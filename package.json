@@ -20,7 +20,9 @@
       "package.json"
     ],
     "artifactName": "${productName}-${version}.${ext}",
+    "icon": "public/icons",
     "win": {
+      "icon": "public/icons/icon.ico",
       "target": [
         "nsis",
         "portable"
@@ -28,6 +30,7 @@
       "artifactName": "${productName}-Setup-${version}.${ext}"
     },
     "mac": {
+      "icon": "public/icons/icon.icns",
       "target": [
         "dmg",
         "zip"
@@ -35,6 +38,7 @@
       "category": "public.app-category.utilities"
     },
     "linux": {
+      "icon": "public/icons",
       "target": [
         "AppImage",
         "deb"
@@ -78,6 +82,8 @@
   },
   "devDependencies": {
     "@types/node": "^22.14.0",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
     "autoprefixer": "^10.4.21",
     "electron": "^41.0.3",
     "electron-builder": "^24.13.3",

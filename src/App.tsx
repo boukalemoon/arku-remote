@@ -478,8 +478,8 @@ export default function App() {
       <header className="border-b border-steppe-border sticky top-0 z-50 backdrop-blur-md" style={{ background: isLight ? 'rgba(240,244,248,0.92)' : 'rgba(17,16,16,0.85)' }}>
         <div className="max-w-7xl mx-auto px-6 py-4 flex justify-between items-center">
           <div className="flex items-center gap-4">
-            <div className="w-11 h-11 gokturk-border flex items-center justify-center" style={{ background: 'var(--bg-primary)' }}>
-              <span className="text-steppe-gold font-display text-xl">A</span>
+            <div className="w-11 h-11 gokturk-border flex items-center justify-center overflow-hidden" style={{ background: 'var(--bg-primary)' }}>
+              <img src="/icons/64x64.png" alt="Arku" className="w-9 h-9 object-contain" />
             </div>
             <div>
               <h1 className="text-lg text-steppe-gold leading-none">Arku Remote</h1>
