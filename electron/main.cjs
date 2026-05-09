@@ -13,7 +13,7 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.cjs'),
     },
     icon: path.join(__dirname, '../public/icon.ico'),
-    title: 'Yırak Remote',
+    title: 'Arku Remote',
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
     ...(process.platform !== 'darwin' && {
       titleBarOverlay: {

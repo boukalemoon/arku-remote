@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  coturn:
+    image: coturn/coturn:latest
+    container_name: arku-turn
+    ports:
+      # STUN/TURN
+      - "3478:3478/udp"
+      - "3478:3478/tcp"
+      # STUN/TURN TLS
+      - "5349:5349/udp"
+      - "5349:5349/tcp"
+      # Admin port
+      - "5766:5766/tcp"
+    volumes:
+      - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
+      - coturn-logs:/var/log/coturn
+    networks:
+      - arku-network
+    restart: always
+    environment:
+      - TURNSERVER_ENABLED=1
+    healthcheck:
+      test: ["CMD", "netstat", "-an"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+networks:
+  arku-network:
+    driver: bridge
+
+volumes:
+  coturn-logs:
+    driver: local

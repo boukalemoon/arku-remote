@@ -7,8 +7,8 @@
   "type": "module",
   "main": "electron/main.cjs",
   "build": {
-    "appId": "com.yirak.remote",
-    "productName": "Yirak-Remote",
+    "appId": "com.arku.remote",
+    "productName": "Arku-Remote",
     "copyright": "Copyright © 2026 ITrend Technology",
     "directories": {
       "output": "dist_electron"
@@ -46,7 +46,7 @@
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "Yirak Remote"
+      "shortcutName": "Arku Remote"
     },
     "publish": {
       "provider": "github",
