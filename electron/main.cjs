@@ -1,4 +1,4 @@
-const { app, BrowserWindow, session, desktopCapturer, shell } = require('electron');
+const { app, BrowserWindow, session, desktopCapturer, shell, ipcMain, screen } = require('electron');
 const path = require('path');
 
 function createWindow() {
@@ -25,7 +25,7 @@ function createWindow() {
   });
 
   // Ekran paylaşımı için izin ver
-  session.defaultSession.setDisplayMediaRequestHandler((request, callback) => {
+  session.defaultSession.setDisplayMediaRequestHandler((_request, callback) => {
     desktopCapturer.getSources({ types: ['screen', 'window'] }).then((sources) => {
       callback({ video: sources[0], audio: 'loopback' });
     });
@@ -62,4 +62,27 @@ app.whenReady().then(() => {
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
+});
+
+// Remote input injection — receiver side
+// Koordinatlar 0-1 normalize. robotjs veya @nut-tree/nut-js kurulumu ile aktif hale gelir.
+ipcMain.on('input-event', (_e, event) => {
+  let robot;
+  try { robot = require('robotjs'); } catch { return; } // robotjs kurulu değilse yoksay
+
+  const { width, height } = screen.getPrimaryDisplay().workAreaSize;
+
+  if (event.type === 'mousemove') {
+    robot.moveMouse(Math.round(event.x * width), Math.round(event.y * height));
+  } else if (event.type === 'mousedown' || event.type === 'mouseup') {
+    const btn = event.button === 2 ? 'right' : event.button === 1 ? 'middle' : 'left';
+    robot.moveMouse(Math.round(event.x * width), Math.round(event.y * height));
+    robot.mouseToggle(event.type === 'mousedown' ? 'down' : 'up', btn);
+  } else if (event.type === 'wheel') {
+    robot.scrollMouse(Math.round(event.dx / 100), Math.round(event.dy / 100));
+  } else if (event.type === 'keydown') {
+    try { robot.keyToggle(event.key.toLowerCase(), 'down'); } catch {}
+  } else if (event.type === 'keyup') {
+    try { robot.keyToggle(event.key.toLowerCase(), 'up'); } catch {}
+  }
 });

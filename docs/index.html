@@ -1,0 +1,597 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Arku Remote — Güvenli P2P Uzak Masaüstü</title>
+  <meta name="description" content="Sunucu olmadan, doğrudan cihazdan cihaza uzak masaüstü erişimi. Ücretsiz, açık kaynak, tüm platformlar." />
+  <meta property="og:title" content="Arku Remote" />
+  <meta property="og:description" content="Güvenli P2P Uzak Masaüstü — Verileriniz Sadece Size Ait" />
+  <meta property="og:type" content="website" />
+
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:       #111010;
+      --surface:  #181615;
+      --surface2: #1e1c1a;
+      --gold:     #c5a059;
+      --gold-dim: #9a7a3e;
+      --text:     #e8dcc8;
+      --muted:    #7a6f65;
+      --border:   #2a2826;
+      --green:    #4ade80;
+    }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+      font-size: 15px;
+      line-height: 1.6;
+      min-height: 100vh;
+    }
+
+    /* ── UTILS ── */
+    .container { max-width: 1100px; margin: 0 auto; padding: 0 24px; }
+    .label     { font-size: 10px; letter-spacing: .2em; text-transform: uppercase; color: var(--muted); }
+    .gold      { color: var(--gold); }
+    .mono      { font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace; }
+
+    /* ── NAV ── */
+    nav {
+      position: sticky; top: 0; z-index: 100;
+      border-bottom: 1px solid var(--border);
+      background: rgba(17,16,16,.92);
+      backdrop-filter: blur(12px);
+    }
+    nav .inner {
+      display: flex; align-items: center; justify-content: space-between;
+      max-width: 1100px; margin: 0 auto; padding: 16px 24px;
+    }
+    .logo { display: flex; align-items: center; gap: 12px; text-decoration: none; }
+    .logo-icon {
+      width: 40px; height: 40px;
+      border: 1px solid var(--border);
+      display: flex; align-items: center; justify-content: center;
+      background: var(--surface);
+      font-size: 18px; font-weight: 700; color: var(--gold);
+    }
+    .logo-text h1 { font-size: 16px; color: var(--gold); font-weight: 500; line-height: 1.1; }
+    .logo-text span { font-size: 9px; color: var(--muted); text-transform: uppercase; letter-spacing: .15em; }
+    .nav-links { display: flex; gap: 32px; }
+    .nav-links a {
+      font-size: 11px; text-transform: uppercase; letter-spacing: .15em;
+      text-decoration: none; color: var(--muted);
+      transition: color .2s;
+    }
+    .nav-links a:hover { color: var(--text); }
+    .nav-cta {
+      padding: 8px 20px;
+      border: 1px solid var(--gold);
+      background: transparent;
+      color: var(--gold);
+      font-size: 11px; text-transform: uppercase; letter-spacing: .15em;
+      text-decoration: none;
+      cursor: pointer;
+      transition: background .2s, color .2s;
+    }
+    .nav-cta:hover { background: var(--gold); color: #111010; }
+
+    /* ── HERO ── */
+    .hero {
+      padding: 100px 24px 80px;
+      text-align: center;
+      position: relative;
+      overflow: hidden;
+    }
+    .hero::before {
+      content: '';
+      position: absolute; inset: 0;
+      background: radial-gradient(ellipse 60% 40% at 50% 0%, rgba(197,160,89,.08) 0%, transparent 70%);
+      pointer-events: none;
+    }
+    .hero-badge {
+      display: inline-flex; align-items: center; gap: 8px;
+      border: 1px solid var(--border); padding: 6px 16px;
+      margin-bottom: 32px;
+    }
+    .hero-badge .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green); }
+    .hero-badge span { font-size: 11px; text-transform: uppercase; letter-spacing: .15em; color: var(--muted); }
+    .hero h2 {
+      font-size: clamp(36px, 6vw, 64px);
+      font-weight: 300; color: var(--gold);
+      letter-spacing: -.01em; line-height: 1.1;
+      margin-bottom: 16px;
+    }
+    .hero h2 em { font-style: normal; font-weight: 700; }
+    .hero p {
+      font-size: 17px; color: var(--muted); max-width: 540px;
+      margin: 0 auto 48px; line-height: 1.7;
+    }
+    .hero-dl { display: flex; justify-content: center; gap: 12px; flex-wrap: wrap; }
+
+    /* ── BUTTONS ── */
+    .btn-dl {
+      display: flex; align-items: center; gap: 12px;
+      padding: 14px 24px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      text-decoration: none;
+      transition: border-color .2s, background .2s;
+      cursor: pointer;
+    }
+    .btn-dl:hover { border-color: var(--gold); background: var(--surface2); }
+    .btn-dl .os-icon { font-size: 22px; line-height: 1; }
+    .btn-dl .os-info { text-align: left; }
+    .btn-dl .os-name { display: block; font-size: 13px; color: var(--text); font-weight: 500; }
+    .btn-dl .os-ext  { display: block; font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .1em; margin-top: 1px; }
+    .btn-primary {
+      background: var(--gold); color: #111010;
+      border-color: var(--gold);
+    }
+    .btn-primary:hover { background: #d4ae6a; border-color: #d4ae6a; }
+
+    /* ── CORNER MARKERS ── */
+    .corners { position: relative; }
+    .corners::after, .corners::before,
+    .corners .c1, .corners .c2, .corners .c3, .corners .c4 {
+      content: ''; position: absolute; width: 12px; height: 12px;
+      border-color: var(--gold-dim);
+      border-style: solid;
+    }
+    .corners::before { top: 0; left: 0; border-width: 2px 0 0 2px; }
+    .corners::after  { top: 0; right: 0; border-width: 2px 2px 0 0; }
+    .corners .c1 { bottom: 0; left: 0; border-width: 0 0 2px 2px; }
+    .corners .c2 { bottom: 0; right: 0; border-width: 0 2px 2px 0; }
+
+    /* ── STATS ── */
+    .stats {
+      border-top: 1px solid var(--border);
+      border-bottom: 1px solid var(--border);
+      padding: 40px 24px;
+    }
+    .stats-grid {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 0;
+      max-width: 1100px; margin: 0 auto;
+    }
+    .stat {
+      padding: 24px 32px;
+      border-right: 1px solid var(--border);
+    }
+    .stat:last-child { border-right: none; }
+    .stat-value { font-size: 32px; color: var(--gold); font-weight: 200; line-height: 1; margin-bottom: 6px; }
+    .stat-label { font-size: 10px; text-transform: uppercase; letter-spacing: .15em; color: var(--muted); }
+
+    /* ── FEATURES ── */
+    .features { padding: 100px 24px; }
+    .section-header { text-align: center; margin-bottom: 64px; }
+    .section-header h2 { font-size: 32px; font-weight: 300; color: var(--gold); margin: 12px 0 16px; }
+    .section-header p { color: var(--muted); max-width: 480px; margin: 0 auto; }
+    .features-grid {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1px;
+      border: 1px solid var(--border);
+      max-width: 1100px; margin: 0 auto;
+      background: var(--border);
+    }
+    .feature {
+      background: var(--surface); padding: 40px 36px;
+      transition: background .2s;
+    }
+    .feature:hover { background: var(--surface2); }
+    .feature-icon {
+      width: 48px; height: 48px; border: 1px solid var(--border);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 22px; margin-bottom: 24px;
+      background: var(--bg);
+    }
+    .feature h3 { font-size: 15px; color: var(--text); font-weight: 500; margin-bottom: 10px; }
+    .feature p { font-size: 13px; color: var(--muted); line-height: 1.7; }
+
+    /* ── HOW IT WORKS ── */
+    .how { padding: 100px 24px; background: var(--surface); }
+    .steps {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 0; max-width: 1100px; margin: 0 auto;
+      border: 1px solid var(--border);
+    }
+    .step {
+      padding: 48px 36px;
+      border-right: 1px solid var(--border);
+      position: relative;
+    }
+    .step:last-child { border-right: none; }
+    .step-num {
+      font-size: 48px; font-weight: 200; color: var(--border);
+      line-height: 1; margin-bottom: 24px;
+      font-family: 'SF Mono', monospace;
+    }
+    .step h3 { font-size: 14px; color: var(--gold); text-transform: uppercase; letter-spacing: .12em; margin-bottom: 10px; }
+    .step p { font-size: 13px; color: var(--muted); line-height: 1.7; }
+
+    /* ── DOWNLOAD ── */
+    .download { padding: 100px 24px; text-align: center; position: relative; overflow: hidden; }
+    .download::before {
+      content: '';
+      position: absolute; inset: 0;
+      background: radial-gradient(ellipse 50% 60% at 50% 100%, rgba(197,160,89,.06) 0%, transparent 70%);
+      pointer-events: none;
+    }
+    .download h2 { font-size: 36px; font-weight: 300; color: var(--gold); margin: 12px 0 16px; }
+    .download p { color: var(--muted); margin-bottom: 48px; }
+    .dl-grid {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 16px; max-width: 900px; margin: 0 auto 48px;
+    }
+    .dl-card {
+      border: 1px solid var(--border); padding: 36px 32px;
+      background: var(--surface); text-align: left;
+      transition: border-color .2s;
+    }
+    .dl-card:hover { border-color: var(--gold-dim); }
+    .dl-card-icon { font-size: 36px; margin-bottom: 20px; display: block; }
+    .dl-card h3 { font-size: 18px; color: var(--text); font-weight: 400; margin-bottom: 6px; }
+    .dl-card .version { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .1em; margin-bottom: 20px; display: block; }
+    .dl-card .formats { display: flex; gap: 8px; margin-bottom: 24px; flex-wrap: wrap; }
+    .format-tag {
+      padding: 4px 10px;
+      border: 1px solid var(--border);
+      font-size: 10px; text-transform: uppercase; letter-spacing: .1em;
+      color: var(--muted);
+    }
+    .dl-card a {
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 10px 20px;
+      border: 1px solid var(--gold);
+      color: var(--gold); text-decoration: none;
+      font-size: 11px; text-transform: uppercase; letter-spacing: .15em;
+      transition: background .2s, color .2s;
+    }
+    .dl-card a:hover { background: var(--gold); color: #111010; }
+    .web-note {
+      border: 1px solid var(--border); padding: 20px 32px;
+      display: inline-flex; align-items: center; gap: 16px;
+      max-width: 500px;
+    }
+    .web-note span { font-size: 12px; color: var(--muted); }
+    .web-note a { color: var(--gold); text-decoration: none; font-size: 13px; }
+    .web-note a:hover { text-decoration: underline; }
+
+    /* ── SECURITY ── */
+    .security { padding: 80px 24px; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
+    .security-inner {
+      max-width: 1100px; margin: 0 auto;
+      display: grid; grid-template-columns: 1fr 1fr; gap: 80px; align-items: center;
+    }
+    .security h2 { font-size: 28px; font-weight: 300; color: var(--gold); margin: 12px 0 20px; }
+    .security p { color: var(--muted); line-height: 1.7; margin-bottom: 16px; font-size: 14px; }
+    .security-items { display: flex; flex-direction: column; gap: 16px; }
+    .sec-item { display: flex; gap: 16px; align-items: flex-start; }
+    .sec-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--gold); margin-top: 8px; flex-shrink: 0; }
+    .sec-item h4 { font-size: 13px; color: var(--text); margin-bottom: 4px; }
+    .sec-item p  { font-size: 12px; color: var(--muted); margin: 0; }
+
+    /* ── FOOTER ── */
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 40px 24px;
+    }
+    footer .inner {
+      max-width: 1100px; margin: 0 auto;
+      display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 16px;
+    }
+    footer p { font-size: 10px; text-transform: uppercase; letter-spacing: .2em; color: var(--muted); }
+    footer nav { display: flex; gap: 24px; }
+    footer nav a { font-size: 10px; text-transform: uppercase; letter-spacing: .15em; color: var(--muted); text-decoration: none; transition: color .2s; }
+    footer nav a:hover { color: var(--gold); }
+
+    /* ── RESPONSIVE ── */
+    @media (max-width: 768px) {
+      .nav-links { display: none; }
+      .hero { padding: 72px 24px 60px; }
+      .security-inner { grid-template-columns: 1fr; gap: 40px; }
+      .stats-grid { grid-template-columns: 1fr 1fr; }
+      .stat { border-bottom: 1px solid var(--border); }
+      .step { border-right: none; border-bottom: 1px solid var(--border); }
+      .step:last-child { border-bottom: none; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- ── NAV ── -->
+<nav>
+  <div class="inner">
+    <a href="#" class="logo">
+      <div class="logo-icon">A</div>
+      <div class="logo-text">
+        <h1>Arku Remote</h1>
+        <span>v1.0.0</span>
+      </div>
+    </a>
+    <div class="nav-links">
+      <a href="#ozellikler">Özellikler</a>
+      <a href="#nasil-calisir">Nasıl Çalışır</a>
+      <a href="#indir">İndir</a>
+      <a href="#guvenlik">Güvenlik</a>
+    </div>
+    <a href="https://github.com/boukalemoon/yirak-remote" target="_blank" class="nav-cta">GitHub</a>
+  </div>
+</nav>
+
+<!-- ── HERO ── -->
+<section class="hero">
+  <div class="hero-badge">
+    <div class="dot"></div>
+    <span>Açık Kaynak · Ücretsiz · P2P</span>
+  </div>
+  <h2>Uzak Masaüstü.<br><em>Verileriniz Size Ait.</em></h2>
+  <p>
+    Sunucu üzerinden geçmeyen, doğrudan cihazdan cihaza bağlantı.
+    WebRTC şifreli P2P teknolojisiyle tam güvenlik.
+  </p>
+  <div class="hero-dl">
+    <a href="#indir" class="btn-dl btn-primary">
+      <span class="os-icon">⊞</span>
+      <div class="os-info">
+        <span class="os-name">Windows İndir</span>
+        <span class="os-ext">.exe Kurulum</span>
+      </div>
+    </a>
+    <a href="#indir" class="btn-dl">
+      <span class="os-icon"></span>
+      <div class="os-info">
+        <span class="os-name">macOS İndir</span>
+        <span class="os-ext">.dmg</span>
+      </div>
+    </a>
+    <a href="#indir" class="btn-dl">
+      <span class="os-icon">🐧</span>
+      <div class="os-info">
+        <span class="os-name">Linux İndir</span>
+        <span class="os-ext">.AppImage · .deb</span>
+      </div>
+    </a>
+  </div>
+</section>
+
+<!-- ── STATS ── -->
+<div class="stats">
+  <div class="stats-grid">
+    <div class="stat">
+      <div class="stat-value">P2P</div>
+      <div class="stat-label">Doğrudan Bağlantı</div>
+    </div>
+    <div class="stat">
+      <div class="stat-value">AES-256</div>
+      <div class="stat-label">Uçtan Uca Şifreleme</div>
+    </div>
+    <div class="stat">
+      <div class="stat-value">&lt;50ms</div>
+      <div class="stat-label">Tipik Gecikme</div>
+    </div>
+    <div class="stat">
+      <div class="stat-value">3</div>
+      <div class="stat-label">Desteklenen Platform</div>
+    </div>
+    <div class="stat">
+      <div class="stat-value">%100</div>
+      <div class="stat-label">Ücretsiz</div>
+    </div>
+  </div>
+</div>
+
+<!-- ── FEATURES ── -->
+<section class="features" id="ozellikler">
+  <div class="container">
+    <div class="section-header">
+      <div class="label">Özellikler</div>
+      <h2>Neden Arku Remote?</h2>
+      <p>Diğer uzak masaüstü araçlarının aksine, verileriniz hiçbir zaman bizim sunucularımıza uğramaz.</p>
+    </div>
+    <div class="features-grid">
+      <div class="feature">
+        <div class="feature-icon">🔒</div>
+        <h3>Uçtan Uca Şifreleme</h3>
+        <p>WebRTC DTLS/SRTP protokolü sayesinde tüm bağlantılar uçtan uca şifrelenir. Araya girilmesi mümkün değildir.</p>
+      </div>
+      <div class="feature">
+        <div class="feature-icon">⚡</div>
+        <h3>Düşük Gecikme</h3>
+        <p>P2P bağlantı sayesinde veriler doğrudan karşı cihaza ulaşır. Sunucu relay olmadığı için gecikme minimumda kalır.</p>
+      </div>
+      <div class="feature">
+        <div class="feature-icon">🌐</div>
+        <h3>Sunucusuz Altyapı</h3>
+        <p>Bağlantı kurulduktan sonra hiçbir sunucu araya girmez. Ekran görüntüleriniz sadece iki cihaz arasında akar.</p>
+      </div>
+      <div class="feature">
+        <div class="feature-icon">💻</div>
+        <h3>Tüm Platformlar</h3>
+        <p>Windows, macOS ve Linux için yerel masaüstü uygulaması. Ayrıca herhangi bir tarayıcıdan da kullanılabilir.</p>
+      </div>
+      <div class="feature">
+        <div class="feature-icon">🖱️</div>
+        <h3>Tam Kontrol</h3>
+        <p>Fare ve klavye olayları uzak cihaza iletilir. Uzak masaüstünü tam kontrol altına alın.</p>
+      </div>
+      <div class="feature">
+        <div class="feature-icon">🔓</div>
+        <h3>Açık Kaynak</h3>
+        <p>Kaynak kodu tamamen açık ve topluluk tarafından denetlenebilir. Gizli bir şey yok, gizlenecek bir şey de yok.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── HOW IT WORKS ── -->
+<section class="how" id="nasil-calisir">
+  <div class="container">
+    <div class="section-header">
+      <div class="label">Nasıl Çalışır?</div>
+      <h2>Üç Adımda Bağlantı</h2>
+      <p>Hesap oluşturmanıza gerek yok. Sadece ID'nizi paylaşın.</p>
+    </div>
+    <div class="steps">
+      <div class="step">
+        <div class="step-num">01</div>
+        <h3>ID'nizi Paylaşın</h3>
+        <p>Uygulama açıldığında size özel bir kimlik (ör: 123-456-789) atanır. Bu kodu karşı tarafla paylaşın.</p>
+      </div>
+      <div class="step">
+        <div class="step-num">02</div>
+        <h3>Bağlantı İsteği Alın</h3>
+        <p>Karşı taraf kimliğinizi girerek bağlanmak istediğinde bildirim alırsınız. Kabul ya da red edin.</p>
+      </div>
+      <div class="step">
+        <div class="step-num">03</div>
+        <h3>Ekranı Paylaşın</h3>
+        <p>Kabul ettikten sonra paylaşmak istediğiniz ekranı seçin. P2P bağlantı kurulur, görüntü akmaya başlar.</p>
+      </div>
+      <div class="step">
+        <div class="step-num">04</div>
+        <h3>Kontrol Edin</h3>
+        <p>İsteğe bağlı olarak bağlanan tarafa fare ve klavye kontrolü verilebilir. Dilediğiniz an kapatabilirsiniz.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── SECURITY ── -->
+<section class="security" id="guvenlik">
+  <div class="security-inner container">
+    <div>
+      <div class="label">Güvenlik Altyapısı</div>
+      <h2>Gizliliğiniz Önceliğimiz</h2>
+      <p>Arku Remote, merkezi bir altyapıya minimum bağımlılık ilkesiyle tasarlanmıştır. Sinyal sunucusu yalnızca bağlantı kurulum aşamasında devreye girer; bağlantı kurulduktan sonra devre dışı kalır.</p>
+      <p>Tüm medya verileri WebRTC'nin yerleşik DTLS ve SRTP protokolleri aracılığıyla şifrelenir.</p>
+    </div>
+    <div class="security-items">
+      <div class="sec-item">
+        <div class="sec-dot"></div>
+        <div>
+          <h4>WebRTC DTLS/SRTP</h4>
+          <p>Tüm bağlantılar endüstri standardı WebRTC şifreleme protokolleriyle korunur.</p>
+        </div>
+      </div>
+      <div class="sec-item">
+        <div class="sec-dot"></div>
+        <div>
+          <h4>P2P — Sunucu Araya Girmez</h4>
+          <p>Bağlantı kurulduktan sonra ekran görüntüleri yalnızca iki cihaz arasında akar. Sunucumuz görmez.</p>
+        </div>
+      </div>
+      <div class="sec-item">
+        <div class="sec-dot"></div>
+        <div>
+          <h4>Anlık Onay Mekanizması</h4>
+          <p>Her bağlantı isteği sizin onayınız olmadan gerçekleşemez. İstediğiniz anda bağlantıyı kesebilirsiniz.</p>
+        </div>
+      </div>
+      <div class="sec-item">
+        <div class="sec-dot"></div>
+        <div>
+          <h4>Açık Kaynak Denetim</h4>
+          <p>Kaynak kod herkese açık. Güvenlik araştırmacıları kodu inceleyebilir, açıklarını bildirebilir.</p>
+        </div>
+      </div>
+      <div class="sec-item">
+        <div class="sec-dot"></div>
+        <div>
+          <h4>Misafir Modu</h4>
+          <p>Hesap açmadan bağlanın. Misafir modunda herhangi bir kişisel veri saklanmaz.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── DOWNLOAD ── -->
+<section class="download" id="indir">
+  <div class="container">
+    <div class="label">İndir</div>
+    <h2>Tüm Platformlar İçin</h2>
+    <p>Ücretsiz indirin, kurulum yapın, hemen kullanmaya başlayın.</p>
+
+    <div class="dl-grid">
+      <!-- Windows -->
+      <div class="dl-card">
+        <span class="dl-card-icon">⊞</span>
+        <h3>Windows</h3>
+        <span class="version">v1.0.0 · 64-bit</span>
+        <div class="formats">
+          <span class="format-tag">NSIS Kurulum</span>
+          <span class="format-tag">Portable</span>
+        </div>
+        <a href="https://github.com/boukalemoon/yirak-remote/releases/latest/download/Yirak-Remote-Setup-1.0.0.exe">
+          ↓ &nbsp; Kurulum İndir (.exe)
+        </a>
+      </div>
+
+      <!-- macOS -->
+      <div class="dl-card">
+        <span class="dl-card-icon"></span>
+        <h3>macOS</h3>
+        <span class="version">v1.0.0 · Intel &amp; Apple Silicon</span>
+        <div class="formats">
+          <span class="format-tag">DMG</span>
+          <span class="format-tag">ZIP</span>
+        </div>
+        <a href="https://github.com/boukalemoon/yirak-remote/releases/latest/download/Yirak-Remote-1.0.0.dmg">
+          ↓ &nbsp; Disk Görüntüsü İndir (.dmg)
+        </a>
+      </div>
+
+      <!-- Linux -->
+      <div class="dl-card">
+        <span class="dl-card-icon">🐧</span>
+        <h3>Linux</h3>
+        <span class="version">v1.0.0 · x64</span>
+        <div class="formats">
+          <span class="format-tag">AppImage</span>
+          <span class="format-tag">.deb</span>
+        </div>
+        <a href="https://github.com/boukalemoon/yirak-remote/releases/latest/download/Yirak-Remote-1.0.0.AppImage">
+          ↓ &nbsp; AppImage İndir
+        </a>
+      </div>
+    </div>
+
+    <div class="web-note">
+      <span>⊕</span>
+      <div>
+        <span>Masaüstü uygulaması kurmak istemiyorsanız:</span><br>
+        <a href="https://yirak-remote.vercel.app" target="_blank">Tarayıcıda Kullan →</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── FOOTER ── -->
+<footer>
+  <div class="inner">
+    <div>
+      <p>© 2026 Arku Remote — ITrend Technology</p>
+    </div>
+    <nav>
+      <a href="https://github.com/boukalemoon/yirak-remote" target="_blank">GitHub</a>
+      <a href="https://github.com/boukalemoon/yirak-remote/issues" target="_blank">Hata Bildir</a>
+      <a href="https://github.com/boukalemoon/yirak-remote/releases" target="_blank">Sürümler</a>
+    </nav>
+  </div>
+</footer>
+
+<script>
+  // Smooth scroll for anchor links
+  document.querySelectorAll('a[href^="#"]').forEach(a => {
+    a.addEventListener('click', e => {
+      const target = document.querySelector(a.getAttribute('href'));
+      if (target) { e.preventDefault(); target.scrollIntoView({ behavior: 'smooth', block: 'start' }); }
+    });
+  });
+</script>
+</body>
+</html>

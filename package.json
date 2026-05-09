@@ -1,34 +1,37 @@
 {
-  "name": "yirak-remote",
+  "name": "arku-remote",
+  "description": "Güvenli P2P Uzak Masaüstü Uygulaması",
+  "author": "ITrend Technology",
   "private": true,
   "version": "1.0.0",
   "type": "module",
   "main": "electron/main.cjs",
   "build": {
     "appId": "com.yirak.remote",
-    "productName": "Yırak Remote",
+    "productName": "Yirak-Remote",
     "copyright": "Copyright © 2026 ITrend Technology",
     "directories": {
       "output": "dist_electron"
     },
+    "asar": false,
     "files": [
       "dist/**/*",
       "electron/**/*",
       "package.json"
     ],
+    "artifactName": "${productName}-${version}.${ext}",
     "win": {
       "target": [
         "nsis",
         "portable"
       ],
-      "icon": "public/icon.ico"
+      "artifactName": "${productName}-Setup-${version}.${ext}"
     },
     "mac": {
       "target": [
         "dmg",
         "zip"
       ],
-      "icon": "public/icon.icns",
       "category": "public.app-category.utilities"
     },
     "linux": {
@@ -36,18 +39,18 @@
         "AppImage",
         "deb"
       ],
-      "icon": "public/icon.png",
       "category": "Network"
     },
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
-      "installerIcon": "public/icon.ico",
-      "uninstallerIcon": "public/icon.ico",
-      "installerHeaderIcon": "public/icon.ico",
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "Yırak Remote"
+      "shortcutName": "Yirak Remote"
+    },
+    "publish": {
+      "provider": "github",
+      "releaseType": "release"
     }
   },
   "scripts": {
@@ -77,7 +80,7 @@
     "@types/node": "^22.14.0",
     "autoprefixer": "^10.4.21",
     "electron": "^41.0.3",
-    "electron-builder": "^26.8.1",
+    "electron-builder": "^24.13.3",
     "electron-icon-builder": "^2.0.1",
     "tailwindcss": "^4.1.14",
     "typescript": "~5.8.2"
