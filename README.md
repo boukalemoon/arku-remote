@@ -1,20 +1,63 @@
 <div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
+<img width="1200" height="475" alt="Arku Remote Banner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
 </div>
 
-# Run and deploy your AI Studio app
+# Arku Remote
 
-This contains everything you need to run your app locally.
+**Güvenli P2P Uzak Masaüstü Uygulaması** — Sunucusuz, uçtan uca şifreli, açık kaynak.
 
-View your app in AI Studio: https://ai.studio/apps/c8cf648e-4b4c-4dd4-9687-73c4bdd96fe6
+[arku-remote-website.vercel.app](https://arku-remote-website.vercel.app) · [Web'de Dene](https://arku-remote.vercel.app) · [Releases](https://github.com/boukalemoon/arku-remote/releases)
 
-## Run Locally
+---
 
-**Prerequisites:**  Node.js
+## Özellikler
 
+- **P2P Bağlantı** — WebRTC ile sunucusuz, doğrudan bağlantı
+- **Uçtan Uca Şifreleme** — Tüm veri akışı şifreli
+- **Çapraz Platform** — Windows, macOS, Linux ve tarayıcı desteği
+- **Açık Kaynak** — MIT lisansı
 
-1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+## Kurulum
+
+[Releases](https://github.com/boukalemoon/arku-remote/releases) sayfasından platformunuza uygun dosyayı indirin:
+
+| Platform | Dosya |
+|----------|-------|
+| Windows  | `Arku-Remote-Setup.exe` |
+| macOS    | `Arku-Remote.dmg` |
+| Linux    | `Arku-Remote.AppImage` |
+
+## Geliştirme Ortamı
+
+**Gereksinimler:** Node.js 20+
+
+```bash
+# Bağımlılıkları yükle
+npm install
+
+# .env.local dosyası oluştur
+cp .env.example .env.local
+# VITE_SUPABASE_URL ve VITE_SUPABASE_ANON_KEY değerlerini doldur
+
+# Web uygulamasını başlat
+npm run dev
+
+# Electron uygulamasını başlat
+npm run desktop:dev
+```
+
+## Yapı
+
+```
+src/          — React uygulaması
+electron/     — Electron ana süreç
+website/      — Landing page (statik HTML)
+```
+
+## Güvenlik
+
+Güvenlik açığı bildirimi için: [SECURITY.md](SECURITY.md)
+
+---
+
+**ITrend Technology** tarafından geliştirildi.
