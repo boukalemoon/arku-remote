@@ -397,13 +397,17 @@ export class WebRTCManager {
     // which is BEFORE the receiver clicks Accept. Those candidates are already
     // in the DB and won't trigger realtime events — fetch them explicitly.
     try {
-      const { data: missedCandidates } = await supabase
+      const query = supabase
         .from('signals')
         .select('id, payload')
         .eq('from_id', fromId)
         .eq('to_id', this.myId)
         .eq('type', 'ice-candidate')
         .order('created_at', { ascending: true });
+      if (this.hasSessionIdColumn && this.sessionId) {
+        query.eq('session_id', this.sessionId);
+      }
+      const { data: missedCandidates } = await query;
       if (missedCandidates && missedCandidates.length > 0) {
         this.log(`${missedCandidates.length} önceden gönderilmiş ICE adayı bulundu.`, 'sys');
         for (const row of missedCandidates) {
@@ -465,8 +469,10 @@ export class WebRTCManager {
         await supabase.from('signals').delete().eq('session_id', this.sessionId).lt('created_at', ago);
         return;
       }
+      // Fallback: sadece bu peer çiftine ait sinyalleri sil — tüm kullanıcı sinyallerini değil
       await supabase.from('signals').delete()
-        .or(`from_id.eq.${this.myId},to_id.eq.${this.myId}`)
+        .eq('from_id', this.myId)
+        .eq('to_id', this.peerId)
         .lt('created_at', ago);
     } catch (err) {
       this.log(`Sinyal temizleme hatası: ${String(err)}`, 'warn');
