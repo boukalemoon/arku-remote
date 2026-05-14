@@ -19,7 +19,7 @@
       "electron/**/*",
       "package.json"
     ],
-    "artifactName": "${productName}-${version}.${ext}",
+    "artifactName": "${productName}.${ext}",
     "icon": "public/icons",
     "win": {
       "icon": "public/icons/icon.ico",
@@ -27,7 +27,7 @@
         "nsis",
         "portable"
       ],
-      "artifactName": "${productName}-Setup-${version}.${ext}"
+      "artifactName": "${productName}-Setup.${ext}"
     },
     "mac": {
       "icon": "public/icons/icon.icns",
@@ -35,6 +35,7 @@
         "dmg",
         "zip"
       ],
+      "artifactName": "${productName}.${ext}",
       "category": "public.app-category.utilities"
     },
     "linux": {
@@ -43,6 +44,7 @@
         "AppImage",
         "deb"
       ],
+      "artifactName": "${productName}.${ext}",
       "category": "Network"
     },
     "nsis": {
