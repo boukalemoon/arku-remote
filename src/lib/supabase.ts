@@ -28,6 +28,11 @@ export interface UserProfile {
   last_seen: string | null;
   theme: string;
   created_at: string;
+  qrtim_id: string | null;
+  qrtim_username: string | null;
+  qrtim_name: string | null;
+  qrtim_email: string | null;
+  qrtim_connected_at: string | null;
 }
 
 export interface LogEntry {

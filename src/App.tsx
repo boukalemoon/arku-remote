@@ -12,6 +12,10 @@ type Tab = 'dashboard' | 'connections' | 'settings';
 type AuthMode = 'login' | 'register' | 'mfa' | 'reset';
 interface LogEntryLocal { time: string; msg: string; type: LogType; }
 interface IncomingCall { fromId: string; offerPayload: Record<string, unknown>; sessionId?: string; }
+interface QrtimUser { qrtim_id: string; email: string; name: string; username: string; photo_url: string | null; title: string | null; company: string | null; plan: string; }
+
+const QRTIM_BASE_URL = import.meta.env.VITE_QRTIM_URL ?? 'https://qartim.com';
+const QRTIM_ARKU_LINK_URL = 'https://kfpnsxoxfrxepxezatsr.supabase.co/functions/v1/arku-link';
 
 const generateDeviceFingerprint = (): string => {
   const nav = window.navigator;
@@ -78,6 +82,8 @@ export default function App() {
   const [logs, setLogs] = React.useState<LogEntryLocal[]>([]);
   const [inputEnabled, setInputEnabled] = React.useState(false);
   const [captureFrameRate, setCaptureFrameRate] = React.useState(15);
+  const [qrtimUser, setQrtimUser] = React.useState<QrtimUser | null>(null);
+  const [qrtimLinking, setQrtimLinking] = React.useState(false);
   const lastMouseMoveRef = React.useRef(0);
   // Polling fallback refs for when Supabase Realtime WebSocket is unavailable
   const incomingPollSinceRef = React.useRef(new Date().toISOString());
@@ -226,7 +232,18 @@ export default function App() {
         setDeviceFingerprint(fp);
         await supabase.from('users').upsert({ id: user.id, email: user.email, connection_id: pid, device_fingerprint: fp, last_seen: new Date().toISOString() }, { onConflict: 'id' });
         const { data: prof } = await supabase.from('users').select('*').eq('id', user.id).single();
-        if (prof) { setUserProfile(prof as UserProfile); if (prof.theme) setTheme(prof.theme as Theme); if (prof.display_name) setDisplayName(prof.display_name); if (prof.phone) setPhone(prof.phone); }
+        if (prof) {
+          setUserProfile(prof as UserProfile);
+          if (prof.theme) setTheme(prof.theme as Theme);
+          if (prof.display_name) setDisplayName(prof.display_name);
+          if (prof.phone) setPhone(prof.phone);
+          if (prof.qrtim_id) {
+            setQrtimUser({ qrtim_id: prof.qrtim_id, email: prof.qrtim_email ?? '', name: prof.qrtim_name ?? '', username: prof.qrtim_username ?? '', photo_url: null, title: null, company: null, plan: 'free' });
+          }
+        }
+        const urlParams = new URLSearchParams(window.location.search);
+        const qrtimToken = urlParams.get('qrtim_token');
+        if (qrtimToken) handleQrtimCallback(qrtimToken, user);
         const { data: lgData } = await supabase.from('logs').select('*').eq('user_id', user.id).order('created_at', { ascending: false }).limit(50);
         if (lgData) setLogs(lgData.map(l => ({ time: new Date(l.created_at).toLocaleTimeString('tr-TR'), msg: l.msg, type: l.type as LogType })));
         const { data: cxData } = await supabase.from('connections').select('*').eq('caller_id', user.id).order('created_at', { ascending: false }).limit(20);
@@ -318,6 +335,56 @@ export default function App() {
     setActiveTab('dashboard'); addLocalLog('Oturum kapatildi.', 'warn');
   };
   const handleGuestLogin = () => { setIsGuest(true); setShowAuth(false); setAuthError(''); addLog('Misafir olarak devam ediliyor.', 'warn'); };
+
+  const handleQrtimCallback = async (token: string, user: SupabaseUser) => {
+    setQrtimLinking(true);
+    try {
+      const res = await fetch(QRTIM_ARKU_LINK_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.valid) {
+        addLocalLog(`QRtım bağlantısı başarısız: ${data.error || 'Bilinmeyen hata'}`, 'error');
+        return;
+      }
+      const { error: updErr } = await supabase.from('users').update({
+        qrtim_id: data.user.qrtim_id,
+        qrtim_username: data.user.username,
+        qrtim_name: data.user.name,
+        qrtim_email: data.user.email,
+        qrtim_connected_at: new Date().toISOString(),
+      }).eq('id', user.id);
+      if (updErr) {
+        addLocalLog(`QRtım kimliği kaydedilemedi: ${updErr.message}`, 'error');
+        return;
+      }
+      setQrtimUser(data.user);
+      addLocalLog(`QRtım hesabı bağlandı: ${data.user.name}`, 'sys');
+    } catch (err) {
+      addLocalLog(`QRtım bağlantısı hatası: ${String(err)}`, 'error');
+    } finally {
+      setQrtimLinking(false);
+      window.history.replaceState({}, '', window.location.pathname);
+    }
+  };
+
+  const handleQrtimConnect = () => {
+    if (!currentUser) { setShowAuth(true); setAuthMode('login'); return; }
+    const callbackUrl = window.location.origin + window.location.pathname;
+    window.location.href = `${QRTIM_BASE_URL}/login?callback=${encodeURIComponent(callbackUrl)}&source=arku`;
+  };
+
+  const handleQrtimDisconnect = async () => {
+    if (!currentUser) return;
+    await supabase.from('users').update({
+      qrtim_id: null, qrtim_username: null, qrtim_name: null,
+      qrtim_email: null, qrtim_connected_at: null,
+    }).eq('id', currentUser.id);
+    setQrtimUser(null);
+    addLocalLog('QRtım hesabı bağlantısı kesildi.', 'warn');
+  };
 
   const buildManager = (): WebRTCManager => {
     const myId = currentUser?.id || connectionId;
@@ -777,14 +844,44 @@ export default function App() {
             </section>
             <section className="gokturk-border surface-card p-8">
               <h3 className="text-[10px] uppercase tracking-widest text-steppe-muted mb-6 flex items-center gap-2"><QrCode size={12} className="text-steppe-gold" /> QRtim Entegrasyonu</h3>
-              <div className="flex items-center justify-between p-4 border border-steppe-border mb-4" style={{ background: 'var(--surface-primary)' }}>
-                <div className="flex items-center gap-3"><div className="w-2 h-2 rounded-full bg-yellow-400" /><div><p className="text-[11px] text-steppe-paper">QRtim Hesabi</p><p className="text-[9px] text-steppe-muted">Henuz baglanmadi</p></div></div>
-                <span className="text-[9px] uppercase tracking-widest text-yellow-400 border border-yellow-400/30 px-2 py-1">Bagli Degil</span>
-              </div>
-              <div className="grid grid-cols-2 gap-3">
-                <button onClick={() => window.open('https://qartim.com/register','_blank')} className="btn-primary">Hesap Olustur</button>
-                <button onClick={() => window.open('https://qartim.com/login','_blank')} className="btn-ghost">Giris Yap</button>
-              </div>
+              {qrtimLinking ? (
+                <div className="flex items-center gap-3 p-4 border border-steppe-border mb-4" style={{ background: 'var(--surface-primary)' }}>
+                  <div className="w-2 h-2 rounded-full bg-steppe-gold animate-pulse" />
+                  <p className="text-[10px] text-steppe-muted">QRtım hesabı bağlanıyor...</p>
+                </div>
+              ) : qrtimUser ? (
+                <>
+                  <div className="flex items-center justify-between p-4 border border-green-500/30 mb-4" style={{ background: 'rgba(34,197,94,0.05)' }}>
+                    <div className="flex items-center gap-3">
+                      <div className="w-2 h-2 rounded-full bg-green-400" />
+                      <div>
+                        <p className="text-[11px] text-steppe-paper">{qrtimUser.name}</p>
+                        <p className="text-[9px] text-steppe-muted">@{qrtimUser.username} · {qrtimUser.email}</p>
+                      </div>
+                    </div>
+                    <span className="text-[9px] uppercase tracking-widest text-green-400 border border-green-400/30 px-2 py-1">Bağlı</span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <button onClick={() => window.open(`${QRTIM_BASE_URL}/card/${qrtimUser.username}`, '_blank')} className="btn-ghost flex items-center justify-center gap-2"><ExternalLink size={12} /> Kartı Gör</button>
+                    <button onClick={handleQrtimDisconnect} className="py-3 border border-red-500/30 text-red-400 text-[10px] uppercase tracking-widest hover:bg-red-500/10 transition-all">Bağlantıyı Kes</button>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="flex items-center justify-between p-4 border border-steppe-border mb-4" style={{ background: 'var(--surface-primary)' }}>
+                    <div className="flex items-center gap-3">
+                      <div className="w-2 h-2 rounded-full bg-yellow-400" />
+                      <div><p className="text-[11px] text-steppe-paper">QRtim Hesabi</p><p className="text-[9px] text-steppe-muted">Henuz baglanmadi</p></div>
+                    </div>
+                    <span className="text-[9px] uppercase tracking-widest text-yellow-400 border border-yellow-400/30 px-2 py-1">Bagli Degil</span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <button onClick={() => { const cb = encodeURIComponent(window.location.origin + window.location.pathname); window.open(`${QRTIM_BASE_URL}/signup?callback=${cb}&source=arku`, '_blank'); }} className="btn-primary">Hesap Olustur</button>
+                    <button onClick={handleQrtimConnect} className="btn-ghost">QRtım ile Bağla</button>
+                  </div>
+                  <p className="text-[9px] text-steppe-muted mt-3 text-center">QRtım hesabınız varsa "QRtım ile Bağla" butonuna tıklayın</p>
+                </>
+              )}
             </section>
           </div>
         )}
