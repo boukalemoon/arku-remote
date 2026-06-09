@@ -16,6 +16,7 @@ interface QrtimUser { qrtim_id: string; email: string; name: string; username: s
 
 const QRTIM_BASE_URL = import.meta.env.VITE_QRTIM_URL ?? 'https://qartim.com';
 const QRTIM_ARKU_LINK_URL = 'https://kfpnsxoxfrxepxezatsr.supabase.co/functions/v1/arku-link';
+const QRTIM_AUTH_URL = 'https://bxakaxylrfjldhtdjjmf.supabase.co/functions/v1/qrtim-auth';
 
 const generateDeviceFingerprint = (): string => {
   const nav = window.navigator;
@@ -241,9 +242,6 @@ export default function App() {
             setQrtimUser({ qrtim_id: prof.qrtim_id, email: prof.qrtim_email ?? '', name: prof.qrtim_name ?? '', username: prof.qrtim_username ?? '', photo_url: null, title: null, company: null, plan: 'free' });
           }
         }
-        const urlParams = new URLSearchParams(window.location.search);
-        const qrtimToken = urlParams.get('qrtim_token');
-        if (qrtimToken) handleQrtimCallback(qrtimToken, user);
         const { data: lgData } = await supabase.from('logs').select('*').eq('user_id', user.id).order('created_at', { ascending: false }).limit(50);
         if (lgData) setLogs(lgData.map(l => ({ time: new Date(l.created_at).toLocaleTimeString('tr-TR'), msg: l.msg, type: l.type as LogType })));
         const { data: cxData } = await supabase.from('connections').select('*').eq('caller_id', user.id).order('created_at', { ascending: false }).limit(20);
@@ -254,6 +252,21 @@ export default function App() {
       }
     });
     return () => subscription.unsubscribe();
+  }, []);
+
+  // QRtım'den ?qrtim_token=... ile dönüşte tek noktadan işle:
+  // oturum açıksa hesabı bağla, açık değilse QRtım ile giriş yap (SSO).
+  React.useEffect(() => {
+    const qrtimToken = new URLSearchParams(window.location.search).get('qrtim_token');
+    if (!qrtimToken) return;
+    (async () => {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (session?.user) {
+        await handleQrtimCallback(qrtimToken, session.user);
+      } else {
+        await handleQrtimSsoLogin(qrtimToken);
+      }
+    })();
   }, []);
 
   const updateTheme = async (t: Theme) => {
@@ -374,6 +387,41 @@ export default function App() {
     if (!currentUser) { setShowAuth(true); setAuthMode('login'); return; }
     const callbackUrl = window.location.origin + window.location.pathname;
     window.location.href = `${QRTIM_BASE_URL}/login?callback=${encodeURIComponent(callbackUrl)}&source=arku`;
+  };
+
+  // Giriş ekranından QRtım ile tek tıkla giriş (oturum gerekmez).
+  const handleQrtimLogin = () => {
+    const callbackUrl = window.location.origin + window.location.pathname;
+    window.location.href = `${QRTIM_BASE_URL}/login?callback=${encodeURIComponent(callbackUrl)}&source=arku`;
+  };
+
+  // QRtım token'ı ile dönüldüğünde: oturum varsa hesabı bağla, yoksa SSO ile giriş yap.
+  const handleQrtimSsoLogin = async (token: string) => {
+    setQrtimLinking(true);
+    try {
+      const res = await fetch(QRTIM_AUTH_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ qrtim_token: token }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.token_hash) {
+        addLocalLog(`QRtım ile giriş başarısız: ${data.error || 'Bilinmeyen hata'}`, 'error');
+        return;
+      }
+      const { error } = await supabase.auth.verifyOtp({ token_hash: data.token_hash, type: 'magiclink' });
+      if (error) {
+        addLocalLog(`QRtım oturumu açılamadı: ${error.message}`, 'error');
+        return;
+      }
+      setShowAuth(false);
+      addLocalLog('QRtım ile giriş yapıldı.', 'sys');
+    } catch (err) {
+      addLocalLog(`QRtım giriş hatası: ${String(err)}`, 'error');
+    } finally {
+      setQrtimLinking(false);
+      window.history.replaceState({}, '', window.location.pathname);
+    }
   };
 
   const handleQrtimDisconnect = async () => {
@@ -924,6 +972,10 @@ export default function App() {
                   {authError && <p className="text-[10px] text-red-400">{authError}</p>}
                   <button onClick={handleLogin} className="btn-primary">Devam Et</button>
                   <button onClick={() => { setAuthMode('reset'); setAuthError(''); setResetSent(false); setResetEmail(''); }} className="w-full text-[10px] text-steppe-muted hover:text-steppe-gold transition-colors text-center">Sifremi Unuttum</button>
+                  <div className="flex items-center gap-3 py-1"><div className="flex-1 h-px bg-steppe-border" /><span className="text-[9px] uppercase tracking-widest text-steppe-muted">veya</span><div className="flex-1 h-px bg-steppe-border" /></div>
+                  <button onClick={handleQrtimLogin} className="w-full flex items-center justify-center gap-2 p-3 border border-steppe-gold/40 hover:border-steppe-gold hover:bg-steppe-gold/5 transition-all">
+                    <QrCode size={14} className="text-steppe-gold" /><span className="text-[10px] uppercase tracking-widest text-steppe-gold">QRtım ile Giriş Yap</span>
+                  </button>
                   <button onClick={handleGuestLogin} className="w-full flex items-center justify-center gap-2 p-3 border border-steppe-border hover:border-steppe-gold transition-all" style={{ background: 'var(--surface-primary)' }}>
                     <User size={14} className="text-steppe-muted" /><span className="text-[10px] uppercase tracking-widest text-steppe-muted">Hesap Acmadan Devam Et</span>
                   </button>
