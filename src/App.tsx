@@ -6,6 +6,7 @@ import type { UserProfile, LogType, ConnectionEntry } from './lib/supabase';
 import type { User as SupabaseUser } from '@supabase/supabase-js';
 import { WebRTCManager } from './lib/webrtc';
 import type { ConnectionState, InputEventMsg } from './lib/webrtc';
+import { EMBED, postSessionEvent, resetSessionEvents } from './lib/embed';
 
 type Theme = 'otuken' | 'umay' | 'gok' | 'gece';
 type Tab = 'dashboard' | 'connections' | 'settings';
@@ -96,7 +97,7 @@ export default function App() {
   const addLocalLog = (msg: string, type: LogType = 'info') => setLogs(p => [{ time: ts(), msg, type }, ...p].slice(0, 50));
 
   const handleVideoMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (!inputEnabled || !webrtc || rtcState !== 'connected' || !remoteStream) return;
+    if (!inputEnabled || EMBED.mode === 'view' || !webrtc || rtcState !== 'connected' || !remoteStream) return;
     const now = Date.now();
     if (now - lastMouseMoveRef.current < 33) return; // ~30 fps throttle
     lastMouseMoveRef.current = now;
@@ -104,28 +105,28 @@ export default function App() {
     webrtc.sendInput({ type: 'mousemove', x: (e.clientX - rect.left) / rect.width, y: (e.clientY - rect.top) / rect.height });
   };
   const handleVideoMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (!inputEnabled || !webrtc || rtcState !== 'connected' || !remoteStream) return;
+    if (!inputEnabled || EMBED.mode === 'view' || !webrtc || rtcState !== 'connected' || !remoteStream) return;
     e.preventDefault();
     const rect = e.currentTarget.getBoundingClientRect();
     webrtc.sendInput({ type: 'mousedown', button: e.button, x: (e.clientX - rect.left) / rect.width, y: (e.clientY - rect.top) / rect.height });
   };
   const handleVideoMouseUp = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (!inputEnabled || !webrtc || rtcState !== 'connected' || !remoteStream) return;
+    if (!inputEnabled || EMBED.mode === 'view' || !webrtc || rtcState !== 'connected' || !remoteStream) return;
     const rect = e.currentTarget.getBoundingClientRect();
     webrtc.sendInput({ type: 'mouseup', button: e.button, x: (e.clientX - rect.left) / rect.width, y: (e.clientY - rect.top) / rect.height });
   };
   const handleVideoWheel = (e: React.WheelEvent<HTMLDivElement>) => {
-    if (!inputEnabled || !webrtc || rtcState !== 'connected' || !remoteStream) return;
+    if (!inputEnabled || EMBED.mode === 'view' || !webrtc || rtcState !== 'connected' || !remoteStream) return;
     const rect = e.currentTarget.getBoundingClientRect();
     webrtc.sendInput({ type: 'wheel', dx: e.deltaX, dy: e.deltaY, x: (e.clientX - rect.left) / rect.width, y: (e.clientY - rect.top) / rect.height });
   };
   const handleVideoKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
-    if (!inputEnabled || !webrtc || rtcState !== 'connected' || !remoteStream) return;
+    if (!inputEnabled || EMBED.mode === 'view' || !webrtc || rtcState !== 'connected' || !remoteStream) return;
     e.preventDefault();
     webrtc.sendInput({ type: 'keydown', key: e.key, code: e.code });
   };
   const handleVideoKeyUp = (e: React.KeyboardEvent<HTMLDivElement>) => {
-    if (!inputEnabled || !webrtc || rtcState !== 'connected' || !remoteStream) return;
+    if (!inputEnabled || EMBED.mode === 'view' || !webrtc || rtcState !== 'connected' || !remoteStream) return;
     webrtc.sendInput({ type: 'keyup', key: e.key, code: e.code });
   };
   const addLog = async (msg: string, type: LogType = 'info') => {
@@ -268,6 +269,37 @@ export default function App() {
       }
     })();
   }, []);
+
+  // --- Embed (Nexus iframe) entegrasyonu ---
+  const autoConnectRef = React.useRef(false);
+
+  // session=<kod> geldiyse hedef kimliği doldur.
+  React.useEffect(() => {
+    if (EMBED.embed && EMBED.session) setTargetId(EMBED.session);
+  }, []);
+
+  // Embed'de kimlik çözülemezse (oturum yok) misafir moduna düş — böylece
+  // auth modalı göstermeden otomatik bağlantı kurulabilir. Kalıcı oturumun
+  // çözülmesi için kısa bir gecikme verilir.
+  React.useEffect(() => {
+    if (!EMBED.embed || !EMBED.session) return;
+    const t = setTimeout(() => {
+      setIsGuest((g) => (!currentUser && !g ? true : g));
+    }, 1500);
+    return () => clearTimeout(t);
+  }, [currentUser]);
+
+  // Kimlik hazır olunca verilen session koduna bir kez otomatik bağlan.
+  React.useEffect(() => {
+    if (!EMBED.embed || !EMBED.session || autoConnectRef.current) return;
+    if (rtcState !== 'idle' || isConnecting) return;
+    if (targetId !== EMBED.session) return;
+    const ready = (currentUser && isEmailVerified) || isGuest;
+    if (!ready) return;
+    autoConnectRef.current = true;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    handleConnect();
+  }, [currentUser, isGuest, isEmailVerified, rtcState, isConnecting, targetId]);
 
   const updateTheme = async (t: Theme) => {
     setTheme(t);
@@ -439,14 +471,19 @@ export default function App() {
     const m = new WebRTCManager(myId);
     m.onStateChange = (state) => {
       setRtcState(state);
+      if (state === 'connecting') {
+        postSessionEvent('connecting', targetId, EMBED.mode);
+      }
       if (state === 'connected') {
         setIsConnecting(false);
+        postSessionEvent('connected', targetId, EMBED.mode);
         if (connTimeoutRef.current) { clearTimeout(connTimeoutRef.current); connTimeoutRef.current = null; }
       }
       if (state === 'disconnected') {
         setIsConnecting(false);
         setRemoteStream(null);
         setInputEnabled(false);
+        postSessionEvent('ended', targetId, EMBED.mode);
         if (localVideoRef.current?.srcObject) {
           (localVideoRef.current.srcObject as MediaStream)?.getTracks().forEach(t => t.stop());
           localVideoRef.current.srcObject = null;
@@ -483,7 +520,9 @@ export default function App() {
 
     if (webrtc) await webrtc.disconnect();
     setWebrtc(null); setRemoteStream(null); setRtcState('idle'); setIsConnecting(true);
-    addLog(`${targetId} adresine baglaniliyor...`, 'warn');
+    addLog(`${targetId} adresine baglaniliyor...${EMBED.op ? ` (operator: ${EMBED.op})` : ''}`, 'warn');
+    resetSessionEvents();
+    postSessionEvent('connecting', targetId, EMBED.mode);
 
     const nd = (v: string) => { const d = v.replace(/\D/g, '').slice(0, 9); return d.length === 9 ? `${d.slice(0,3)}-${d.slice(3,6)}-${d.slice(6,9)}` : v.trim(); };
     const normalizedTarget = nd(targetId);
@@ -501,7 +540,7 @@ export default function App() {
         const q2 = await supabase.from('users').select('id').eq('connection_id', rd).maybeSingle();
         if (q2.data?.id) peerUser = q2.data;
       }
-      if (!peerUser) { setIsConnecting(false); addLog(`Hedef kimlik bulunamadi: ${normalizedTarget}`, 'error'); return; }
+      if (!peerUser) { setIsConnecting(false); postSessionEvent('error', targetId, EMBED.mode); addLog(`Hedef kimlik bulunamadi: ${normalizedTarget}`, 'error'); return; }
       peerSignalId = peerUser.id;
       if (peerSignalId === currentUser.id) { setIsConnecting(false); addLog('Kendi hesabiniza baglamazsiniz.', 'error'); return; }
       addLog(`Hedef cozumlendi -> ${peerSignalId.slice(0,8)}...`, 'sys');
@@ -510,11 +549,11 @@ export default function App() {
     const m = buildManager();
     setWebrtc(m);
     try { await m.call(peerSignalId); }
-    catch (err) { addLog(`Baglantiyi gonderilemedi: ${String(err)}`, 'error'); setWebrtc(null); setIsConnecting(false); return; }
+    catch (err) { postSessionEvent('error', targetId, EMBED.mode); addLog(`Baglantiyi gonderilemedi: ${String(err)}`, 'error'); setWebrtc(null); setIsConnecting(false); return; }
 
     if (connTimeoutRef.current) clearTimeout(connTimeoutRef.current);
     connTimeoutRef.current = setTimeout(async () => {
-      if (!m.isConnected()) { await m.disconnect(); setWebrtc(null); setIsConnecting(false); addLog(`${targetId} yanit vermedi (zaman asimi).`, 'error'); }
+      if (!m.isConnected()) { await m.disconnect(); setWebrtc(null); setIsConnecting(false); postSessionEvent('error', targetId, EMBED.mode); addLog(`${targetId} yanit vermedi (zaman asimi).`, 'error'); }
     }, 30000);
   };
 
@@ -584,12 +623,14 @@ export default function App() {
     if (webrtc) { await webrtc.disconnect(); setWebrtc(null); }
     if (localVideoRef.current?.srcObject) { (localVideoRef.current.srcObject as MediaStream)?.getTracks().forEach(t => t.stop()); localVideoRef.current.srcObject = null; }
     setRemoteStream(null); setRtcState('idle'); setIsConnecting(false); addLog('Baglaniti kesildi.', 'warn');
+    postSessionEvent('ended', targetId, EMBED.mode);
   };
 
   const isLight = theme === 'umay';
 
   return (
     <div className="min-h-screen flex flex-col selection:bg-steppe-gold selection:text-steppe-stone">
+      {!EMBED.embed && (
       <header className="border-b border-steppe-border sticky top-0 z-50 backdrop-blur-md" style={{ background: isLight ? 'rgba(240,244,248,0.92)' : 'rgba(17,16,16,0.85)' }}>
         <div className="max-w-7xl mx-auto px-6 py-4 flex justify-between items-center">
           <div className="flex items-center gap-4">
@@ -628,8 +669,9 @@ export default function App() {
           </nav>
         </div>
       </header>
+      )}
 
-      <main className="flex-1 max-w-7xl mx-auto w-full px-6 py-10">
+      <main className={`flex-1 max-w-7xl mx-auto w-full px-6 ${EMBED.embed ? 'py-4' : 'py-10'}`}>
         {activeTab === 'dashboard' && (
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
             <div className="lg:col-span-4 space-y-6">
@@ -734,12 +776,14 @@ export default function App() {
                       <span className="text-[9px] text-green-400 uppercase tracking-widest">Bagli - {targetId}</span>
                     </div>
                     <div className="absolute top-3 right-3 flex gap-2">
+                      {EMBED.mode !== 'view' && (
                       <button
                         onClick={() => setInputEnabled(v => !v)}
                         className="px-2 py-1 text-[9px] uppercase tracking-widest rounded transition-colors"
                         style={{ background: inputEnabled ? 'var(--accent-primary)' : 'rgba(0,0,0,0.7)', color: inputEnabled ? '#000' : 'var(--text-muted)' }}
                         title="Klavye/fare kontrolünü aç-kapat"
                       >{inputEnabled ? 'Kontrol: AÇIK' : 'Kontrol'}</button>
+                      )}
                       <button onClick={() => videoContainerRef.current?.requestFullscreen()} className="px-2 py-1 text-[9px] uppercase tracking-widest text-steppe-muted hover:text-steppe-gold rounded" style={{ background: 'rgba(0,0,0,0.7)' }}>Tam Ekran</button>
                       <button onClick={handleDisconnect} className="px-2 py-1 text-[9px] uppercase tracking-widest text-white rounded bg-red-500/80 hover:bg-red-500">Kes</button>
                     </div>
