@@ -1,7 +1,10 @@
 {
   "name": "arku-remote",
   "description": "Güvenli P2P Uzak Masaüstü Uygulaması",
-  "author": "ITrend Technology",
+  "author": {
+    "name": "ITrend Technology",
+    "email": "burakakmese@gmail.com"
+  },
   "private": true,
   "version": "1.0.2",
   "type": "module",
