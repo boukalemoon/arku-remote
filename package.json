@@ -38,7 +38,7 @@
       "category": "public.app-category.utilities"
     },
     "linux": {
-      "icon": "public/icons",
+      "icon": "public/icons/512x512.png",
       "target": [
         "AppImage",
         "deb"

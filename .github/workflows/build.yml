@@ -33,7 +33,10 @@ jobs:
             platform: mac
             artifact_glob: 'dist_electron/*.dmg'
             name: macOS
-          - os: ubuntu-latest
+          # ubuntu-22.04: electron-builder 24.x'in AppImage/app-builder-bin araçları
+          # Ubuntu 24.04'te (ubuntu-latest) libfuse2/glibc uyumsuzluğu nedeniyle
+          # erken hata veriyor. 22.04 stabil çalışıyor.
+          - os: ubuntu-22.04
             platform: linux
             artifact_glob: 'dist_electron/*.AppImage'
             name: Linux
@@ -51,12 +54,14 @@ jobs:
           node-version: '20'
           cache: 'npm'
 
-      # Linux: electron-builder için gerekli sistem paketleri
+      # Linux: electron-builder için gerekli sistem paketleri.
+      # libfuse2 -> AppImage paketleyici (appimagetool) çalışması için şart.
       - name: Install Linux dependencies
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.platform == 'linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
+            libfuse2 \
             libnss3-dev \
             libatk1.0-dev \
             libatk-bridge2.0-dev \
