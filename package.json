@@ -3,7 +3,7 @@
   "description": "Güvenli P2P Uzak Masaüstü Uygulaması",
   "author": "ITrend Technology",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.0.2",
   "type": "module",
   "main": "electron/main.cjs",
   "build": {
@@ -26,8 +26,7 @@
       "target": [
         "nsis",
         "portable"
-      ],
-      "artifactName": "${productName}-Setup.${ext}"
+      ]
     },
     "mac": {
       "icon": "public/icons/icon.icns",
@@ -52,7 +51,8 @@
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "Arku Remote"
+      "shortcutName": "Arku Remote",
+      "artifactName": "${productName}-Setup.${ext}"
     },
     "publish": {
       "provider": "github",

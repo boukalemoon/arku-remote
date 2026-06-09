@@ -74,13 +74,22 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # VITE_ değişkenleri: secret tanımlıysa kullanılır, değilse koddaki public
+      # fallback devreye girer (anon key zaten client'a gömülü, RLS ile korunur).
       - name: Build React app
         run: npm run build
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+          VITE_QRTIM_URL: ${{ secrets.VITE_QRTIM_URL }}
 
       - name: Build Electron — ${{ matrix.name }}
         run: npm run desktop:build:${{ matrix.platform }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+          VITE_QRTIM_URL: ${{ secrets.VITE_QRTIM_URL }}
           # macOS: kod imzalama olmadan Gatekeeper uyarısı görünür.
           # Sertifika eklemek için CSC_LINK ve CSC_KEY_PASSWORD secret'larını tanımlayın.
           CSC_IDENTITY_AUTO_DISCOVERY: false

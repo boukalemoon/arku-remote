@@ -1,4 +1,4 @@
-# Yırak Remote - TURN Sunucusu Kurulumu
+# Arku Remote - TURN Sunucusu Kurulumu
 
 ## Seçenek 1: Docker Desktop ile (Windows)
 
@@ -38,7 +38,7 @@ services:
 Proje klasöründe `turnserver.conf` oluştur:
 
 ```conf
-# TURN Server configuration for Yırak Remote
+# TURN Server configuration for Arku Remote
 
 # Network settings
 listening-port=3478
@@ -61,8 +61,8 @@ max-bps=0
 max-sessions=0
 
 # Security
-realm=turn.yirak.local
-server-name=turn.yirak.local
+realm=turn.arku.local
+server-name=turn.arku.local
 
 # WebRTC friendly settings
 fingerprint
@@ -120,7 +120,7 @@ listening-ip=0.0.0.0
 external-ip=YOUR_DROPLET_IP
 
 user=turnuser:turnpass123
-realm=turn.yirak.local
+realm=turn.arku.local
 
 fingerprint
 verbose
@@ -163,7 +163,7 @@ vercel --prod
 
 ## Adım 6: Test Et
 
-1. https://yirak-remote.vercel.app açın
+1. https://arku-remote.vercel.app açın
 2. İki cihazdan:
    - Cihaz A: Kimlik kopyala
    - Cihaz B: Kimliği gir, Bağlantı Kur

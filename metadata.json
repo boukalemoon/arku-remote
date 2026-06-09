@@ -1,6 +1,6 @@
 {
-  "name": "Ötüken Remote",
-  "description": "Göktürk temalı, güvenli ve kişisel kullanıma uygun WebRTC tabanlı uzak masaüstü yönetim arayüzü.",
+  "name": "Arku Remote",
+  "description": "Göktürk temalı, güvenli P2P (WebRTC) uzak masaüstü uygulaması.",
   "requestFramePermissions": [
     "display-capture"
   ]

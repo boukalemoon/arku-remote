@@ -1,5 +1,5 @@
 -- =========================================================
--- Yırak Remote - signals tablo kontrolü
+-- Arku Remote - signals tablo kontrolü
 -- Bu komutları Supabase SQL Editor'da çalıştırın
 -- =========================================================
 
