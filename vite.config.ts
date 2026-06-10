@@ -4,6 +4,10 @@ import path from 'path';
 import { defineConfig } from 'vite';
 
 export default defineConfig({
+  // Göreli asset yolları: Electron uygulamada index.html `file://` ile yüklenir;
+  // mutlak '/assets/...' yolları dosya sisteminin köküne bakıp 404 verir (beyaz
+  // ekran). './' göreli yolu hem web'de hem Electron'da çalışır.
+  base: './',
   plugins: [react(), tailwindcss()],
   resolve: {
     alias: {
