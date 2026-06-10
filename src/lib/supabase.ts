@@ -7,6 +7,9 @@ import { createClient } from '@supabase/supabase-js';
 const SUPABASE_URL = (import.meta.env.VITE_SUPABASE_URL as string) || 'https://bxakaxylrfjldhtdjjmf.supabase.co';
 const SUPABASE_ANON_KEY = (import.meta.env.VITE_SUPABASE_ANON_KEY as string) || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJ4YWtheHlscmZqbGRodGRqam1mIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQ4MDgyNjIsImV4cCI6MjA5MDM4NDI2Mn0.S1lilLIGP53SaaecNv3u9ZZ-wqQ0wteFjCgoRsgmwB0';
 
+// Edge function çağrılarında gateway `apikey` header'ı için (public anon key).
+export const ARKU_ANON_KEY = SUPABASE_ANON_KEY;
+
 export const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
   auth: {
     persistSession: true,

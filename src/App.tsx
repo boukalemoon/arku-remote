@@ -1,7 +1,7 @@
 ﻿import React from 'react';
 import { Shield, Lock, Zap, Heart, Monitor, Settings, User, Terminal, Globe, LogOut, Sun, ExternalLink, Copy, CheckCircle, QrCode, ArrowRight } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { supabase } from './lib/supabase';
+import { supabase, ARKU_ANON_KEY } from './lib/supabase';
 import type { UserProfile, LogType, ConnectionEntry } from './lib/supabase';
 import type { User as SupabaseUser } from '@supabase/supabase-js';
 import { WebRTCManager } from './lib/webrtc';
@@ -18,6 +18,9 @@ interface QrtimUser { qrtim_id: string; email: string; name: string; username: s
 const QRTIM_BASE_URL = import.meta.env.VITE_QRTIM_URL ?? 'https://qartim.com';
 const QRTIM_ARKU_LINK_URL = 'https://kfpnsxoxfrxepxezatsr.supabase.co/functions/v1/arku-link';
 const QRTIM_AUTH_URL = 'https://bxakaxylrfjldhtdjjmf.supabase.co/functions/v1/qrtim-auth';
+// QRtim projesinin public anon key'i — arku-link edge function'ını çağırırken
+// Supabase gateway'in beklediği apikey header'ı için (public, RLS ile korunur).
+const QRTIM_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtmcG5zeG94ZnJ4ZXB4ZXphdHNyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njk2MjQ0NDUsImV4cCI6MjA4NTIwMDQ0NX0.HN7nKw5gO1cuN9fSmrRO72cgIgqNSUfLsY2L3FOhHDg';
 
 const generateDeviceFingerprint = (): string => {
   const nav = window.navigator;
@@ -386,7 +389,11 @@ export default function App() {
     try {
       const res = await fetch(QRTIM_ARKU_LINK_URL, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          apikey: QRTIM_ANON_KEY,
+          Authorization: `Bearer ${QRTIM_ANON_KEY}`,
+        },
         body: JSON.stringify({ token }),
       });
       const data = await res.json();
@@ -394,17 +401,23 @@ export default function App() {
         addLocalLog(`QRtım bağlantısı başarısız: ${data.error || 'Bilinmeyen hata'}`, 'error');
         return;
       }
-      const { error: updErr } = await supabase.from('users').update({
+      const updatePayload: Record<string, unknown> = {
         qrtim_id: data.user.qrtim_id,
         qrtim_username: data.user.username,
         qrtim_name: data.user.name,
         qrtim_email: data.user.email,
         qrtim_connected_at: new Date().toISOString(),
-      }).eq('id', user.id);
+      };
+      // Ad/telefon Arku'da boşsa QRtım'den doldur (mevcut değeri ezme).
+      if (!displayName && data.user.name) updatePayload.display_name = data.user.name;
+      if (!phone && data.user.phone) updatePayload.phone = data.user.phone;
+      const { error: updErr } = await supabase.from('users').update(updatePayload).eq('id', user.id);
       if (updErr) {
         addLocalLog(`QRtım kimliği kaydedilemedi: ${updErr.message}`, 'error');
         return;
       }
+      if (updatePayload.display_name) setDisplayName(data.user.name);
+      if (updatePayload.phone) setPhone(data.user.phone);
       setQrtimUser(data.user);
       addLocalLog(`QRtım hesabı bağlandı: ${data.user.name}`, 'sys');
     } catch (err) {
@@ -433,7 +446,11 @@ export default function App() {
     try {
       const res = await fetch(QRTIM_AUTH_URL, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          apikey: ARKU_ANON_KEY,
+          Authorization: `Bearer ${ARKU_ANON_KEY}`,
+        },
         body: JSON.stringify({ qrtim_token: token }),
       });
       const data = await res.json();

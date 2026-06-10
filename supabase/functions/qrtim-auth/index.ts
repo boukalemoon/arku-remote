@@ -19,6 +19,11 @@ import { createClient } from "jsr:@supabase/supabase-js@2";
 const QRTIM_ARKU_LINK_URL =
   "https://kfpnsxoxfrxepxezatsr.supabase.co/functions/v1/arku-link";
 
+// QRtim projesinin public anon key'i — arku-link'i çağırırken Supabase
+// gateway'in beklediği apikey/Authorization header'ı için (public, RLS korumalı).
+const QRTIM_ANON_KEY =
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtmcG5zeG94ZnJ4ZXB4ZXphdHNyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njk2MjQ0NDUsImV4cCI6MjA4NTIwMDQ0NX0.HN7nKw5gO1cuN9fSmrRO72cgIgqNSUfLsY2L3FOhHDg";
+
 const cors = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers":
@@ -46,7 +51,11 @@ Deno.serve(async (req: Request) => {
     // 1) QRtım token'ını doğrula (tek kullanımlık olarak burada tüketilir)
     const vr = await fetch(QRTIM_ARKU_LINK_URL, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        apikey: QRTIM_ANON_KEY,
+        Authorization: `Bearer ${QRTIM_ANON_KEY}`,
+      },
       body: JSON.stringify({ token: qrtim_token }),
     });
     const vd = await vr.json().catch(() => ({ valid: false }));
@@ -55,7 +64,7 @@ Deno.serve(async (req: Request) => {
     }
 
     const q = vd.user as {
-      qrtim_id: string; email: string; name: string; username: string;
+      qrtim_id: string; email: string; name: string; username: string; phone: string | null;
     };
     if (!q.email) return json({ error: "QRtım hesabında e-posta yok" }, 400);
 
@@ -81,8 +90,16 @@ Deno.serve(async (req: Request) => {
       return json({ error: "Oturum oluşturulamadı" }, 500);
     }
 
-    // 4) QRtım kimliğini Arku users tablosuna yaz
-    await admin.from("users").upsert({
+    // 4) QRtım kimliğini Arku users tablosuna yaz. Ad/telefon gibi profil
+    //    alanlarını yalnızca Arku tarafında boşsa QRtım'den doldur — kullanıcının
+    //    daha önce Arku'da yaptığı özelleştirmeyi ezme.
+    const { data: existing } = await admin
+      .from("users")
+      .select("display_name, phone")
+      .eq("id", linkData.user.id)
+      .maybeSingle();
+
+    const row: Record<string, unknown> = {
       id: linkData.user.id,
       email: q.email,
       qrtim_id: q.qrtim_id,
@@ -90,7 +107,11 @@ Deno.serve(async (req: Request) => {
       qrtim_name: q.name,
       qrtim_email: q.email,
       qrtim_connected_at: new Date().toISOString(),
-    }, { onConflict: "id" });
+    };
+    if (!existing?.display_name && q.name) row.display_name = q.name;
+    if (!existing?.phone && q.phone) row.phone = q.phone;
+
+    await admin.from("users").upsert(row, { onConflict: "id" });
 
     return json({
       email: q.email,
