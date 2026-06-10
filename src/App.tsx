@@ -375,9 +375,14 @@ export default function App() {
   };
   const handleLogout = async () => {
     if (connTimeoutRef.current) clearTimeout(connTimeoutRef.current);
-    if (webrtc) { await webrtc.disconnect(); setWebrtc(null); }
-    await supabase.auth.signOut();
+    if (webrtc) { try { await webrtc.disconnect(); } catch { /* yok say */ } setWebrtc(null); }
+    // signOut'un sunucu çağrısı (global scope) başarısız olsa bile yerel oturumu
+    // kesin temizle; aksi halde state güncellenmez ve "çıkış yapılmıyor" görünür.
+    try { await supabase.auth.signOut({ scope: 'local' }); } catch { /* yok say */ }
+    // QRtım yeniden-giriş döngüsünü kır: kalan callback/token izlerini temizle.
+    try { sessionStorage.removeItem('partner_callback'); } catch { /* yok say */ }
     setCurrentUser(null); setUserProfile(null); setIsGuest(false); setConnectionHistory([]);
+    setQrtimUser(null);
     setRemoteStream(null); setRtcState('idle'); setIsConnecting(false);
     setConnectionId(getOrCreateGuestId()); setDisplayName(''); setPhone(''); setSessionToken(''); setDeviceFingerprint('');
     setActiveTab('dashboard'); addLocalLog('Oturum kapatildi.', 'warn');
