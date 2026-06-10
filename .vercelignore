@@ -1,0 +1,8 @@
+# Electron paketleme çıktıları (web deploy'a dahil edilmez — 100MB+ .exe/.asar)
+dist_electron
+electron
+hooks
+supabase
+website
+*.exe
+*.asar

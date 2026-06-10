@@ -1127,7 +1127,7 @@ export default function App() {
       </AnimatePresence>
 
       <footer className="border-t border-steppe-border py-6 text-center" style={{ background: isLight ? 'rgba(240,244,248,0.8)' : 'rgba(0,0,0,0.2)' }}>
-        <p className="text-[9px] text-steppe-muted tracking-[0.3em] uppercase">2026 Arku Remote - ITrend Technology</p>
+        <p className="text-[9px] text-steppe-muted tracking-[0.3em] uppercase">2026 Arku Remote - TrendTech</p>
       </footer>
     </div>
   );

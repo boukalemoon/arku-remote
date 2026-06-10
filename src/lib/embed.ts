@@ -40,7 +40,9 @@ function compute(): EmbedConfig {
   return {
     embed: p.get('embed') === '1',
     mode: p.get('mode') === 'view' ? 'view' : 'control',
-    session: p.get('session'),
+    // Otomatik bağlanılacak hedef kimlik. Nexus firmaya tanımlı Arku ID'sini
+    // `target` ile gönderir; `session` geriye dönük uyumluluk için alias.
+    session: p.get('target') ?? p.get('session'),
     op: p.get('op'),
     parentOrigin: detectParentOrigin(),
   };

@@ -2,17 +2,17 @@
   "name": "arku-remote",
   "description": "Güvenli P2P Uzak Masaüstü Uygulaması",
   "author": {
-    "name": "ITrend Technology",
+    "name": "TrendTech",
     "email": "burakakmese@gmail.com"
   },
   "private": true,
-  "version": "1.0.4",
+  "version": "1.0.5",
   "type": "module",
   "main": "electron/main.cjs",
   "build": {
     "appId": "com.arku.remote",
     "productName": "Arku-Remote",
-    "copyright": "Copyright © 2026 ITrend Technology",
+    "copyright": "Copyright © 2026 TrendTech",
     "directories": {
       "output": "dist_electron"
     },

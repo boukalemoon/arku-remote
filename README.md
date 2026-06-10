@@ -60,4 +60,4 @@ Güvenlik açığı bildirimi için: [SECURITY.md](SECURITY.md)
 
 ---
 
-**ITrend Technology** tarafından geliştirildi.
+**TrendTech** tarafından geliştirildi.
