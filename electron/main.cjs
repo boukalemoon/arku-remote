@@ -12,7 +12,7 @@ function createWindow() {
       contextIsolation: true,
       preload: path.join(__dirname, 'preload.cjs'),
     },
-    icon: path.join(__dirname, '../public/icon.ico'),
+    icon: path.join(__dirname, '../dist/icons/icon.ico'),
     title: 'Arku Remote',
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
     ...(process.platform !== 'darwin' && {
@@ -38,6 +38,22 @@ function createWindow() {
     }
     return { action: 'deny' };
   });
+
+  // QRtım SSO dönüşü: pencere QRtım girişine gider, QRtım web callback'e
+  // (?qrtim_token=...) yönlendirir. Web uygulamasını yüklemek yerine token'ı
+  // yakalayıp yerel index.html'i token ile yeniden yükle — SSO yerelde tamamlanır.
+  const interceptQrtimReturn = (event, url) => {
+    try {
+      const u = new URL(url);
+      const token = u.searchParams.get('qrtim_token');
+      if (token && u.origin === 'https://arku-remote.vercel.app') {
+        event.preventDefault();
+        win.loadFile(path.join(__dirname, '../dist/index.html'), { query: { qrtim_token: token } });
+      }
+    } catch { /* geçersiz URL — yok say */ }
+  };
+  win.webContents.on('will-navigate', interceptQrtimReturn);
+  win.webContents.on('will-redirect', interceptQrtimReturn);
 
   const isDev = process.env.NODE_ENV === 'development' || !app.isPackaged;
 if (isDev) {

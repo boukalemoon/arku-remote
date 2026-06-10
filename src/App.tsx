@@ -252,7 +252,7 @@ export default function App() {
         if (cxData) setConnectionHistory(cxData as ConnectionEntry[]);
       } else {
         setIsEmailVerified(true); setUserProfile(null); setSessionToken(''); setDeviceFingerprint(''); setConnectionId(getOrCreateGuestId());
-        setLogs([{ time: ts(), msg: 'Arku Remote v1.0.2 baslatildi...', type: 'sys' }, { time: ts(), msg: 'Lutfen giris yapin.', type: 'warn' }]);
+        setLogs([{ time: ts(), msg: `Arku Remote v${__APP_VERSION__} baslatildi...`, type: 'sys' }, { time: ts(), msg: 'Lutfen giris yapin.', type: 'warn' }]);
       }
     });
     return () => subscription.unsubscribe();
@@ -433,16 +433,25 @@ export default function App() {
     }
   };
 
+  // QRtım'in geri döneceği adres. Masaüstü (Electron) uygulamada sayfa file://
+  // ile yüklüdür; QRtim file:// callback'i kabul etmez (ve https -> file://
+  // yönlendirme tarayıcıca engellenir). Bu yüzden Electron'da callback olarak
+  // güvenilen web adresi kullanılır; dönüş electron/main.cjs tarafından
+  // yakalanıp token yerel uygulamaya aktarılır.
+  const qrtimCallbackUrl = () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    if ((window as any).electronAPI?.isElectron) return 'https://arku-remote.vercel.app';
+    return window.location.origin + window.location.pathname;
+  };
+
   const handleQrtimConnect = () => {
     if (!currentUser) { setShowAuth(true); setAuthMode('login'); return; }
-    const callbackUrl = window.location.origin + window.location.pathname;
-    window.location.href = `${QRTIM_BASE_URL}/login?callback=${encodeURIComponent(callbackUrl)}&source=arku`;
+    window.location.href = `${QRTIM_BASE_URL}/login?callback=${encodeURIComponent(qrtimCallbackUrl())}&source=arku`;
   };
 
   // Giriş ekranından QRtım ile tek tıkla giriş (oturum gerekmez).
   const handleQrtimLogin = () => {
-    const callbackUrl = window.location.origin + window.location.pathname;
-    window.location.href = `${QRTIM_BASE_URL}/login?callback=${encodeURIComponent(callbackUrl)}&source=arku`;
+    window.location.href = `${QRTIM_BASE_URL}/login?callback=${encodeURIComponent(qrtimCallbackUrl())}&source=arku`;
   };
 
   // QRtım token'ı ile dönüldüğünde: oturum varsa hesabı bağla, yoksa SSO ile giriş yap.
@@ -657,11 +666,11 @@ export default function App() {
         <div className="max-w-7xl mx-auto px-6 py-4 flex justify-between items-center">
           <div className="flex items-center gap-4">
             <div className="w-11 h-11 gokturk-border flex items-center justify-center overflow-hidden" style={{ background: 'var(--bg-primary)' }}>
-              <img src="/icons/64x64.png" alt="Arku" className="w-9 h-9 object-contain" />
+              <img src="./icons/64x64.png" alt="Arku" className="w-9 h-9 object-contain" />
             </div>
             <div>
               <h1 className="text-lg text-steppe-gold leading-none">Arku Remote</h1>
-              <span className="text-[7px] px-1 border border-steppe-border text-steppe-gold opacity-60 uppercase tracking-widest">v1.0.2</span>
+              <span className="text-[7px] px-1 border border-steppe-border text-steppe-gold opacity-60 uppercase tracking-widest">{`v${__APP_VERSION__}`}</span>
             </div>
           </div>
           <div className="hidden md:flex items-center gap-2 px-3 py-1 border border-steppe-border" style={{ background: 'var(--surface-primary)' }}>
@@ -947,10 +956,10 @@ export default function App() {
                     value={captureFrameRate}
                     onChange={e => setCaptureFrameRate(Number(e.target.value))}
                     className="input-field py-1 w-28 text-center"
-                    style={{ background: 'var(--surface-primary)' }}
+                    style={{ background: 'var(--surface-primary)', color: 'var(--text-primary)' }}
                   >
                     {[5, 10, 15, 24, 30].map(fps => (
-                      <option key={fps} value={fps}>{fps} FPS</option>
+                      <option key={fps} value={fps} style={{ background: 'var(--bg-primary)', color: 'var(--text-primary)' }}>{fps} FPS</option>
                     ))}
                   </select>
                 </div>
@@ -976,7 +985,7 @@ export default function App() {
                     <span className="text-[9px] uppercase tracking-widest text-green-400 border border-green-400/30 px-2 py-1">Bağlı</span>
                   </div>
                   <div className="grid grid-cols-2 gap-3">
-                    <button onClick={() => window.open(`${QRTIM_BASE_URL}/card/${qrtimUser.username}`, '_blank')} className="btn-ghost flex items-center justify-center gap-2"><ExternalLink size={12} /> Kartı Gör</button>
+                    <button onClick={() => window.open(qrtimUser.username ? `${QRTIM_BASE_URL}/card/${qrtimUser.username}` : `${QRTIM_BASE_URL}/dashboard`, '_blank')} className="btn-ghost flex items-center justify-center gap-2"><ExternalLink size={12} /> Kartı Gör</button>
                     <button onClick={handleQrtimDisconnect} className="py-3 border border-red-500/30 text-red-400 text-[10px] uppercase tracking-widest hover:bg-red-500/10 transition-all">Bağlantıyı Kes</button>
                   </div>
                 </>
@@ -990,7 +999,7 @@ export default function App() {
                     <span className="text-[9px] uppercase tracking-widest text-yellow-400 border border-yellow-400/30 px-2 py-1">Bagli Degil</span>
                   </div>
                   <div className="grid grid-cols-2 gap-3">
-                    <button onClick={() => { const cb = encodeURIComponent(window.location.origin + window.location.pathname); window.open(`${QRTIM_BASE_URL}/signup?callback=${cb}&source=arku`, '_blank'); }} className="btn-primary">Hesap Olustur</button>
+                    <button onClick={() => { window.open(`${QRTIM_BASE_URL}/signup?callback=${encodeURIComponent(qrtimCallbackUrl())}&source=arku`, '_blank'); }} className="btn-primary">Hesap Olustur</button>
                     <button onClick={handleQrtimConnect} className="btn-ghost">QRtım ile Bağla</button>
                   </div>
                   <p className="text-[9px] text-steppe-muted mt-3 text-center">QRtım hesabınız varsa "QRtım ile Bağla" butonuna tıklayın</p>
