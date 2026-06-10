@@ -65,11 +65,24 @@ if (isDev) {
 
   win.setMenuBarVisibility(false);
 
+  // Ctrl+N (mac: Cmd+N) -> yeni bağımsız oturum penceresi.
+  // Her pencere kendi WebRTC oturumunu yönetir; aynı hesapla birden fazla
+  // müşteriye eşzamanlı bağlanmayı sağlar.
+  win.webContents.on('before-input-event', (_event, input) => {
+    const mod = process.platform === 'darwin' ? input.meta : input.control;
+    if (mod && !input.shift && !input.alt && input.type === 'keyDown' && input.key.toLowerCase() === 'n') {
+      createWindow();
+    }
+  });
+
   // Pencere hazır olduğunda göster
   win.once('ready-to-show', () => {
     win.show();
   });
 }
+
+// Renderer'daki "Yeni Oturum" butonu
+ipcMain.on('new-window', () => createWindow());
 
 app.whenReady().then(() => {
   createWindow();

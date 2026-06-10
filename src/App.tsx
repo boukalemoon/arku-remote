@@ -171,7 +171,13 @@ export default function App() {
             addLocalLog(`${sig.from_id} baglanmak istiyor...`, 'warn');
           }
           if (sig.type === 'hangup') {
-            setIncomingCall(null);
+            // Yalnızca ilgili taraftan gelen hangup'ı işle. Aynı hesapla birden
+            // fazla pencere/oturum açıkken, başka bir oturumun hangup'ı bu
+            // pencerenin aktif bağlantısını KESMEMELİ (sinyaller to_id=hesapID
+            // ile hepsine ulaşır; ayrım from_id ile yapılır).
+            setIncomingCall(prev => (prev && prev.fromId === sig.from_id) ? null : prev);
+            const activePeer = webrtcRef.current?.getPeerId?.();
+            if (!activePeer || sig.from_id !== activePeer) return;
             addLocalLog('Karsi taraf baglantıyi kesti.', 'warn');
             // Disconnect the active WebRTCManager (uses ref to avoid stale closure)
             webrtcRef.current?.disconnect().catch(() => {});
@@ -684,6 +690,16 @@ export default function App() {
                 {tab === 'dashboard' ? 'Panel' : tab === 'connections' ? 'Baglantilar' : 'Ayarlar'}
               </button>
             ))}
+            <button
+              onClick={() => {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                const api = (window as any).electronAPI;
+                if (api?.newWindow) api.newWindow();
+                else window.open(window.location.origin + window.location.pathname, '_blank');
+              }}
+              title="Ayni hesapla ikinci bir musteriye baglanmak icin yeni bagimsiz oturum ac (Ctrl+N)"
+              className="flex items-center gap-2 text-[11px] uppercase tracking-widest text-steppe-muted hover:text-steppe-gold transition-colors"
+            ><ExternalLink size={12} /> Yeni Oturum</button>
             {currentUser ? (
               <div className="flex items-center gap-4">
                 <span className="text-[10px] text-steppe-gold opacity-70">{userProfile?.display_name || currentUser.email}</span>

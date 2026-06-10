@@ -480,4 +480,7 @@ export class WebRTCManager {
   }
 
   isConnected(): boolean { return this.pc?.connectionState === 'connected'; }
+
+  /** Bu oturumun karşı taraf kimliği — App seviyesindeki sinyal filtreleri için. */
+  getPeerId(): string { return this.peerId; }
 }
