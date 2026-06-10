@@ -249,7 +249,7 @@ export default function App() {
         if (cxData) setConnectionHistory(cxData as ConnectionEntry[]);
       } else {
         setIsEmailVerified(true); setUserProfile(null); setSessionToken(''); setDeviceFingerprint(''); setConnectionId(getOrCreateGuestId());
-        setLogs([{ time: ts(), msg: 'Arku Remote v1.0.0 baslatildi...', type: 'sys' }, { time: ts(), msg: 'Lutfen giris yapin.', type: 'warn' }]);
+        setLogs([{ time: ts(), msg: 'Arku Remote v1.0.2 baslatildi...', type: 'sys' }, { time: ts(), msg: 'Lutfen giris yapin.', type: 'warn' }]);
       }
     });
     return () => subscription.unsubscribe();
@@ -639,7 +639,7 @@ export default function App() {
             </div>
             <div>
               <h1 className="text-lg text-steppe-gold leading-none">Arku Remote</h1>
-              <span className="text-[7px] px-1 border border-steppe-border text-steppe-gold opacity-60 uppercase tracking-widest">v1.0.0</span>
+              <span className="text-[7px] px-1 border border-steppe-border text-steppe-gold opacity-60 uppercase tracking-widest">v1.0.2</span>
             </div>
           </div>
           <div className="hidden md:flex items-center gap-2 px-3 py-1 border border-steppe-border" style={{ background: 'var(--surface-primary)' }}>
