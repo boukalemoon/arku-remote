@@ -1,8 +1,10 @@
 # Electron paketleme çıktıları (web deploy'a dahil edilmez — 100MB+ .exe/.asar)
+# DIKKAT: "website" klasörünü buraya EKLEME — tanıtım sitesi Vercel projesi
+# (arku-remote-website) aynı repodan, kök dizini website/ olarak deploy olur;
+# burada dışlanırsa o projeye hiç dosya gitmez ve site 404 verir.
 dist_electron
 electron
 hooks
 supabase
-website
 *.exe
 *.asar
