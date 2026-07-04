@@ -38,6 +38,50 @@ function json(body: unknown, status = 200): Response {
   });
 }
 
+// QRtım planı -> Arku planı. Tüm ücretli planlar ücretsiz Arku verir.
+function mapQrtimPlan(p: string | null): "free" | "pro" | "business" {
+  const v = (p ?? "").toLowerCase();
+  if (["business", "kurumsal", "stk", "enterprise"].includes(v)) return "business";
+  if (v === "" || v === "free") return "free";
+  return "pro"; // student, professional ve diğer tüm ücretli planlar
+}
+
+// QRtım kaynaklı Arku aboneliği ver/güncelle.
+// Kurallar: ücretsiz plan için abonelik oluşturma; satın alınmış (source=direct,
+// active) aboneliği ezme; yalnızca qrtim kaynaklı satırı güncelle.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function grantQrtimSubscription(admin: any, userId: string, qrtimPlan: string | null) {
+  const arkuPlan = mapQrtimPlan(qrtimPlan);
+
+  const { data: existing } = await admin
+    .from("subscriptions")
+    .select("id, source, status, plan")
+    .eq("owner_id", userId)
+    .maybeSingle();
+
+  // Satın alınmış aktif aboneliğe dokunma
+  if (existing && existing.source === "direct" && existing.status === "active") return;
+
+  if (arkuPlan === "free") {
+    // QRtım artık ücretsiz: yalnızca qrtim kaynaklı satırı free'ye çek
+    if (existing && existing.source === "qrtim") {
+      await admin.from("subscriptions")
+        .update({ plan: "free", qrtim_plan: qrtimPlan, status: "active" })
+        .eq("owner_id", userId);
+    }
+    return;
+  }
+
+  await admin.from("subscriptions").upsert({
+    owner_id: userId,
+    plan: arkuPlan,
+    status: "active",
+    source: "qrtim",
+    qrtim_plan: qrtimPlan,
+    seats: arkuPlan === "business" ? 5 : 1,
+  }, { onConflict: "owner_id" });
+}
+
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
   if (req.method !== "POST") return json({ error: "Yalnızca POST desteklenir" }, 405);
@@ -65,6 +109,7 @@ Deno.serve(async (req: Request) => {
 
     const q = vd.user as {
       qrtim_id: string; email: string; name: string; username: string; phone: string | null;
+      plan?: string | null;
     };
     if (!q.email) return json({ error: "QRtım hesabında e-posta yok" }, 400);
 
@@ -112,6 +157,10 @@ Deno.serve(async (req: Request) => {
     if (!existing?.phone && q.phone) row.phone = q.phone;
 
     await admin.from("users").upsert(row, { onConflict: "id" });
+
+    // 5) QRtım aboneliğini Arku'ya senkronla — ücretli QRtım planları ücretsiz
+    //    Arku aboneliği verir. Mevcut satın alınmış (direct) abonelik ezilmez.
+    await grantQrtimSubscription(admin, linkData.user.id, q.plan ?? null);
 
     return json({
       email: q.email,

@@ -24,6 +24,37 @@ export const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
 
 export type LogType = 'info' | 'warn' | 'error' | 'sys';
 
+export type ArkuPlan = 'free' | 'pro' | 'team' | 'business';
+
+// arku_effective_subscription RPC'sinin döndürdüğü etkin abonelik özeti.
+export interface Entitlements {
+  plan: ArkuPlan;
+  source: 'direct' | 'qrtim' | 'manual' | 'none';
+  seats: number;
+  is_org_member: boolean;
+}
+
+export const FREE_ENTITLEMENTS: Entitlements = { plan: 'free', source: 'none', seats: 1, is_org_member: false };
+
+// Plan yeteneklerinin tek kaynağı. UI ve mantık bunu okur.
+export function planCapabilities(plan: ArkuPlan) {
+  return {
+    savedContacts: plan !== 'free',              // kayıtlı müşteri ID'leri + kategori
+    organizations: plan === 'team' || plan === 'business', // kurumsal (slug, logo, üyeler)
+    customBranding: plan === 'business',         // logo + vanity slug
+    multiOperator: plan === 'team' || plan === 'business',
+  };
+}
+
+// Giriş yapmış kullanıcının etkin aboneliğini getirir (org üyeliği dahil en yüksek plan).
+export async function fetchEntitlements(): Promise<Entitlements> {
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return FREE_ENTITLEMENTS;
+  const { data, error } = await supabase.rpc('arku_effective_subscription', { p_uid: user.id });
+  if (error || !data) return FREE_ENTITLEMENTS;
+  return { ...FREE_ENTITLEMENTS, ...(data as Partial<Entitlements>) };
+}
+
 export interface UserProfile {
   id: string;
   email: string;

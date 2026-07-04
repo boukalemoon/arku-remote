@@ -1,8 +1,8 @@
 ﻿import React from 'react';
 import { Shield, Lock, Zap, Heart, Monitor, Settings, User, Terminal, Globe, LogOut, Sun, ExternalLink, Copy, CheckCircle, QrCode, ArrowRight } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { supabase, ARKU_ANON_KEY } from './lib/supabase';
-import type { UserProfile, LogType, ConnectionEntry } from './lib/supabase';
+import { supabase, ARKU_ANON_KEY, fetchEntitlements, FREE_ENTITLEMENTS } from './lib/supabase';
+import type { UserProfile, LogType, ConnectionEntry, Entitlements } from './lib/supabase';
 import type { User as SupabaseUser } from '@supabase/supabase-js';
 import { WebRTCManager } from './lib/webrtc';
 import type { ConnectionState, InputEventMsg } from './lib/webrtc';
@@ -16,11 +16,12 @@ interface IncomingCall { fromId: string; offerPayload: Record<string, unknown>; 
 interface QrtimUser { qrtim_id: string; email: string; name: string; username: string; photo_url: string | null; title: string | null; company: string | null; plan: string; }
 
 const QRTIM_BASE_URL = import.meta.env.VITE_QRTIM_URL ?? 'https://qartim.com';
-const QRTIM_ARKU_LINK_URL = 'https://kfpnsxoxfrxepxezatsr.supabase.co/functions/v1/arku-link';
+// QRtım entegrasyonu artık Arku edge fonksiyonları üzerinden yürür:
+//   qrtim-auth  -> SSO ile giriş, qrtim-sync -> hesap bağlama + abonelik senkronu.
+// Bu fonksiyonlar QRtım'in arku-link'ini server-to-server kendileri çağırır;
+// client'ın QRtım anon key'ini tutmasına gerek kalmadı.
 const QRTIM_AUTH_URL = 'https://jpmbttlxyxrqmpghymbq.supabase.co/functions/v1/qrtim-auth';
-// QRtim projesinin public anon key'i — arku-link edge function'ını çağırırken
-// Supabase gateway'in beklediği apikey header'ı için (public, RLS ile korunur).
-const QRTIM_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtmcG5zeG94ZnJ4ZXB4ZXphdHNyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njk2MjQ0NDUsImV4cCI6MjA4NTIwMDQ0NX0.HN7nKw5gO1cuN9fSmrRO72cgIgqNSUfLsY2L3FOhHDg';
+const QRTIM_SYNC_URL = 'https://jpmbttlxyxrqmpghymbq.supabase.co/functions/v1/qrtim-sync';
 
 const generateDeviceFingerprint = (): string => {
   const nav = window.navigator;
@@ -93,6 +94,7 @@ export default function App() {
   const [captureFrameRate, setCaptureFrameRate] = React.useState(15);
   const [qrtimUser, setQrtimUser] = React.useState<QrtimUser | null>(null);
   const [qrtimLinking, setQrtimLinking] = React.useState(false);
+  const [entitlements, setEntitlements] = React.useState<Entitlements>(FREE_ENTITLEMENTS);
   const lastMouseMoveRef = React.useRef(0);
   // Polling fallback refs for when Supabase Realtime WebSocket is unavailable
   const incomingPollSinceRef = React.useRef(new Date().toISOString());
@@ -261,8 +263,10 @@ export default function App() {
         if (lgData) setLogs(lgData.map(l => ({ time: new Date(l.created_at).toLocaleTimeString('tr-TR'), msg: l.msg, type: l.type as LogType })));
         const { data: cxData } = await supabase.from('connections').select('*').eq('caller_id', user.id).order('created_at', { ascending: false }).limit(20);
         if (cxData) setConnectionHistory(cxData as ConnectionEntry[]);
+        setEntitlements(await fetchEntitlements());
       } else {
         setIsEmailVerified(true); setUserProfile(null); setSessionToken(''); setDeviceFingerprint(''); setConnectionId(getOrCreateGuestId());
+        setEntitlements(FREE_ENTITLEMENTS);
         setLogs([{ time: ts(), msg: `Arku Remote v${__APP_VERSION__} baslatildi...`, type: 'sys' }, { time: ts(), msg: 'Lutfen giris yapin.', type: 'warn' }]);
       }
     });
@@ -415,42 +419,38 @@ export default function App() {
   };
   const handleGuestLogin = () => { setIsGuest(true); setShowAuth(false); setAuthError(''); addLog('Misafir olarak devam ediliyor.', 'warn'); };
 
-  const handleQrtimCallback = async (token: string, user: SupabaseUser) => {
+  const refreshEntitlements = async () => {
+    try { setEntitlements(await fetchEntitlements()); }
+    catch { setEntitlements(FREE_ENTITLEMENTS); }
+  };
+
+  const handleQrtimCallback = async (token: string, _user: SupabaseUser) => {
     setQrtimLinking(true);
     try {
-      const res = await fetch(QRTIM_ARKU_LINK_URL, {
+      // qrtim-sync (Arku edge function): QRtım token'ını server-to-server doğrular,
+      // kimliği users satırına yazar ve ücretli QRtım planı için ücretsiz Arku
+      // aboneliği verir. Çağrı, kullanıcının kendi oturum jetonuyla yapılır.
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session) { addLocalLog('QRtım bağlantısı için oturum gerekli.', 'error'); return; }
+      const res = await fetch(QRTIM_SYNC_URL, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          apikey: QRTIM_ANON_KEY,
-          Authorization: `Bearer ${QRTIM_ANON_KEY}`,
+          apikey: ARKU_ANON_KEY,
+          Authorization: `Bearer ${session.access_token}`,
         },
-        body: JSON.stringify({ token }),
+        body: JSON.stringify({ qrtim_token: token }),
       });
       const data = await res.json();
       if (!res.ok || !data.valid) {
         addLocalLog(`QRtım bağlantısı başarısız: ${data.error || 'Bilinmeyen hata'}`, 'error');
         return;
       }
-      const updatePayload: Record<string, unknown> = {
-        qrtim_id: data.user.qrtim_id,
-        qrtim_username: data.user.username,
-        qrtim_name: data.user.name,
-        qrtim_email: data.user.email,
-        qrtim_connected_at: new Date().toISOString(),
-      };
-      // Ad/telefon Arku'da boşsa QRtım'den doldur (mevcut değeri ezme).
-      if (!displayName && data.user.name) updatePayload.display_name = data.user.name;
-      if (!phone && data.user.phone) updatePayload.phone = data.user.phone;
-      const { error: updErr } = await supabase.from('users').update(updatePayload).eq('id', user.id);
-      if (updErr) {
-        addLocalLog(`QRtım kimliği kaydedilemedi: ${updErr.message}`, 'error');
-        return;
-      }
-      if (updatePayload.display_name) setDisplayName(data.user.name);
-      if (updatePayload.phone) setPhone(data.user.phone);
+      if (data.user.name && !displayName) setDisplayName(data.user.name);
       setQrtimUser(data.user);
-      addLocalLog(`QRtım hesabı bağlandı: ${data.user.name}`, 'sys');
+      await refreshEntitlements();
+      const planNote = data.arku_plan && data.arku_plan !== 'free' ? ` (Arku ${data.arku_plan} aboneliği tanımlandı)` : '';
+      addLocalLog(`QRtım hesabı bağlandı: ${data.user.name}${planNote}`, 'sys');
     } catch (err) {
       addLocalLog(`QRtım bağlantısı hatası: ${String(err)}`, 'error');
     } finally {
@@ -763,6 +763,11 @@ export default function App() {
                 <div className="flex items-center gap-2 mt-3">
                   <div className={`w-1.5 h-1.5 rounded-full ${currentUser ? 'bg-green-400' : isGuest ? 'bg-yellow-400' : 'bg-gray-400'}`} />
                   <span className="text-[9px] text-steppe-muted uppercase tracking-widest">{currentUser ? 'Profil ID' : isGuest ? 'Misafir ID' : 'Cihaz ID (Gecici)'}</span>
+                  {currentUser && entitlements.plan !== 'free' && (
+                    <span className="text-[8px] px-1.5 py-0.5 rounded uppercase tracking-widest font-bold" style={{ background: 'var(--accent-primary)', color: 'var(--btn-text)' }}>
+                      {entitlements.plan}{entitlements.source === 'qrtim' ? ' · QRtım' : ''}
+                    </span>
+                  )}
                 </div>
                 {currentUser && sessionToken && (
                   <div className="mt-2 p-2 border border-steppe-border" style={{ background: 'var(--log-bg)' }}>
