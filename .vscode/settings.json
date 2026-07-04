@@ -1,0 +1,8 @@
+{
+  // Supabase Edge Function'ları Deno çalışma zamanında koşar; bu klasörde
+  // VSCode'un yerleşik TypeScript'i yerine Deno dil sunucusu kullanılır.
+  // Gerekli eklenti: denoland.vscode-deno (extensions.json'da önerili).
+  "deno.enablePaths": ["supabase/functions"],
+  "deno.lint": true,
+  "deno.unstable": false
+}
