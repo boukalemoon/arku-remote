@@ -1,15 +1,22 @@
 ﻿import React from 'react';
-import { Shield, Lock, Zap, Heart, Monitor, Settings, User, Terminal, Globe, LogOut, Sun, ExternalLink, Copy, CheckCircle, QrCode, ArrowRight } from 'lucide-react';
+import { Shield, Lock, Zap, Heart, Monitor, Settings, User, Terminal, Globe, LogOut, Sun, ExternalLink, Copy, CheckCircle, QrCode, ArrowRight, Building2, Users, Plus, Trash2, Tag, Bookmark } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { supabase, ARKU_ANON_KEY, fetchEntitlements, FREE_ENTITLEMENTS } from './lib/supabase';
+import { supabase, ARKU_ANON_KEY, fetchEntitlements, FREE_ENTITLEMENTS, planCapabilities } from './lib/supabase';
 import type { UserProfile, LogType, ConnectionEntry, Entitlements } from './lib/supabase';
+import {
+  listMyOrganizations, createOrganization, updateOrganization, deleteOrganization,
+  listOrgMembers, addOrgMember, updateOrgMember, removeOrgMember,
+  listCategories, createCategory, deleteCategory,
+  listSavedContacts, createSavedContact, deleteSavedContact, touchSavedContact,
+} from './lib/enterprise';
+import type { Organization, OrgMember, ContactCategory, SavedContact, OrgRole } from './lib/enterprise';
 import type { User as SupabaseUser } from '@supabase/supabase-js';
 import { WebRTCManager } from './lib/webrtc';
 import type { ConnectionState, InputEventMsg } from './lib/webrtc';
 import { EMBED, postSessionEvent, resetSessionEvents } from './lib/embed';
 
 type Theme = 'otuken' | 'umay' | 'gok' | 'gece';
-type Tab = 'dashboard' | 'connections' | 'settings';
+type Tab = 'dashboard' | 'connections' | 'contacts' | 'organization' | 'settings';
 type AuthMode = 'login' | 'register' | 'mfa' | 'reset';
 interface LogEntryLocal { time: string; msg: string; type: LogType; }
 interface IncomingCall { fromId: string; offerPayload: Record<string, unknown>; sessionId?: string; }
@@ -95,6 +102,13 @@ export default function App() {
   const [qrtimUser, setQrtimUser] = React.useState<QrtimUser | null>(null);
   const [qrtimLinking, setQrtimLinking] = React.useState(false);
   const [entitlements, setEntitlements] = React.useState<Entitlements>(FREE_ENTITLEMENTS);
+  // Kurumsal + kayıtlı müşteri durumu
+  const [savedContacts, setSavedContacts] = React.useState<SavedContact[]>([]);
+  const [categories, setCategories] = React.useState<ContactCategory[]>([]);
+  const [organizations, setOrganizations] = React.useState<Organization[]>([]);
+  const [activeOrgId, setActiveOrgId] = React.useState<string | null>(null);
+  const [orgMembers, setOrgMembers] = React.useState<OrgMember[]>([]);
+  const caps = planCapabilities(entitlements.plan);
   const lastMouseMoveRef = React.useRef(0);
   // Polling fallback refs for when Supabase Realtime WebSocket is unavailable
   const incomingPollSinceRef = React.useRef(new Date().toISOString());
@@ -424,6 +438,116 @@ export default function App() {
     catch { setEntitlements(FREE_ENTITLEMENTS); }
   };
 
+  const refreshContacts = async () => {
+    const [sc, cat] = await Promise.all([listSavedContacts(), listCategories()]);
+    setSavedContacts(sc); setCategories(cat);
+  };
+  const refreshOrganizations = async () => {
+    const orgs = await listMyOrganizations();
+    setOrganizations(orgs);
+    setActiveOrgId(prev => prev && orgs.some(o => o.id === prev) ? prev : (orgs[0]?.id ?? null));
+  };
+
+  // Kurumsal/kayıtlı verileri, ilgili sekme açıldığında ve giriş yapılınca yükle
+  React.useEffect(() => {
+    if (!currentUser) { setSavedContacts([]); setCategories([]); setOrganizations([]); setOrgMembers([]); setActiveOrgId(null); return; }
+    if (activeTab === 'contacts' && caps.savedContacts) refreshContacts();
+    if (activeTab === 'organization' && caps.organizations) refreshOrganizations();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, currentUser, entitlements.plan]);
+
+  // Seçili org değişince üyeleri yükle
+  React.useEffect(() => {
+    if (activeOrgId) listOrgMembers(activeOrgId).then(setOrgMembers); else setOrgMembers([]);
+  }, [activeOrgId]);
+
+  // ── Kayıtlı müşteri form durumu + eylemleri ────────────────────────────────
+  const [scConnId, setScConnId] = React.useState('');
+  const [scName, setScName] = React.useState('');
+  const [scCategory, setScCategory] = React.useState('');
+  const [scNotes, setScNotes] = React.useState('');
+  const [newCatName, setNewCatName] = React.useState('');
+  const [newCatColor, setNewCatColor] = React.useState('#c5a059');
+  const [entError, setEntError] = React.useState('');
+
+  const activeOrg = organizations.find(o => o.id === activeOrgId) ?? null;
+  const myMembership = orgMembers.find(m => m.user_id === currentUser?.id);
+  const canManageOrg = activeOrg?.owner_id === currentUser?.id || myMembership?.role === 'owner' || myMembership?.role === 'admin';
+
+  const handleSaveContact = async () => {
+    setEntError('');
+    if (!scConnId.trim()) { setEntError('Kimlik gerekli.'); return; }
+    // Kayıtlı sekmesi kişisel kayıt oluşturur (owner_id = ben). Kurumsal
+    // paylaşımlı kayıtlar sonraki adımda org kapsamıyla eklenecek.
+    const { error } = await createSavedContact({
+      connection_id: scConnId, display_name: scName, category_id: scCategory || null, notes: scNotes,
+    });
+    if (error) { setEntError(error); return; }
+    setScConnId(''); setScName(''); setScCategory(''); setScNotes('');
+    await refreshContacts();
+  };
+  const handleDeleteContact = async (id: string) => { await deleteSavedContact(id); await refreshContacts(); };
+  const handleCreateCategory = async () => {
+    setEntError('');
+    if (!newCatName.trim()) return;
+    const { error } = await createCategory(newCatName.trim(), newCatColor);
+    if (error) { setEntError(error); return; }
+    setNewCatName(''); await refreshContacts();
+  };
+  const handleDeleteCategory = async (id: string) => { await deleteCategory(id); await refreshContacts(); };
+  const connectToContact = (cid: string) => { setTargetId(cid); setActiveTab('dashboard'); };
+
+  // ── Organizasyon form durumu + eylemleri ───────────────────────────────────
+  const [newOrgName, setNewOrgName] = React.useState('');
+  const [newOrgSlug, setNewOrgSlug] = React.useState('');
+  const [orgEditName, setOrgEditName] = React.useState('');
+  const [orgEditLogo, setOrgEditLogo] = React.useState('');
+  const [memberEmail, setMemberEmail] = React.useState('');
+  const [memberLabel, setMemberLabel] = React.useState('');
+  const [memberRole, setMemberRole] = React.useState<OrgRole>('operator');
+
+  React.useEffect(() => {
+    if (activeOrg) { setOrgEditName(activeOrg.name); setOrgEditLogo(activeOrg.logo_url ?? ''); }
+  }, [activeOrgId]);
+
+  const handleCreateOrg = async () => {
+    setEntError('');
+    const { org, error } = await createOrganization(newOrgName.trim(), newOrgSlug.trim().toLowerCase());
+    if (error) { setEntError(error); return; }
+    setNewOrgName(''); setNewOrgSlug('');
+    await refreshOrganizations();
+    if (org) setActiveOrgId(org.id);
+  };
+  const handleSaveOrg = async () => {
+    if (!activeOrgId) return;
+    setEntError('');
+    const { error } = await updateOrganization(activeOrgId, { name: orgEditName.trim(), logo_url: orgEditLogo.trim() || null });
+    if (error) { setEntError(error); return; }
+    await refreshOrganizations();
+  };
+  const handleDeleteOrg = async () => {
+    if (!activeOrgId) return;
+    await deleteOrganization(activeOrgId);
+    await refreshOrganizations();
+  };
+  const handleAddMember = async () => {
+    if (!activeOrgId) return;
+    setEntError('');
+    if (!memberEmail.trim() && !memberLabel.trim()) { setEntError('E-posta veya cihaz etiketi girin.'); return; }
+    const { error } = await addOrgMember(activeOrgId, { invited_email: memberEmail.trim() || undefined, device_label: memberLabel.trim() || undefined, role: memberRole });
+    if (error) { setEntError(error); return; }
+    setMemberEmail(''); setMemberLabel('');
+    setOrgMembers(await listOrgMembers(activeOrgId));
+  };
+  const handleRemoveMember = async (id: string) => {
+    await removeOrgMember(id);
+    if (activeOrgId) setOrgMembers(await listOrgMembers(activeOrgId));
+  };
+  const handleMemberLabel = async (id: string, label: string) => {
+    await updateOrgMember(id, { device_label: label || null });
+    if (activeOrgId) setOrgMembers(await listOrgMembers(activeOrgId));
+  };
+
   const handleQrtimCallback = async (token: string, _user: SupabaseUser) => {
     setQrtimLinking(true);
     try {
@@ -585,7 +709,10 @@ export default function App() {
     postSessionEvent('connecting', targetId, EMBED.mode);
 
     const nd = (v: string) => { const d = v.replace(/\D/g, '').slice(0, 9); return d.length === 9 ? `${d.slice(0,3)}-${d.slice(3,6)}-${d.slice(6,9)}` : v.trim(); };
-    const normalizedTarget = nd(targetId);
+    // Harf içeren hedef = kurumsal vanity kimlik (acme-01); slug küçük harfle
+    // saklandığı için normalize et. Salt numerik ID'ler eski biçimini korur.
+    const hasLetters = /[a-z]/i.test(targetId);
+    const normalizedTarget = hasLetters ? targetId.trim().toLowerCase() : nd(targetId);
     const looksLikeUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(normalizedTarget);
 
     let peerSignalId = normalizedTarget;
@@ -615,6 +742,8 @@ export default function App() {
     setWebrtc(m);
     try { await m.call(peerSignalId); }
     catch (err) { postSessionEvent('error', targetId, EMBED.mode); addLog(`Baglantiyi gonderilemedi: ${String(err)}`, 'error'); setWebrtc(null); setIsConnecting(false); return; }
+    // Kayıtlı bir müşteriye bağlanıldıysa son bağlantı zamanını güncelle (RLS izin verirse)
+    if (currentUser) touchSavedContact(normalizedTarget).catch(() => {});
 
     if (connTimeoutRef.current) clearTimeout(connTimeoutRef.current);
     connTimeoutRef.current = setTimeout(async () => {
@@ -715,9 +844,12 @@ export default function App() {
             {isGuest && <span className="text-[9px] text-yellow-400 ml-2 pl-2 border-l border-steppe-border uppercase tracking-widest">Misafir</span>}
           </div>
           <nav className="hidden md:flex gap-8 items-center">
-            {(['dashboard','connections','settings'] as Tab[]).map(tab => (
+            {(['dashboard','connections',
+               ...(currentUser && caps.savedContacts ? ['contacts'] as Tab[] : []),
+               ...(currentUser && caps.organizations ? ['organization'] as Tab[] : []),
+               'settings'] as Tab[]).map(tab => (
               <button key={tab} onClick={() => setActiveTab(tab)} className={`text-[11px] uppercase tracking-widest transition-colors ${activeTab === tab ? 'text-steppe-gold' : 'text-steppe-muted hover:text-steppe-paper'}`}>
-                {tab === 'dashboard' ? 'Panel' : tab === 'connections' ? 'Baglantilar' : 'Ayarlar'}
+                {tab === 'dashboard' ? 'Panel' : tab === 'connections' ? 'Baglantilar' : tab === 'contacts' ? 'Kayitli' : tab === 'organization' ? 'Kurumsal' : 'Ayarlar'}
               </button>
             ))}
             <button
@@ -977,6 +1109,163 @@ export default function App() {
                 </div>
               ) : <div className="text-center py-16 text-steppe-muted italic text-sm">{connFilter === 'all' ? 'Henuz baglaniti kaydi bulunmuyor.' : 'Bu filtrede kayit yok.'}</div>}
             </div>
+          </div>
+        )}
+
+        {activeTab === 'contacts' && caps.savedContacts && (
+          <div className="max-w-4xl mx-auto space-y-6">
+            <h2 className="text-xl text-steppe-gold flex items-center gap-3"><Bookmark size={20} /> Kayitli Musteriler</h2>
+            {entError && <div className="p-3 border border-red-500/40 text-red-400 text-[11px]">{entError}</div>}
+
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+              {/* Yeni kayıt */}
+              <div className="gokturk-border surface-card p-5 space-y-3">
+                <p className="text-[10px] uppercase tracking-widest text-steppe-muted flex items-center gap-2"><Plus size={12} className="text-steppe-gold" /> Yeni Musteri</p>
+                <input className="input-field" placeholder="Kimlik (123-456-789 / acme-01)" value={scConnId} onChange={e => setScConnId(e.target.value)} />
+                <input className="input-field" placeholder="Ad / etiket" value={scName} onChange={e => setScName(e.target.value)} />
+                <select className="input-field" value={scCategory} onChange={e => setScCategory(e.target.value)}>
+                  <option value="">Kategorisiz</option>
+                  {categories.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+                </select>
+                <textarea className="input-field" rows={2} placeholder="Not (opsiyonel)" value={scNotes} onChange={e => setScNotes(e.target.value)} />
+                <button onClick={handleSaveContact} className="btn-primary w-full">Kaydet</button>
+
+                <div className="pt-3 mt-2 border-t border-steppe-border">
+                  <p className="text-[10px] uppercase tracking-widest text-steppe-muted flex items-center gap-2 mb-2"><Tag size={12} className="text-steppe-gold" /> Kategoriler</p>
+                  <div className="flex flex-wrap gap-2 mb-3">
+                    {categories.length === 0 && <span className="text-[10px] text-steppe-muted italic">Kategori yok</span>}
+                    {categories.map(c => (
+                      <span key={c.id} className="text-[9px] uppercase tracking-widest px-2 py-1 flex items-center gap-1.5 border border-steppe-border" style={{ color: c.color }}>
+                        <span className="w-2 h-2 rounded-full" style={{ background: c.color }} />{c.name}
+                        <button onClick={() => handleDeleteCategory(c.id)} className="text-steppe-muted hover:text-red-400"><Trash2 size={10} /></button>
+                      </span>
+                    ))}
+                  </div>
+                  <div className="flex gap-2">
+                    <input className="input-field flex-1" placeholder="Kategori adi" value={newCatName} onChange={e => setNewCatName(e.target.value)} />
+                    <input type="color" className="w-9 h-9 bg-transparent border border-steppe-border cursor-pointer" value={newCatColor} onChange={e => setNewCatColor(e.target.value)} />
+                    <button onClick={handleCreateCategory} className="btn-ghost px-3"><Plus size={14} /></button>
+                  </div>
+                </div>
+              </div>
+
+              {/* Liste */}
+              <div className="lg:col-span-2 gokturk-border surface-card p-5">
+                {savedContacts.length === 0 ? (
+                  <div className="text-center py-16 text-steppe-muted italic text-sm">Henuz kayitli musteri yok. Soldan ekleyin.</div>
+                ) : (
+                  <div className="space-y-2">
+                    {savedContacts.map(sc => {
+                      const cat = categories.find(c => c.id === sc.category_id);
+                      return (
+                        <div key={sc.id} className="flex items-center justify-between p-3 border border-steppe-border hover:border-steppe-gold transition-colors">
+                          <div className="min-w-0">
+                            <div className="flex items-center gap-2">
+                              <span className="text-sm text-steppe-gold font-mono">{sc.connection_id}</span>
+                              {sc.org_id && <span className="text-[8px] uppercase tracking-widest text-steppe-muted border border-steppe-border px-1">Kurumsal</span>}
+                              {cat && <span className="text-[8px] uppercase tracking-widest px-1.5 py-0.5 flex items-center gap-1" style={{ color: cat.color }}><span className="w-1.5 h-1.5 rounded-full" style={{ background: cat.color }} />{cat.name}</span>}
+                            </div>
+                            {sc.display_name && <p className="text-[11px] text-steppe-paper truncate">{sc.display_name}</p>}
+                            {sc.notes && <p className="text-[10px] text-steppe-muted truncate">{sc.notes}</p>}
+                          </div>
+                          <div className="flex items-center gap-2 shrink-0">
+                            <button onClick={() => connectToContact(sc.connection_id)} className="btn-ghost text-[9px] py-1 px-3">Baglan</button>
+                            <button onClick={() => handleDeleteContact(sc.id)} className="text-steppe-muted hover:text-red-400 p-1"><Trash2 size={13} /></button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {activeTab === 'organization' && caps.organizations && (
+          <div className="max-w-4xl mx-auto space-y-6">
+            <div className="flex items-center justify-between flex-wrap gap-3">
+              <h2 className="text-xl text-steppe-gold flex items-center gap-3"><Building2 size={20} /> Kurumsal Yonetim</h2>
+              {organizations.length > 0 && (
+                <select className="input-field w-auto" value={activeOrgId ?? ''} onChange={e => setActiveOrgId(e.target.value || null)}>
+                  {organizations.map(o => <option key={o.id} value={o.id}>{o.name} ({o.slug})</option>)}
+                </select>
+              )}
+            </div>
+            {entError && <div className="p-3 border border-red-500/40 text-red-400 text-[11px]">{entError}</div>}
+
+            {/* Yeni firma */}
+            <div className="gokturk-border surface-card p-5">
+              <p className="text-[10px] uppercase tracking-widest text-steppe-muted flex items-center gap-2 mb-3"><Plus size={12} className="text-steppe-gold" /> Yeni Firma</p>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <input className="input-field" placeholder="Firma adi" value={newOrgName} onChange={e => setNewOrgName(e.target.value)} />
+                <input className="input-field font-mono" placeholder="slug (acme)" value={newOrgSlug} onChange={e => setNewOrgSlug(e.target.value.toLowerCase())} />
+                <button onClick={handleCreateOrg} disabled={!newOrgName.trim() || !newOrgSlug.trim()} className="btn-primary disabled:opacity-40">Olustur</button>
+              </div>
+              <p className="text-[9px] text-steppe-muted mt-2">Cihazlar <span className="font-mono text-steppe-gold">{newOrgSlug || 'slug'}-01</span> gibi adreslenir.</p>
+            </div>
+
+            {activeOrg && (
+              <>
+                {/* Firma ayarları */}
+                <div className="gokturk-border surface-card p-5 space-y-3">
+                  <p className="text-[10px] uppercase tracking-widest text-steppe-muted mb-1">Firma Ayarlari · <span className="font-mono text-steppe-gold">{activeOrg.slug}</span></p>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div>
+                      <label className="text-[9px] uppercase tracking-widest text-steppe-muted">Ad</label>
+                      <input className="input-field mt-1" value={orgEditName} onChange={e => setOrgEditName(e.target.value)} disabled={!canManageOrg} />
+                    </div>
+                    <div>
+                      <label className="text-[9px] uppercase tracking-widest text-steppe-muted">Logo URL</label>
+                      <input className="input-field mt-1" placeholder="https://..." value={orgEditLogo} onChange={e => setOrgEditLogo(e.target.value)} disabled={!canManageOrg} />
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    {orgEditLogo && <img src={orgEditLogo} alt="logo" className="w-10 h-10 object-contain border border-steppe-border" onError={e => { (e.target as HTMLImageElement).style.display = 'none'; }} />}
+                    {canManageOrg && <button onClick={handleSaveOrg} className="btn-primary">Kaydet</button>}
+                    {activeOrg.owner_id === currentUser?.id && <button onClick={handleDeleteOrg} className="btn-ghost text-red-400 border-red-500/40">Firmayi Sil</button>}
+                  </div>
+                </div>
+
+                {/* Üyeler / cihazlar */}
+                <div className="gokturk-border surface-card p-5">
+                  <p className="text-[10px] uppercase tracking-widest text-steppe-muted flex items-center gap-2 mb-3"><Users size={12} className="text-steppe-gold" /> Uyeler & Cihazlar</p>
+                  {canManageOrg && (
+                    <div className="grid grid-cols-1 sm:grid-cols-4 gap-2 mb-4">
+                      <input className="input-field" placeholder="E-posta (operator)" value={memberEmail} onChange={e => setMemberEmail(e.target.value)} />
+                      <input className="input-field font-mono" placeholder="cihaz etiketi (01)" value={memberLabel} onChange={e => setMemberLabel(e.target.value)} />
+                      <select className="input-field" value={memberRole} onChange={e => setMemberRole(e.target.value as OrgRole)}>
+                        <option value="operator">Operator</option>
+                        <option value="admin">Yonetici</option>
+                        <option value="member">Uye (cihaz)</option>
+                      </select>
+                      <button onClick={handleAddMember} className="btn-primary">Ekle</button>
+                    </div>
+                  )}
+                  <div className="space-y-2">
+                    {orgMembers.map(m => (
+                      <div key={m.id} className="flex items-center justify-between p-3 border border-steppe-border gap-3">
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className="text-[11px] text-steppe-paper truncate">{m.invited_email || (m.user_id === currentUser?.id ? 'Siz' : m.user_id?.slice(0,8)) || '—'}</span>
+                            <span className="text-[8px] uppercase tracking-widest px-1.5 py-0.5 bg-steppe-gold/15 text-steppe-gold">{m.role}</span>
+                            <span className={`text-[8px] uppercase tracking-widest px-1.5 py-0.5 ${m.status === 'active' ? 'text-green-400' : 'text-yellow-400'}`}>{m.status === 'active' ? 'Aktif' : m.status === 'invited' ? 'Davetli' : 'Pasif'}</span>
+                            {m.device_label && <span className="text-[9px] font-mono text-steppe-gold">{activeOrg.slug}-{m.device_label}</span>}
+                          </div>
+                        </div>
+                        {canManageOrg && (
+                          <div className="flex items-center gap-2 shrink-0">
+                            <input className="input-field w-20 text-[10px] py-1 font-mono" placeholder="etiket" defaultValue={m.device_label ?? ''} onBlur={e => { if (e.target.value !== (m.device_label ?? '')) handleMemberLabel(m.id, e.target.value.trim()); }} />
+                            {m.role !== 'owner' && <button onClick={() => handleRemoveMember(m.id)} className="text-steppe-muted hover:text-red-400 p-1"><Trash2 size={13} /></button>}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                    {orgMembers.length === 0 && <p className="text-[10px] text-steppe-muted italic text-center py-4">Uye yok.</p>}
+                  </div>
+                </div>
+              </>
+            )}
           </div>
         )}
 
