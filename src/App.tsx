@@ -286,6 +286,21 @@ export default function App() {
 
   // --- Embed (Nexus iframe) entegrasyonu ---
   const autoConnectRef = React.useRef(false);
+  // Ana uygulamanın (Nexus) "Bitir" düğmesi {type:'arku:command', action:'end'}
+  // gönderir. handleDisconnect aşağıda tanımlandığı için ref üzerinden çağrılır.
+  const handleDisconnectRef = React.useRef<(() => Promise<void>) | null>(null);
+
+  React.useEffect(() => {
+    if (!EMBED.embed) return;
+    const onMsg = (e: MessageEvent) => {
+      if (EMBED.parentOrigin !== '*' && e.origin !== EMBED.parentOrigin) return;
+      const d = e.data as { type?: string; action?: string } | null;
+      if (d?.type !== 'arku:command') return;
+      if (d.action === 'end') handleDisconnectRef.current?.();
+    };
+    window.addEventListener('message', onMsg);
+    return () => window.removeEventListener('message', onMsg);
+  }, []);
 
   // session=<kod> geldiyse hedef kimliği doldur.
   React.useEffect(() => {
@@ -676,6 +691,7 @@ export default function App() {
     setRemoteStream(null); setRtcState('idle'); setIsConnecting(false); addLog('Baglaniti kesildi.', 'warn');
     postSessionEvent('ended', targetId, EMBED.mode);
   };
+  handleDisconnectRef.current = handleDisconnect; // her render'da güncel referans
 
   const isLight = theme === 'umay';
 
