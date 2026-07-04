@@ -1,5 +1,78 @@
-const { app, BrowserWindow, session, desktopCapturer, shell, ipcMain, screen } = require('electron');
+const { app, BrowserWindow, session, desktopCapturer, shell, ipcMain, screen, dialog } = require('electron');
 const path = require('path');
+
+// ── Otomatik güncelleme ──────────────────────────────────────────────────────
+// Windows (NSIS) ve Linux (AppImage): electron-updater ile indirilir, kullanıcı
+// onayıyla kurulur. macOS imzasız uygulamada ve .deb kurulumlarında otomatik
+// kurulum desteklenmediği için yalnızca yeni sürüm bildirimi gösterilir.
+const UPDATE_CHECK_INTERVAL = 4 * 60 * 60 * 1000; // 4 saat
+const RELEASES_LATEST_URL = 'https://github.com/boukalemoon/arku-remote/releases/latest';
+let updateNotified = false; // bildirim tabanlı yolda oturum başına tek uyarı
+
+function canAutoInstallUpdates() {
+  if (process.platform === 'win32') return true;
+  if (process.platform === 'linux') return !!process.env.APPIMAGE; // .deb hariç
+  return false; // macOS: imza olmadan Squirrel.Mac güncellemesi çalışmaz
+}
+
+async function checkLatestAndNotify() {
+  if (updateNotified) return;
+  try {
+    const res = await fetch('https://api.github.com/repos/boukalemoon/arku-remote/releases/latest');
+    if (!res.ok) return;
+    const rel = await res.json();
+    const latest = String(rel.tag_name || '').replace(/^v/, '');
+    const current = app.getVersion();
+    if (!latest || latest.localeCompare(current, undefined, { numeric: true }) <= 0) return;
+    updateNotified = true;
+    const win = BrowserWindow.getAllWindows()[0];
+    const { response } = await dialog.showMessageBox(win, {
+      type: 'info',
+      title: 'Yeni sürüm mevcut',
+      message: `Arku Remote v${latest} yayınlandı (kurulu sürüm: v${current}).`,
+      detail: 'Bu kurulum türünde otomatik güncelleme desteklenmiyor. Yeni sürümü indirip mevcut kurulumun üzerine kurmanız yeterli.',
+      buttons: ['İndirme Sayfasını Aç', 'Daha Sonra'],
+      defaultId: 0,
+      cancelId: 1,
+    });
+    if (response === 0) shell.openExternal(RELEASES_LATEST_URL);
+  } catch { /* çevrimdışı vb. — sessiz geç */ }
+}
+
+function setupUpdates() {
+  if (!app.isPackaged) return; // geliştirmede güncelleme kontrolü yapma
+
+  if (!canAutoInstallUpdates()) {
+    checkLatestAndNotify();
+    setInterval(checkLatestAndNotify, UPDATE_CHECK_INTERVAL);
+    return;
+  }
+
+  let autoUpdater;
+  try { ({ autoUpdater } = require('electron-updater')); } catch { return; }
+
+  autoUpdater.autoDownload = true;
+  autoUpdater.autoInstallOnAppQuit = true; // kullanıcı "Daha Sonra" derse çıkışta kurulur
+
+  autoUpdater.on('update-downloaded', async (info) => {
+    const win = BrowserWindow.getAllWindows()[0];
+    const { response } = await dialog.showMessageBox(win, {
+      type: 'info',
+      title: 'Güncelleme hazır',
+      message: `Arku Remote v${info.version} indirildi.`,
+      detail: 'Şimdi yeniden başlatarak güncelleyebilirsiniz; ertelerseniz uygulama kapanırken otomatik kurulur.',
+      buttons: ['Şimdi Yeniden Başlat', 'Daha Sonra'],
+      defaultId: 0,
+      cancelId: 1,
+    });
+    if (response === 0) autoUpdater.quitAndInstall();
+  });
+  autoUpdater.on('error', () => { /* ağ hatası vb. — bir sonraki kontrolde tekrar denenir */ });
+
+  const check = () => { autoUpdater.checkForUpdates().catch(() => {}); };
+  check();
+  setInterval(check, UPDATE_CHECK_INTERVAL);
+}
 
 function createWindow() {
   const win = new BrowserWindow({
@@ -86,6 +159,7 @@ ipcMain.on('new-window', () => createWindow());
 
 app.whenReady().then(() => {
   createWindow();
+  setupUpdates();
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });

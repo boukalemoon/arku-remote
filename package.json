@@ -6,7 +6,7 @@
     "email": "burakakmese@gmail.com"
   },
   "private": true,
-  "version": "1.0.7",
+  "version": "1.0.8",
   "type": "module",
   "main": "electron/main.cjs",
   "build": {
@@ -75,6 +75,7 @@
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.49.0",
+    "electron-updater": "^6.8.9",
     "lucide-react": "^0.546.0",
     "motion": "^12.23.24",
     "react": "^19.0.0",
