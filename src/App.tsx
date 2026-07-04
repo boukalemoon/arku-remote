@@ -17,7 +17,7 @@ interface QrtimUser { qrtim_id: string; email: string; name: string; username: s
 
 const QRTIM_BASE_URL = import.meta.env.VITE_QRTIM_URL ?? 'https://qartim.com';
 const QRTIM_ARKU_LINK_URL = 'https://kfpnsxoxfrxepxezatsr.supabase.co/functions/v1/arku-link';
-const QRTIM_AUTH_URL = 'https://bxakaxylrfjldhtdjjmf.supabase.co/functions/v1/qrtim-auth';
+const QRTIM_AUTH_URL = 'https://jpmbttlxyxrqmpghymbq.supabase.co/functions/v1/qrtim-auth';
 // QRtim projesinin public anon key'i — arku-link edge function'ını çağırırken
 // Supabase gateway'in beklediği apikey header'ı için (public, RLS ile korunur).
 const QRTIM_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtmcG5zeG94ZnJ4ZXB4ZXphdHNyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njk2MjQ0NDUsImV4cCI6MjA4NTIwMDQ0NX0.HN7nKw5gO1cuN9fSmrRO72cgIgqNSUfLsY2L3FOhHDg';
@@ -86,6 +86,10 @@ export default function App() {
   const videoContainerRef = React.useRef<HTMLDivElement>(null);
   const [logs, setLogs] = React.useState<LogEntryLocal[]>([]);
   const [inputEnabled, setInputEnabled] = React.useState(false);
+  // Ekranı paylaşan tarafın (alıcı) açık onayı olmadan uzaktan gelen
+  // klavye/fare komutları işletilmez. Her oturumda kapalı başlar.
+  const [remoteControlAllowed, setRemoteControlAllowed] = React.useState(false);
+  const remoteControlAllowedRef = React.useRef(false);
   const [captureFrameRate, setCaptureFrameRate] = React.useState(15);
   const [qrtimUser, setQrtimUser] = React.useState<QrtimUser | null>(null);
   const [qrtimLinking, setQrtimLinking] = React.useState(false);
@@ -140,6 +144,7 @@ export default function App() {
 
   React.useEffect(() => { rtcStateRef.current = rtcState; }, [rtcState]);
   React.useEffect(() => { webrtcRef.current = webrtc; }, [webrtc]);
+  React.useEffect(() => { remoteControlAllowedRef.current = remoteControlAllowed; }, [remoteControlAllowed]);
   React.useEffect(() => { document.documentElement.setAttribute('data-theme', theme); }, [theme]);
   React.useEffect(() => { if (showAuth && authMode === 'mfa') setTimeout(() => mfaRefs.current[0]?.focus(), 100); }, [showAuth, authMode]);
   React.useEffect(() => {
@@ -520,6 +525,7 @@ export default function App() {
         setIsConnecting(false);
         setRemoteStream(null);
         setInputEnabled(false);
+        setRemoteControlAllowed(false);
         postSessionEvent('ended', targetId, EMBED.mode);
         if (localVideoRef.current?.srcObject) {
           (localVideoRef.current.srcObject as MediaStream)?.getTracks().forEach(t => t.stop());
@@ -527,7 +533,7 @@ export default function App() {
         }
         if (connTimeoutRef.current) { clearTimeout(connTimeoutRef.current); connTimeoutRef.current = null; }
       }
-      if (state === 'idle') { setIsConnecting(false); setRemoteStream(null); setInputEnabled(false); }
+      if (state === 'idle') { setIsConnecting(false); setRemoteStream(null); setInputEnabled(false); setRemoteControlAllowed(false); }
     };
     m.onRemoteStream = (stream) => {
       setRemoteStream(stream);
@@ -536,6 +542,8 @@ export default function App() {
     };
     m.onLog = (msg, type) => addLog(msg, (type as LogType) || 'info');
     m.onInputEvent = (event: InputEventMsg) => {
+      // Ekranı paylaşan kullanıcı izin vermeden uzaktan kontrol işletilmez
+      if (!remoteControlAllowedRef.current) return;
       // Forward to Electron main process if running as desktop app
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       (window as any).electronAPI?.sendInput?.(event);
@@ -569,16 +577,21 @@ export default function App() {
 
     if (!isGuest && currentUser && !looksLikeUuid) {
       const rawDigits = targetId.replace(/\D/g, '').slice(0, 9);
-      let peerUser: { id: string } | null = null;
-      const q1 = await supabase.from('users').select('id').eq('connection_id', normalizedTarget).maybeSingle();
-      if (q1.data?.id) peerUser = q1.data;
-      if (!peerUser && rawDigits.length === 9) {
-        const rd = `${rawDigits.slice(0,3)}-${rawDigits.slice(3,6)}-${rawDigits.slice(6,9)}`;
-        const q2 = await supabase.from('users').select('id').eq('connection_id', rd).maybeSingle();
-        if (q2.data?.id) peerUser = q2.data;
+      // RLS, users tablosunu kendi satırıyla sınırlar; çözümleme yalnızca UUID
+      // döndüren resolve_connection_id RPC'si üzerinden yapılır. Fonksiyon henüz
+      // kurulmamışsa (eski şema) doğrudan sorguya düşülür.
+      const resolve = async (cid: string): Promise<string | null> => {
+        const { data, error } = await supabase.rpc('resolve_connection_id', { cid });
+        if (!error) return (data as string | null) ?? null;
+        const q = await supabase.from('users').select('id').eq('connection_id', cid).maybeSingle();
+        return q.data?.id ?? null;
+      };
+      let peerId: string | null = await resolve(normalizedTarget);
+      if (!peerId && rawDigits.length === 9) {
+        peerId = await resolve(`${rawDigits.slice(0,3)}-${rawDigits.slice(3,6)}-${rawDigits.slice(6,9)}`);
       }
-      if (!peerUser) { setIsConnecting(false); postSessionEvent('error', targetId, EMBED.mode); addLog(`Hedef kimlik bulunamadi: ${normalizedTarget}`, 'error'); return; }
-      peerSignalId = peerUser.id;
+      if (!peerId) { setIsConnecting(false); postSessionEvent('error', targetId, EMBED.mode); addLog(`Hedef kimlik bulunamadi: ${normalizedTarget}`, 'error'); return; }
+      peerSignalId = peerId;
       if (peerSignalId === currentUser.id) { setIsConnecting(false); addLog('Kendi hesabiniza baglamazsiniz.', 'error'); return; }
       addLog(`Hedef cozumlendi -> ${peerSignalId.slice(0,8)}...`, 'sys');
     }
@@ -612,6 +625,7 @@ export default function App() {
     setIncomingCall(null);
     if (localVideoRef.current) localVideoRef.current.srcObject = screen;
     if (webrtc) await webrtc.disconnect();
+    setRemoteControlAllowed(false); // her oturum kontrol izni kapalı başlar
     const m = buildManager();
     setWebrtc(m); setTargetId(fromId); setIsConnecting(true);
 
@@ -841,14 +855,34 @@ export default function App() {
                       </div>
                     )}
                   </div>
-                ) : isConnecting && rtcState !== 'idle' ? (
+                ) : (isConnecting || rtcState === 'connected') && rtcState !== 'idle' ? (
                   <div className="absolute inset-0">
                     <video ref={localVideoRef} autoPlay playsInline muted className="w-full h-full object-contain bg-black" />
                     <div className="absolute top-3 left-3 flex items-center gap-2 px-2 py-1 rounded" style={{ background: 'rgba(0,0,0,0.7)' }}>
-                      <div className="w-2 h-2 rounded-full bg-yellow-400 animate-pulse" />
-                      <span className="text-[9px] text-yellow-400 uppercase tracking-widest">Ekran Paylasiliyor - Baglaniliyor...</span>
+                      <div className={`w-2 h-2 rounded-full animate-pulse ${rtcState === 'connected' ? 'bg-green-400' : 'bg-yellow-400'}`} />
+                      <span className={`text-[9px] uppercase tracking-widest ${rtcState === 'connected' ? 'text-green-400' : 'text-yellow-400'}`}>
+                        {rtcState === 'connected' ? 'Ekran Paylasiliyor - Bagli' : 'Ekran Paylasiliyor - Baglaniliyor...'}
+                      </span>
                     </div>
-                    <button onClick={handleCancelConnect} className="absolute top-3 right-3 px-2 py-1 text-[9px] uppercase tracking-widest text-white rounded bg-red-500/80">Iptal</button>
+                    <div className="absolute top-3 right-3 flex gap-2">
+                      {rtcState === 'connected' && (
+                        <button
+                          onClick={() => { const nv = !remoteControlAllowed; setRemoteControlAllowed(nv); addLocalLog(nv ? 'Uzaktan kontrole izin verildi.' : 'Uzaktan kontrol izni kapatildi.', 'warn'); }}
+                          className="px-2 py-1 text-[9px] uppercase tracking-widest rounded transition-colors"
+                          style={{ background: remoteControlAllowed ? 'var(--accent-primary)' : 'rgba(0,0,0,0.7)', color: remoteControlAllowed ? '#000' : 'var(--text-muted)' }}
+                          title="Karşı tarafın klavye/fare kontrolüne izin ver"
+                        >{remoteControlAllowed ? 'Kontrol İzni: AÇIK' : 'Kontrol İzni'}</button>
+                      )}
+                      {rtcState === 'connected'
+                        ? <button onClick={handleDisconnect} className="px-2 py-1 text-[9px] uppercase tracking-widest text-white rounded bg-red-500/80 hover:bg-red-500">Kes</button>
+                        : <button onClick={handleCancelConnect} className="px-2 py-1 text-[9px] uppercase tracking-widest text-white rounded bg-red-500/80">Iptal</button>}
+                    </div>
+                    {remoteControlAllowed && rtcState === 'connected' && (
+                      <div className="absolute bottom-3 left-3 flex items-center gap-2 px-2 py-1 rounded" style={{ background: 'rgba(0,0,0,0.7)' }}>
+                        <div className="w-2 h-2 rounded-full bg-steppe-gold animate-pulse" />
+                        <span className="text-[9px] text-steppe-gold uppercase tracking-widest">Karsi taraf kontrol edebilir</span>
+                      </div>
+                    )}
                   </div>
                 ) : (
                   <div className="text-center z-10 p-12">
