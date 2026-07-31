@@ -6,7 +6,7 @@
     "email": "burakakmese@gmail.com"
   },
   "private": true,
-  "version": "1.0.13",
+  "version": "1.0.14",
   "type": "module",
   "main": "electron/main.cjs",
   "repository": {

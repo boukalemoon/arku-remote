@@ -108,13 +108,6 @@ function createWindow() {
     })
   });
 
-  // Ekran paylaşımı için izin ver
-  session.defaultSession.setDisplayMediaRequestHandler((_request, callback) => {
-    desktopCapturer.getSources({ types: ['screen', 'window'] }).then((sources) => {
-      callback({ video: sources[0], audio: 'loopback' });
-    });
-  });
-
   // Dış linkleri tarayıcıda aç — sadece http/https protokollerine izin ver
   win.webContents.setWindowOpenHandler(({ url }) => {
     if (url.startsWith('https://') || url.startsWith('http://')) {
@@ -159,11 +152,149 @@ if (isDev) {
     }
   });
 
+  // Uzaktan kontrol izni pencereye ve o sayfa yüklemesine bağlıdır: sayfa
+  // yenilenir veya başka bir adrese gidilirse izin düşer, yeniden sorulur.
+  const dropGrant = () => controlGrants.delete(win.webContents.id);
+  win.webContents.on('did-start-navigation', dropGrant);
+  win.on('closed', dropGrant);
+
   // Pencere hazır olduğunda göster
   win.once('ready-to-show', () => {
     win.show();
   });
 }
+
+// ── Ekran paylaşım kaynağı seçici ────────────────────────────────────────────
+// Eskiden `sources[0]` (birincil ekranın tamamı) + `audio: 'loopback'` sorgusuz
+// veriliyordu: kullanıcı NE paylaştığını seçemiyordu ve renderer `audio:false`
+// istediği hâlde sistem sesi yine de yakalanıyordu. Artık her istek için yerel
+// kullanıcıya seçici gösterilir ve ses yalnızca hem istenmişse hem de kullanıcı
+// onaylamışsa eklenir.
+const pickerState = new Map(); // picker webContents.id -> { sources, settle }
+
+function finishPicker(senderId, result) {
+  const state = pickerState.get(senderId);
+  if (!state) return;
+  pickerState.delete(senderId);
+  state.settle(result);
+  const win = BrowserWindow.fromId(state.windowId);
+  if (win && !win.isDestroyed()) win.close();
+}
+
+ipcMain.handle('picker:init', (e) => {
+  const state = pickerState.get(e.sender.id);
+  if (!state) return { sources: [], audioRequested: false };
+  return {
+    audioRequested: state.audioRequested,
+    sources: state.sources.map((s) => ({
+      id: s.id,
+      name: s.name,
+      isScreen: s.id.startsWith('screen:'),
+      thumbnail: s.thumbnail.toDataURL(),
+    })),
+  };
+});
+
+ipcMain.on('picker:choose', (e, payload) => {
+  const state = pickerState.get(e.sender.id);
+  if (!state) return;
+  const source = state.sources.find((s) => s.id === payload?.id) || null;
+  finishPicker(e.sender.id, source ? { source, withAudio: !!payload.withAudio } : null);
+});
+
+ipcMain.on('picker:cancel', (e) => finishPicker(e.sender.id, null));
+
+function pickDisplaySource(parent, audioRequested) {
+  return new Promise((resolve) => {
+    desktopCapturer
+      .getSources({ types: ['screen', 'window'], thumbnailSize: { width: 320, height: 180 } })
+      .then((sources) => {
+        if (!sources.length) { resolve(null); return; }
+
+        const picker = new BrowserWindow({
+          width: 820,
+          height: 620,
+          parent: parent && !parent.isDestroyed() ? parent : undefined,
+          modal: !!(parent && !parent.isDestroyed()),
+          resizable: true,
+          minimizable: false,
+          maximizable: false,
+          title: 'Paylaşılacak ekranı seçin',
+          backgroundColor: '#111010',
+          autoHideMenuBar: true,
+          webPreferences: {
+            nodeIntegration: false,
+            contextIsolation: true,
+            preload: path.join(__dirname, 'picker-preload.cjs'),
+          },
+        });
+
+        let settled = false;
+        const settle = (value) => { if (!settled) { settled = true; resolve(value); } };
+
+        pickerState.set(picker.webContents.id, {
+          sources, audioRequested, settle, windowId: picker.id,
+        });
+
+        // Pencere kapatılırsa (X, Esc, üst pencere kapanması) istek reddedilir.
+        picker.on('closed', () => {
+          pickerState.delete(picker.webContents.id);
+          settle(null);
+        });
+
+        picker.loadFile(path.join(__dirname, 'picker.html'));
+      })
+      .catch(() => resolve(null));
+  });
+}
+
+function setupDisplayMediaHandler() {
+  session.defaultSession.setDisplayMediaRequestHandler(
+    (request, callback) => {
+      const parent = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0];
+      pickDisplaySource(parent, !!request.audioRequested).then((choice) => {
+        // Seçim yapılmadıysa isteği reddet: boş nesne "kaynak yok" demektir.
+        if (!choice) { callback({}); return; }
+        callback({
+          video: choice.source,
+          ...(request.audioRequested && choice.withAudio ? { audio: 'loopback' } : {}),
+        });
+      });
+    },
+    // Kendi seçicimizi kullanıyoruz; platformlar arası davranış aynı olsun.
+    { useSystemPicker: false },
+  );
+}
+
+// ── Uzaktan kontrol yetkisi (ana süreç tarafı) ───────────────────────────────
+// Eskiden `input-event` gelen her olayı işletiyordu; tek kapı renderer'daki bir
+// bayraktı. Web içeriği ele geçirilirse bu bayrak atlanabilir ve işletim sistemi
+// düzeyinde kontrol elde edilebilirdi. Artık izin, ana sürecin gösterdiği yerel
+// bir onay penceresiyle veriliyor ve ana süreçte tutuluyor.
+const controlGrants = new Set(); // izin verilmiş renderer webContents.id'leri
+
+ipcMain.handle('remote-control:request', async (e) => {
+  if (controlGrants.has(e.sender.id)) return true;
+  const win = BrowserWindow.fromWebContents(e.sender);
+  const { response } = await dialog.showMessageBox(win, {
+    type: 'warning',
+    title: 'Uzaktan kontrole izin ver',
+    message: 'Karşı tarafın bilgisayarınızı kontrol etmesine izin verilsin mi?',
+    detail:
+      'İzin verirseniz bağlandığınız kişi fareyi ve klavyeyi sizin adınıza kullanabilir. '
+      + 'Yalnızca tanıdığınız ve güvendiğiniz kişilere izin verin. '
+      + 'İzni istediğiniz an kapatabilirsiniz.',
+    buttons: ['İzin Ver', 'Vazgeç'],
+    defaultId: 1,
+    cancelId: 1,
+    noLink: true,
+  });
+  if (response !== 0) return false;
+  controlGrants.add(e.sender.id);
+  return true;
+});
+
+ipcMain.on('remote-control:revoke', (e) => { controlGrants.delete(e.sender.id); });
 
 // Renderer'daki "Yeni Oturum" butonu
 ipcMain.on('new-window', () => createWindow());
@@ -196,6 +327,8 @@ ipcMain.handle('check-for-updates', async () => {
 });
 
 app.whenReady().then(() => {
+  // Oturum genelinde bir kez bağlanır (pencere başına değil).
+  setupDisplayMediaHandler();
   createWindow();
   setupUpdates();
   app.on('activate', () => {
@@ -299,7 +432,10 @@ async function applyInput(mod, event) {
 
 // Olayları sırayla işle: mousedown/mouseup ve tuş bas/bırak sırası korunur.
 let inputChain = Promise.resolve();
-ipcMain.on('input-event', (_e, event) => {
+ipcMain.on('input-event', (e, event) => {
+  // Ana süreç tarafı yetki kontrolü: yerel kullanıcı onay penceresinde açıkça
+  // izin vermediyse hiçbir girdi işletilmez. Renderer'daki bayrak artık tek kapı değil.
+  if (!controlGrants.has(e.sender.id)) return;
   const mod = loadNut();
   if (!mod || !event || typeof event.type !== 'string') return;
   inputChain = inputChain.then(() => applyInput(mod, event)).catch(() => {});

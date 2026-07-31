@@ -733,6 +733,33 @@ export default function App() {
     addLocalLog('QRtım hesabı bağlantısı kesildi.', 'warn');
   };
 
+  // Uzaktan kontrol iznini kapat. Masaüstünde ana süreçteki yetkiyi de düşürür —
+  // asıl kapı orası; buradaki bayrak yalnızca arayüz durumudur.
+  const disableRemoteControl = () => {
+    setRemoteControlAllowed(false);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (window as any).electronAPI?.revokeRemoteControl?.();
+  };
+
+  // İzin verme yolu: masaüstünde onayı ana süreç kendi penceresinde sorar, böylece
+  // web içeriği ele geçirilse bile kontrol tek başına açılamaz.
+  const toggleRemoteControl = async () => {
+    if (remoteControlAllowed) {
+      disableRemoteControl();
+      addLocalLog('Uzaktan kontrol izni kapatildi.', 'warn');
+      return;
+    }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const api = (window as any).electronAPI;
+    if (api?.requestRemoteControl) {
+      let granted = false;
+      try { granted = await api.requestRemoteControl(); } catch { granted = false; }
+      if (!granted) { addLocalLog('Uzaktan kontrol izni verilmedi.', 'warn'); return; }
+    }
+    setRemoteControlAllowed(true);
+    addLocalLog('Uzaktan kontrole izin verildi.', 'warn');
+  };
+
   const buildManager = (): WebRTCManager => {
     const myId = currentUser?.id || connectionId;
     const m = new WebRTCManager(myId);
@@ -750,7 +777,7 @@ export default function App() {
         setIsConnecting(false);
         setRemoteStream(null);
         setInputEnabled(false);
-        setRemoteControlAllowed(false);
+        disableRemoteControl();
         postSessionEvent('ended', targetId, EMBED.mode);
         if (localVideoRef.current?.srcObject) {
           (localVideoRef.current.srcObject as MediaStream)?.getTracks().forEach(t => t.stop());
@@ -758,7 +785,7 @@ export default function App() {
         }
         if (connTimeoutRef.current) { clearTimeout(connTimeoutRef.current); connTimeoutRef.current = null; }
       }
-      if (state === 'idle') { setIsConnecting(false); setRemoteStream(null); setInputEnabled(false); setRemoteControlAllowed(false); }
+      if (state === 'idle') { setIsConnecting(false); setRemoteStream(null); setInputEnabled(false); disableRemoteControl(); }
     };
     m.onRemoteStream = (stream) => {
       setRemoteStream(stream);
@@ -867,7 +894,7 @@ export default function App() {
     setIncomingCall(null);
     if (localVideoRef.current) localVideoRef.current.srcObject = screen;
     if (webrtc) await webrtc.disconnect();
-    setRemoteControlAllowed(false); // her oturum kontrol izni kapalı başlar
+    disableRemoteControl(); // her oturum kontrol izni kapalı başlar
     const m = buildManager();
     setWebrtc(m); setTargetId(fromId); setIsConnecting(true);
 
@@ -1146,7 +1173,7 @@ export default function App() {
                     <div className="absolute top-3 right-3 flex gap-2">
                       {rtcState === 'connected' && (
                         <button
-                          onClick={() => { const nv = !remoteControlAllowed; setRemoteControlAllowed(nv); addLocalLog(nv ? 'Uzaktan kontrole izin verildi.' : 'Uzaktan kontrol izni kapatildi.', 'warn'); }}
+                          onClick={toggleRemoteControl}
                           className="px-2 py-1 text-[9px] uppercase tracking-widest rounded transition-colors"
                           style={{ background: remoteControlAllowed ? 'var(--accent-primary)' : 'rgba(0,0,0,0.7)', color: remoteControlAllowed ? '#000' : 'var(--text-muted)' }}
                           title="Karşı tarafın klavye/fare kontrolüne izin ver"

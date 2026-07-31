@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="utf-8" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'" />
+<title>Paylaşılacak ekranı seçin</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{
+    background:#111010;color:#ece4d2;font-family:'Segoe UI',system-ui,sans-serif;
+    font-size:13px;height:100vh;display:flex;flex-direction:column;overflow:hidden;
+  }
+  header{padding:18px 22px 12px;border-bottom:1px solid #2a2622}
+  h1{font-size:15px;font-weight:600;color:#c5a059;letter-spacing:.02em}
+  header p{margin-top:5px;color:#7a6f63;font-size:11.5px;line-height:1.5}
+  main{flex:1;overflow-y:auto;padding:16px 22px}
+  h2{
+    font-size:9.5px;text-transform:uppercase;letter-spacing:.22em;color:#7a6f63;
+    margin:14px 0 10px;font-weight:600;
+  }
+  h2:first-child{margin-top:0}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(178px,1fr));gap:12px}
+  .item{
+    border:1px solid #2a2622;background:#1b1816;padding:8px;cursor:pointer;
+    display:flex;flex-direction:column;gap:8px;transition:border-color .15s,background .15s;
+  }
+  .item:hover{border-color:#7a6234;background:#23201d}
+  .item.sel{border-color:#c5a059;background:#23201d;box-shadow:0 0 0 1px #c5a059 inset}
+  .item img{width:100%;height:98px;object-fit:contain;background:#0c0b0a;display:block}
+  .item span{
+    font-size:11px;color:#bfb4a0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+    padding:0 2px 2px;
+  }
+  .item.sel span{color:#ece4d2}
+  .empty{color:#7a6f63;text-align:center;padding:40px 0;font-size:12px}
+  footer{
+    padding:14px 22px;border-top:1px solid #2a2622;display:flex;align-items:center;
+    justify-content:space-between;gap:16px;background:#141211;
+  }
+  label{display:flex;align-items:center;gap:8px;color:#bfb4a0;font-size:12px;cursor:pointer}
+  label.off{display:none}
+  input[type=checkbox]{accent-color:#c5a059;width:15px;height:15px;cursor:pointer}
+  .btns{display:flex;gap:10px;margin-left:auto}
+  button{
+    font:inherit;font-size:11.5px;letter-spacing:.06em;padding:9px 20px;cursor:pointer;
+    border:1px solid #2a2622;background:transparent;color:#bfb4a0;transition:all .15s;
+  }
+  button:hover{border-color:#7a6234;color:#ece4d2}
+  button.primary{background:#c5a059;border-color:#c5a059;color:#111010;font-weight:600}
+  button.primary:hover{background:#d9b574;border-color:#d9b574}
+  button:disabled{opacity:.4;cursor:not-allowed}
+  button.primary:disabled:hover{background:#c5a059;border-color:#c5a059}
+</style>
+</head>
+<body>
+  <header>
+    <h1>Paylaşılacak ekranı seçin</h1>
+    <p>Yalnızca seçtiğiniz ekran veya pencere karşı tarafa iletilir. Paylaşımı istediğiniz an durdurabilirsiniz.</p>
+  </header>
+
+  <main id="main"><div class="empty">Kaynaklar yükleniyor…</div></main>
+
+  <footer>
+    <label id="audioRow" class="off">
+      <input type="checkbox" id="withAudio" />
+      Sistem sesini de paylaş
+    </label>
+    <div class="btns">
+      <button id="cancel">İptal</button>
+      <button id="share" class="primary" disabled>Paylaş</button>
+    </div>
+  </footer>
+
+<script>
+  var selected = null;
+
+  function card(src) {
+    var d = document.createElement('div');
+    d.className = 'item';
+    d.title = src.name;
+
+    var img = document.createElement('img');
+    img.src = src.thumbnail;
+    img.alt = '';
+    d.appendChild(img);
+
+    var s = document.createElement('span');
+    s.textContent = src.name;
+    d.appendChild(s);
+
+    d.addEventListener('click', function () {
+      var prev = document.querySelector('.item.sel');
+      if (prev) prev.classList.remove('sel');
+      d.classList.add('sel');
+      selected = src.id;
+      document.getElementById('share').disabled = false;
+    });
+    d.addEventListener('dblclick', function () { selected = src.id; share(); });
+    return d;
+  }
+
+  function group(title, list, parent) {
+    if (!list.length) return;
+    var h = document.createElement('h2');
+    h.textContent = title;
+    parent.appendChild(h);
+    var g = document.createElement('div');
+    g.className = 'grid';
+    list.forEach(function (s) { g.appendChild(card(s)); });
+    parent.appendChild(g);
+  }
+
+  function share() {
+    if (!selected) return;
+    window.arkuPicker.choose({
+      id: selected,
+      withAudio: document.getElementById('withAudio').checked,
+    });
+  }
+
+  document.getElementById('share').addEventListener('click', share);
+  document.getElementById('cancel').addEventListener('click', function () {
+    window.arkuPicker.cancel();
+  });
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') window.arkuPicker.cancel();
+    if (e.key === 'Enter' && selected) share();
+  });
+
+  window.arkuPicker.init().then(function (data) {
+    var main = document.getElementById('main');
+    main.innerHTML = '';
+    var screens = data.sources.filter(function (s) { return s.isScreen; });
+    var windows = data.sources.filter(function (s) { return !s.isScreen; });
+    if (!data.sources.length) {
+      main.innerHTML = '<div class="empty">Paylaşılabilir kaynak bulunamadı.</div>';
+      return;
+    }
+    group('Ekranlar', screens, main);
+    group('Pencereler', windows, main);
+    if (data.audioRequested) document.getElementById('audioRow').className = '';
+  });
+</script>
+</body>
+</html>
