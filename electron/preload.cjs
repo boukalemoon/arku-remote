@@ -7,4 +7,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
   sendInput: (event) => ipcRenderer.send('input-event', event),
   // Aynı hesapla ikinci bir bağımsız oturum penceresi aç (çoklu müşteri erişimi)
   newWindow: () => ipcRenderer.send('new-window'),
+  // Ayarlar'dan elle güncelleme kontrolü
+  checkForUpdates: () => ipcRenderer.invoke('check-for-updates'),
 });

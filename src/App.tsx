@@ -19,7 +19,9 @@ type Theme = 'otuken' | 'umay' | 'gok' | 'gece';
 type Tab = 'dashboard' | 'connections' | 'contacts' | 'organization' | 'settings';
 type AuthMode = 'login' | 'register' | 'mfa' | 'reset';
 interface LogEntryLocal { time: string; msg: string; type: LogType; }
-interface IncomingCall { fromId: string; offerPayload: Record<string, unknown>; sessionId?: string; }
+// toId: arayanın bize ulaşmak için kullandığı kimlik (UUID veya 123-456-789).
+// Cevabı bu kimlikle imzalamamız gerekir, yoksa arayan yanıtı tanıyamaz.
+interface IncomingCall { fromId: string; toId?: string; offerPayload: Record<string, unknown>; sessionId?: string; signalId?: string; }
 interface QrtimUser { qrtim_id: string; email: string; name: string; username: string; photo_url: string | null; title: string | null; company: string | null; plan: string; }
 
 const QRTIM_BASE_URL = import.meta.env.VITE_QRTIM_URL ?? 'https://qartim.com';
@@ -99,6 +101,9 @@ export default function App() {
   const [remoteControlAllowed, setRemoteControlAllowed] = React.useState(false);
   const remoteControlAllowedRef = React.useRef(false);
   const [captureFrameRate, setCaptureFrameRate] = React.useState(15);
+  // Elle güncelleme kontrolü (yalnızca masaüstü uygulamasında anlamlı)
+  const [updateCheck, setUpdateCheck] = React.useState<{ status: string; version?: string; message?: string } | null>(null);
+  const [updateChecking, setUpdateChecking] = React.useState(false);
   const [qrtimUser, setQrtimUser] = React.useState<QrtimUser | null>(null);
   const [qrtimLinking, setQrtimLinking] = React.useState(false);
   const [entitlements, setEntitlements] = React.useState<Entitlements>(FREE_ENTITLEMENTS);
@@ -177,6 +182,76 @@ export default function App() {
     }
   }, [remoteStream]);
 
+  // Kendi giden bağlantı denememizi yerel olarak sonlandır (çağrı çakışmasında
+  // geri çekilirken kullanılır). Yalnızca ref'lere dokunur, bayat closure riski yok.
+  const teardownOutgoing = () => {
+    if (connTimeoutRef.current) { clearTimeout(connTimeoutRef.current); connTimeoutRef.current = null; }
+    const m = webrtcRef.current;
+    setWebrtc(null); setIsConnecting(false); setRtcState('idle');
+    m?.disconnect().catch(() => {});
+  };
+
+  /**
+   * Gelen bir offer ile ne yapılacağına karar verir:
+   *  'ignore' — alıcı rolündeyken karşı taraftan gelen ICE restart offer'ı;
+   *             WebRTCManager kendi aboneliğinde işler.
+   *  'busy'   — başka bir oturumdayız; arayan 30 sn sessizlik yerine anında
+   *             "meşgul" cevabı almalı.
+   *  'yield'  — çağrı çakışması: iki taraf da aynı anda aradı. İki taraf da aynı
+   *             deterministik kuralı uyguladığı için tam olarak biri geri çekilir.
+   *  'show'   — normal gelen çağrı.
+   */
+  const decideIncomingOffer = (fromId: string): 'ignore' | 'busy' | 'yield' | 'show' => {
+    const state = rtcStateRef.current;
+    if (state !== 'connected' && state !== 'connecting') return 'show';
+    const mgr = webrtcRef.current;
+    const isActivePeer = !!mgr?.isPeer(fromId);
+    if (isActivePeer && mgr?.getRole() === 'receiver') return 'ignore';
+    if (state === 'connecting' && isActivePeer && mgr?.getRole() === 'caller') {
+      const myCallId = currentUser?.id || connectionId;
+      return myCallId < fromId ? 'ignore' : 'yield';
+    }
+    return 'busy';
+  };
+
+  // Meşgul/red bildirimini, arayanın bizi çağırdığı kimlikle imzala; aksi halde
+  // arayan bu sinyali "başkasından" sanıp yok sayar.
+  const sendBusySignal = async (toId: string, addressedAs?: string) => {
+    try {
+      await supabase.from('signals').insert({
+        from_id: addressedAs || currentUser?.id || connectionId,
+        to_id: toId, type: 'hangup', payload: { reason: 'busy' },
+      });
+    } catch { /* bildirim gönderilemedi — arayan zaman aşımına düşer */ }
+  };
+
+  const processIncomingOffer = async (
+    sig: { id?: string; from_id: string; to_id?: string; payload: Record<string, unknown>; session_id?: string },
+    via = '',
+  ) => {
+    // Mükerrer işlemeyi tek noktada engelle: aynı offer hem WebSocket hem polling
+    // yolundan gelebilir; iki kez işlenirse iki kez "meşgul" sinyali gönderilirdi.
+    if (sig.id) {
+      if (processedOfferIdsRef.current.has(sig.id)) return;
+      if (processedOfferIdsRef.current.size > 200) processedOfferIdsRef.current.clear();
+      processedOfferIdsRef.current.add(sig.id);
+    }
+
+    const decision = decideIncomingOffer(sig.from_id);
+    if (decision === 'ignore') return;
+    if (decision === 'busy') {
+      addLocalLog(`${sig.from_id} baglanmak istedi, mesgul oldugunuz bildirildi.`, 'warn');
+      await sendBusySignal(sig.from_id, sig.to_id);
+      return;
+    }
+    if (decision === 'yield') {
+      addLocalLog('Cagri cakismasi: kendi istegimiz geri cekildi, gelen cagri gosteriliyor.', 'warn');
+      teardownOutgoing();
+    }
+    setIncomingCall({ fromId: sig.from_id, toId: sig.to_id, offerPayload: sig.payload, sessionId: sig.session_id, signalId: sig.id });
+    addLocalLog(`${sig.from_id} baglanmak istiyor...${via}`, 'warn');
+  };
+
   React.useEffect(() => {
     const ids = Array.from(new Set([currentUser?.id, connectionId].filter((v): v is string => !!v && v.trim().length > 0)));
     if (ids.length === 0) return;
@@ -185,11 +260,7 @@ export default function App() {
         .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'signals', filter: `to_id=eq.${rid}` }, (payload) => {
           const sig = payload.new as any;
           if (sig.type === 'offer') {
-            // Skip ICE restart offers during an active or establishing connection;
-            // those are handled internally by WebRTCManager's own subscription.
-            if (rtcStateRef.current === 'connected' || rtcStateRef.current === 'connecting') return;
-            setIncomingCall({ fromId: sig.from_id, offerPayload: sig.payload, sessionId: sig.session_id });
-            addLocalLog(`${sig.from_id} baglanmak istiyor...`, 'warn');
+            processIncomingOffer(sig);
           }
           if (sig.type === 'hangup') {
             // Yalnızca ilgili taraftan gelen hangup'ı işle. Aynı hesapla birden
@@ -197,9 +268,16 @@ export default function App() {
             // pencerenin aktif bağlantısını KESMEMELİ (sinyaller to_id=hesapID
             // ile hepsine ulaşır; ayrım from_id ile yapılır).
             setIncomingCall(prev => (prev && prev.fromId === sig.from_id) ? null : prev);
-            const activePeer = webrtcRef.current?.getPeerId?.();
-            if (!activePeer || sig.from_id !== activePeer) return;
-            addLocalLog('Karsi taraf baglantıyi kesti.', 'warn');
+            // Karşı taraf bize hangi kimlikle cevap veriyorsa onu tanı (UUID veya
+            // profil kimliği); isPeer bu eş anlamlıların hepsini kapsar.
+            if (!webrtcRef.current?.isPeer(sig.from_id)) return;
+            const reason = (sig.payload as { reason?: string } | null)?.reason;
+            addLocalLog(
+              reason === 'busy' ? 'Karsi taraf mesgul, su an baska bir oturumda.'
+              : reason === 'rejected' ? 'Baglanti istegi reddedildi.'
+              : 'Karsi taraf baglantıyi kesti.',
+              'warn',
+            );
             // Disconnect the active WebRTCManager (uses ref to avoid stale closure)
             webrtcRef.current?.disconnect().catch(() => {});
             setWebrtc(null);
@@ -224,24 +302,20 @@ export default function App() {
     if (ids.length === 0) return;
 
     const poll = async () => {
-      if (rtcStateRef.current === 'connected' || rtcStateRef.current === 'connecting') return;
       for (const rid of ids) {
         try {
           const { data } = await supabase
             .from('signals')
-            .select('id, from_id, payload, session_id, created_at')
+            .select('id, from_id, to_id, payload, session_id, created_at')
             .eq('to_id', rid)
             .eq('type', 'offer')
-            .gt('created_at', incomingPollSinceRef.current)
+            .gte('created_at', incomingPollSinceRef.current)
             .order('created_at', { ascending: true })
             .limit(5);
           if (!data || data.length === 0) continue;
           for (const sig of data) {
-            if (processedOfferIdsRef.current.has(sig.id)) continue;
-            processedOfferIdsRef.current.add(sig.id);
             incomingPollSinceRef.current = sig.created_at;
-            setIncomingCall({ fromId: sig.from_id, offerPayload: sig.payload, sessionId: sig.session_id });
-            addLocalLog(`${sig.from_id} baglanmak istiyor... (polling)`, 'warn');
+            await processIncomingOffer(sig, ' (polling)');
           }
         } catch { /* ignore transient errors */ }
       }
@@ -250,6 +324,18 @@ export default function App() {
     const timer = setInterval(poll, 2000);
     return () => clearInterval(timer);
   }, [currentUser?.id, connectionId]);
+
+  // Gelen çağrı penceresi sonsuza kadar açık kalmasın: arayan vazgeçip sekmeyi
+  // kapatırsa hangup sinyali hiç gelmez ve pencere ekranda asılı kalırdı.
+  // Arayanın kendi zaman aşımı 30 sn; bunu biraz sonrasına koyuyoruz.
+  React.useEffect(() => {
+    if (!incomingCall) return;
+    const t = setTimeout(() => {
+      setIncomingCall(null);
+      addLocalLog('Gelen baglanti istegi zaman asimina ugradi.', 'warn');
+    }, 45000);
+    return () => clearTimeout(t);
+  }, [incomingCall]);
 
   React.useEffect(() => {
     const { data: { subscription } } = supabase.auth.onAuthStateChange(async (_e, session) => {
@@ -732,10 +818,18 @@ export default function App() {
       if (!peerId && rawDigits.length === 9) {
         peerId = await resolve(`${rawDigits.slice(0,3)}-${rawDigits.slice(3,6)}-${rawDigits.slice(6,9)}`);
       }
-      if (!peerId) { setIsConnecting(false); postSessionEvent('error', targetId, EMBED.mode); addLog(`Hedef kimlik bulunamadi: ${normalizedTarget}`, 'error'); return; }
-      peerSignalId = peerId;
-      if (peerSignalId === currentUser.id) { setIsConnecting(false); addLog('Kendi hesabiniza baglamazsiniz.', 'error'); return; }
-      addLog(`Hedef cozumlendi -> ${peerSignalId.slice(0,8)}...`, 'sys');
+      if (peerId) {
+        peerSignalId = peerId;
+        if (peerSignalId === currentUser.id) { setIsConnecting(false); addLog('Kendi hesabiniza baglamazsiniz.', 'error'); return; }
+        addLog(`Hedef cozumlendi -> ${peerSignalId.slice(0,8)}...`, 'sys');
+      } else {
+        // Çözümlenemeyen kimlik ille de hatalı değildir: misafir kullanıcıların
+        // users satırı yoktur, dolayısıyla RPC null döner. Eskiden burada
+        // iptal ediliyordu ve girişli bir kullanıcı bir misafire ASLA
+        // bağlanamıyordu. Misafirler kendi kimliklerini dinlediği için
+        // yazılan kimliğe doğrudan sinyal göndermek doğru davranıştır.
+        addLog(`Kimlik kayitli degil, dogrudan deneniyor: ${normalizedTarget}`, 'warn');
+      }
     }
 
     const m = buildManager();
@@ -752,14 +846,18 @@ export default function App() {
   };
 
   const handleCancelConnect = async () => {
-    if (connTimeoutRef.current) clearTimeout(connTimeoutRef.current);
-    if (webrtc) { await webrtc.disconnect(); setWebrtc(null); }
-    setIsConnecting(false); setRtcState('idle'); addLog('Baglaniti istegi iptal edildi.', 'warn');
+    if (connTimeoutRef.current) { clearTimeout(connTimeoutRef.current); connTimeoutRef.current = null; }
+    // Arayüzü ÖNCE serbest bırak: teardown'ın herhangi bir adımı takılsa bile
+    // kullanıcı "Baglaniyor..." ekranında kilitli kalmamalı.
+    const m = webrtc;
+    setWebrtc(null); setIsConnecting(false); setRtcState('idle');
+    addLog('Baglaniti istegi iptal edildi.', 'warn');
+    try { await m?.disconnect(); } catch { /* teardown hatasi arayuzu etkilemesin */ }
   };
 
   const handleAcceptCall = async () => {
     if (!incomingCall) return;
-    const { fromId, offerPayload, sessionId } = incomingCall;
+    const { fromId, toId, offerPayload, sessionId, signalId } = incomingCall;
     // getDisplayMedia must be called while still in the user gesture context
     // (button click). Closing the modal first breaks the gesture chain in Chrome.
     let screen: MediaStream | null = null;
@@ -789,7 +887,7 @@ export default function App() {
       };
     });
 
-    try { await m.accept(fromId, offerPayload, screen, sessionId); }
+    try { await m.accept(fromId, offerPayload, screen, { sessionId, addressedAs: toId, offerSignalId: signalId }); }
     catch (err) {
       screen?.getTracks().forEach(t => { t.onended = null; t.stop(); });
       addLog(`Baglaniti kabul edilemedi: ${String(err)}`, 'error');
@@ -809,18 +907,46 @@ export default function App() {
 
   const handleRejectCall = async () => {
     if (!incomingCall) return;
-    await supabase.from('signals').insert({ from_id: currentUser?.id || connectionId, to_id: incomingCall.fromId, type: 'hangup', payload: { reason: 'rejected' } });
+    // Reddi, arayanın bizi çağırdığı kimlikle imzala; aksi halde arayan bu
+    // hangup'ı "başka birinden" sanıp yok sayar ve 30 sn zaman aşımını bekler.
+    const replyAs = incomingCall.toId || currentUser?.id || connectionId;
     setIncomingCall(null); addLog('Baglaniti istegi reddedildi.', 'warn');
+    await supabase.from('signals').insert({ from_id: replyAs, to_id: incomingCall.fromId, type: 'hangup', payload: { reason: 'rejected' } });
   };
 
   const handleDisconnect = async () => {
-    if (connTimeoutRef.current) clearTimeout(connTimeoutRef.current);
-    if (webrtc) { await webrtc.disconnect(); setWebrtc(null); }
+    if (connTimeoutRef.current) { clearTimeout(connTimeoutRef.current); connTimeoutRef.current = null; }
+    // Ekran paylaşımını ve arayüzü önce durdur, teardown'ı sonra bekle.
+    const m = webrtc;
     if (localVideoRef.current?.srcObject) { (localVideoRef.current.srcObject as MediaStream)?.getTracks().forEach(t => t.stop()); localVideoRef.current.srcObject = null; }
-    setRemoteStream(null); setRtcState('idle'); setIsConnecting(false); addLog('Baglaniti kesildi.', 'warn');
+    setWebrtc(null); setRemoteStream(null); setRtcState('idle'); setIsConnecting(false);
+    addLog('Baglaniti kesildi.', 'warn');
     postSessionEvent('ended', targetId, EMBED.mode);
+    try { await m?.disconnect(); } catch { /* teardown hatasi arayuzu etkilemesin */ }
   };
   handleDisconnectRef.current = handleDisconnect; // her render'da güncel referans
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const isElectron = !!(window as any).electronAPI?.isElectron;
+
+  const handleCheckUpdates = async () => {
+    setUpdateChecking(true); setUpdateCheck(null);
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const res = await (window as any).electronAPI?.checkForUpdates?.();
+      setUpdateCheck(res ?? { status: 'error', message: 'Guncelleme servisi kullanilamiyor.' });
+    } catch (err) {
+      setUpdateCheck({ status: 'error', message: String(err) });
+    }
+    setUpdateChecking(false);
+  };
+
+  const updateCheckMessage = (r: { status: string; version?: string; message?: string }): string => {
+    if (r.status === 'available') return `Yeni surum mevcut${r.version ? ` (v${r.version})` : ''}. Hazir oldugunda bilgilendirileceksiniz.`;
+    if (r.status === 'current') return `Uygulamaniz guncel${r.version ? ` (v${r.version})` : ''}.`;
+    if (r.status === 'dev') return 'Gelistirme modunda guncelleme kontrolu yapilmaz.';
+    return `Kontrol edilemedi: ${r.message ?? 'bilinmeyen hata'}`;
+  };
 
   const isLight = theme === 'umay';
 
@@ -1275,6 +1401,32 @@ export default function App() {
             <section className="gokturk-border surface-card p-8">
               <h3 className="text-[10px] uppercase tracking-widest text-steppe-muted mb-6 flex items-center gap-2"><Sun size={12} className="text-steppe-gold" /> Gorunum Temasi</h3>
               <div className="grid grid-cols-4 gap-3">{THEMES.map(t => <ThemeButton key={t.id} active={theme === t.id} onClick={() => updateTheme(t.id)} label={t.label} color={t.color} isLight={!!t.light} />)}</div>
+            </section>
+            <section className="gokturk-border surface-card p-8">
+              <h3 className="text-[10px] uppercase tracking-widest text-steppe-muted mb-6 flex items-center gap-2"><Zap size={12} className="text-steppe-gold" /> Uygulama Guncelleme</h3>
+              <div className="space-y-4">
+                <div className="flex items-center justify-between gap-4">
+                  <div>
+                    <p className="text-[11px] text-steppe-paper">Kurulu surum</p>
+                    <p className="text-[9px] text-steppe-muted uppercase tracking-widest">{`Arku Remote v${__APP_VERSION__}`}</p>
+                  </div>
+                  {isElectron && (
+                    <button onClick={handleCheckUpdates} disabled={updateChecking} className="btn-ghost px-5 py-2 disabled:opacity-40 whitespace-nowrap">
+                      {updateChecking ? 'Kontrol ediliyor...' : 'Guncellemeleri Kontrol Et'}
+                    </button>
+                  )}
+                </div>
+                {updateCheck && (
+                  <div className="p-3 border border-steppe-border text-[10px] text-steppe-muted" style={{ background: 'var(--surface-primary)' }}>
+                    {updateCheckMessage(updateCheck)}
+                  </div>
+                )}
+                <p className="text-[9px] text-steppe-muted">
+                  {isElectron
+                    ? 'Guncellemeler acilista ve 4 saatte bir otomatik kontrol edilir.'
+                    : 'Web surumu her zaman gunceldir; sayfayi yenilemeniz yeterlidir.'}
+                </p>
+              </div>
             </section>
             <section className="gokturk-border surface-card p-8">
               <h3 className="text-[10px] uppercase tracking-widest text-steppe-muted mb-6 flex items-center gap-2"><User size={12} className="text-steppe-gold" /> Profil Bilgileri</h3>

@@ -37,7 +37,18 @@ interface IncomingSignal {
 export class WebRTCManager {
   private pc: RTCPeerConnection | null = null;
   private myId: string;
+  /** accept() sırasında myId geçici olarak değiştirilebilir; close()'da buna dönülür. */
+  private readonly originalId: string;
   private peerId = '';
+  /**
+   * Karşı tarafın bilinen tüm kimlikleri. Arku'da bir kullanıcıya iki kimlikle
+   * ulaşılabilir (UUID ve 123-456-789 biçimli profil kimliği); arayan hangisini
+   * çevirdiyse alıcı onunla cevap vermeyebilir. Sinyalleri tek bir kimliğe göre
+   * eleyince answer/ICE sessizce düşüyordu — bu küme o eşleşmeyi tolere eder.
+   */
+  private peerAliases = new Set<string>();
+  /** Henüz tanınmayan bir kimlikten gelen ICE adayları (answer'dan önce gelebilir). */
+  private unknownCandidates = new Map<string, RTCIceCandidateInit[]>();
   private channel: ReturnType<typeof supabase.channel> | null = null;
   private cleanupTimer: ReturnType<typeof setInterval> | null = null;
   private pollingTimer: ReturnType<typeof setInterval> | null = null;
@@ -59,6 +70,26 @@ export class WebRTCManager {
 
   constructor(myId: string) {
     this.myId = myId;
+    this.originalId = myId;
+  }
+
+  /** Verilen kimlik bu oturumun karşı tarafına mı ait? (App seviyesi hangup filtresi) */
+  isPeer(id: string): boolean {
+    return !!id && this.peerAliases.has(id);
+  }
+
+  /**
+   * Bu oturumda arayan mıyız yoksa alıcı mı? Gelen bir offer'ın anlamı role göre
+   * değişir: alıcıysak karşı tarafın offer'ı ICE restart'tır, arayansak çağrı
+   * çakışmasıdır (ICE restart yalnızca arayan tarafından gönderilir).
+   */
+  getRole(): 'caller' | 'receiver' {
+    return this.isReceiver ? 'receiver' : 'caller';
+  }
+
+  private setPeer(id: string) {
+    this.peerId = id;
+    this.peerAliases.add(id);
   }
 
   private log(msg: string, type = 'info') {
@@ -94,6 +125,15 @@ export class WebRTCManager {
       this.log(`Signal gönderilemedi (${type}): ${error.message}`, 'error');
       throw new Error(error.message);
     }
+  }
+
+  /** Kimliği yeni tanınan bir göndericiden biriktirilmiş ICE adaylarını kuyruğa al. */
+  private adoptCandidatesFrom(fromId: string) {
+    const buffered = this.unknownCandidates.get(fromId);
+    if (!buffered?.length) return;
+    this.log(`${buffered.length} bekleyen ICE adayı eşleştirildi.`, 'sys');
+    this.pendingRemoteCandidates.push(...buffered);
+    this.unknownCandidates.delete(fromId);
   }
 
   private async applyPendingCandidates() {
@@ -235,13 +275,43 @@ export class WebRTCManager {
   // Central signal processor — called by both WebSocket and polling paths
   private async handleSignal(sig: IncomingSignal): Promise<void> {
     if (!this.pc) return;
-    if (sig.from_id !== this.peerId) return;
+
+    if (!this.peerAliases.has(sig.from_id)) {
+      // Bu sinyal zaten bize (to_id = myId) adreslenmiş durumda. Kimlik farklıysa
+      // sebebi neredeyse her zaman şu: karşı tarafa profil kimliğiyle (123-456-789)
+      // ulaştık, o ise UUID'siyle cevap veriyor. Beklediğimiz answer'ı bu yüzden
+      // atmak yerine kimliği benimseyip eş anlamlı olarak kaydediyoruz.
+      const isAwaitedAnswer = sig.type === 'answer' && !this.isReceiver && !this.pc.remoteDescription;
+      if (isAwaitedAnswer) {
+        this.log(`Karşı taraf farklı kimlikle yanıtladı, eşleştirildi: ${sig.from_id.slice(0, 8)}...`, 'sys');
+        this.peerAliases.add(sig.from_id);
+        this.adoptCandidatesFrom(sig.from_id);
+      } else if (sig.type === 'ice-candidate') {
+        // Answer'dan önce gelen adaylar kaybolmasın: kimlik tanınana kadar sakla.
+        const bucket = this.unknownCandidates.get(sig.from_id) ?? [];
+        if (bucket.length < 50) {
+          bucket.push(sig.payload as RTCIceCandidateInit);
+          this.unknownCandidates.set(sig.from_id, bucket);
+        }
+        return;
+      } else {
+        return;
+      }
+    }
 
     if (sig.type === 'answer') {
       this.log('Answer alındı.');
       await this.pc.setRemoteDescription(new RTCSessionDescription(this.sanitizeDescription(sig.payload)));
       await this.applyPendingCandidates();
     } else if (sig.type === 'offer') {
+      // Zaten uyguladığımız offer'ın aynısı tekrar gelebilir (polling 10 sn geriye
+      // bakıyor, kabul edilen ilk offer bu pencereye düşüyor). Bunu ICE restart
+      // sanıp yeniden pazarlık başlatmak kurulu bağlantıyı düşürür.
+      const incomingSdp = (sig.payload as { sdp?: string }).sdp;
+      if (incomingSdp && this.pc.remoteDescription?.sdp === incomingSdp) {
+        this.log('Aynı offer tekrar geldi, yok sayıldı.', 'info');
+        return;
+      }
       // ICE restart offer from caller (receiver handles this)
       this.log('ICE restart teklifi alındı.', 'warn');
       await this.pc.setRemoteDescription(new RTCSessionDescription(this.sanitizeDescription(sig.payload)));
@@ -286,7 +356,9 @@ export class WebRTCManager {
         .select('id, type, from_id, payload, created_at')
         .eq('to_id', this.myId)
         .eq('from_id', this.peerId)
-        .gt('created_at', this.pollSince)
+        // gte: aynı milisaniyede yazılan ICE adayları .gt ile atlanıyordu;
+        // processedSignalIds zaten mükerrer işlemeyi engelliyor.
+        .gte('created_at', this.pollSince)
         .order('created_at', { ascending: true })
         .limit(20);
 
@@ -357,7 +429,7 @@ export class WebRTCManager {
     if (peerId === this.myId) throw new Error('Kendi cihazınıza bağlanamazsınız.');
 
     this.isReceiver = false;
-    this.peerId = peerId;
+    this.setPeer(peerId);
     this.sessionId = this.generateSessionId();
     this.pendingRemoteCandidates = [];
     this.onStateChange?.('connecting');
@@ -369,9 +441,16 @@ export class WebRTCManager {
     const dc = pc.createDataChannel('input', { ordered: true });
     this.setupDataChannel(dc);
 
+    // Ekranı KARŞI taraf paylaşır; biz yalnızca alırız. Eski `offerToReceiveVideo`
+    // bayrağı yerine açık transceiver kullanıyoruz: bayrak standart dışı ve
+    // kaldırılma yolunda; offer'da video m-line'ı oluşmazsa alıcının eklediği
+    // ekran track'i answer'a giremez ve bağlantı kurulsa bile görüntü gelmez.
+    pc.addTransceiver('video', { direction: 'recvonly' });
+    pc.addTransceiver('audio', { direction: 'recvonly' });
+
     await this.subscribe();
 
-    const offer = await pc.createOffer({ offerToReceiveVideo: true, offerToReceiveAudio: true });
+    const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
     await this.send('offer', offer);
 
@@ -379,10 +458,30 @@ export class WebRTCManager {
     this.cleanupTimer = setInterval(() => this.cleanSignals(), 30000);
   }
 
-  // RECEIVER – shares screen, accepts connection
-  async accept(fromId: string, offerPayload: Record<string, unknown>, screenStream: MediaStream, sessionId?: string): Promise<void> {
+  /**
+   * RECEIVER – ekranı paylaşır, bağlantıyı kabul eder.
+   *
+   * `addressedAs`: arayanın bize ulaşmak için kullandığı kimlik (offer satırının
+   * to_id'si). Cevabı bu kimlikle imzalarız; aksi halde arayan bizi tanıyamaz ve
+   * answer/ICE sinyallerini düşürür (görüntü hiç gelmez).
+   *
+   * `offerSignalId`: kabul ettiğimiz offer satırının id'si. İşlenmiş olarak
+   * işaretlenir; polling 10 sn geriye baktığı için aynı offer tekrar okunup
+   * ICE restart sanılmasın diye gerekli.
+   */
+  async accept(
+    fromId: string,
+    offerPayload: Record<string, unknown>,
+    screenStream: MediaStream,
+    opts: { sessionId?: string; addressedAs?: string; offerSignalId?: string } = {},
+  ): Promise<void> {
+    const { sessionId, addressedAs, offerSignalId } = opts;
     this.isReceiver = true;
-    this.peerId = fromId;
+    if (addressedAs && addressedAs.trim()) this.myId = addressedAs.trim();
+    this.setPeer(fromId);
+    // session_id yalnızca offer ile geldiyse güvenilir. Kendi ürettiğimiz bir id
+    // ile erken ICE adaylarını sorgulamak hiçbir satırla eşleşmez.
+    const sessionFromOffer = !!sessionId;
     this.sessionId = sessionId || this.generateSessionId();
     this.pendingRemoteCandidates = [];
     this.onStateChange?.('connecting');
@@ -392,6 +491,10 @@ export class WebRTCManager {
     screenStream.getTracks().forEach(track => pc.addTrack(track, screenStream));
 
     await this.subscribe();
+
+    // Kabul ettiğimiz offer'ı işlenmiş say — aksi halde polling'in 10 sn geriye
+    // dönük penceresi onu tekrar okur ve ICE restart sanıp kurulu bağlantıyı düşürür.
+    if (offerSignalId) this.processedSignalIds.add(offerSignalId);
 
     // Caller starts ICE gathering as soon as setLocalDescription fires,
     // which is BEFORE the receiver clicks Accept. Those candidates are already
@@ -404,7 +507,7 @@ export class WebRTCManager {
         .eq('to_id', this.myId)
         .eq('type', 'ice-candidate')
         .order('created_at', { ascending: true });
-      if (this.hasSessionIdColumn && this.sessionId) {
+      if (this.hasSessionIdColumn && sessionFromOffer && this.sessionId) {
         query.eq('session_id', this.sessionId);
       }
       const { data: missedCandidates } = await query;
@@ -441,13 +544,30 @@ export class WebRTCManager {
     }
   }
 
+  /**
+   * Bağlantıyı kapatır. Yerel teardown ÖNCE yapılır, hangup sinyali arkadan
+   * gönderilir: insert ağda/RLS'te takılırsa "İptal Et" ve "Bağlantıyı Kes"
+   * kilitlenmemeli. Eskiden insert await ediliyordu ve arayüz donuyordu.
+   */
   async disconnect(): Promise<void> {
-    if (this.peerId) {
-      try { await this.send('hangup', {}); } catch {}
-    }
+    const peer = this.peerId;
+    const fromId = this.myId;
+    const sessionId = this.sessionId;
+
     this.close();
     this.onStateChange?.('idle');
     this.log('Bağlantı kapatıldı.', 'warn');
+
+    if (peer) this.sendHangupDetached(fromId, peer, sessionId);
+  }
+
+  /** Hangup'ı bekletmeden gönder — sonucu yalnızca loglanır. */
+  private sendHangupDetached(fromId: string, toId: string, sessionId: string | null): void {
+    const row: Record<string, unknown> = { from_id: fromId, to_id: toId, type: 'hangup', payload: {} };
+    if (this.hasSessionIdColumn && sessionId) row.session_id = sessionId;
+    void supabase.from('signals').insert(row).then(({ error }) => {
+      if (error) this.log(`Hangup gönderilemedi: ${error.message}`, 'warn');
+    });
   }
 
   private close() {
@@ -457,6 +577,9 @@ export class WebRTCManager {
     this.pc?.close();
     this.pc = null;
     this.pendingRemoteCandidates = [];
+    this.unknownCandidates.clear();
+    this.peerAliases.clear();
+    this.myId = this.originalId; // accept() sırasındaki geçici kimlik geri alınır
     this.processedSignalIds = new Set();
     if (this.channel) { supabase.removeChannel(this.channel); this.channel = null; }
     if (this.cleanupTimer) { clearInterval(this.cleanupTimer); this.cleanupTimer = null; }

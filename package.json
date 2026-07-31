@@ -6,9 +6,13 @@
     "email": "burakakmese@gmail.com"
   },
   "private": true,
-  "version": "1.0.8",
+  "version": "1.0.13",
   "type": "module",
   "main": "electron/main.cjs",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/boukalemoon/arku-remote.git"
+  },
   "build": {
     "appId": "com.arku.remote",
     "productName": "Arku-Remote",
@@ -17,6 +21,9 @@
       "output": "dist_electron"
     },
     "asar": true,
+    "asarUnpack": [
+      "**/node_modules/@nut-tree-fork/**"
+    ],
     "files": [
       "dist/**/*",
       "electron/**/*",
@@ -59,6 +66,8 @@
     },
     "publish": {
       "provider": "github",
+      "owner": "boukalemoon",
+      "repo": "arku-remote",
       "releaseType": "release"
     }
   },
@@ -71,9 +80,11 @@
     "desktop:build": "vite build && electron-builder",
     "desktop:build:win": "vite build && electron-builder --win",
     "desktop:build:mac": "vite build && electron-builder --mac",
-    "desktop:build:linux": "vite build && electron-builder --linux"
+    "desktop:build:linux": "vite build && electron-builder --linux",
+    "rebuild:native": "electron-builder install-app-deps"
   },
   "dependencies": {
+    "@nut-tree-fork/nut-js": "^4.2.6",
     "@supabase/supabase-js": "^2.49.0",
     "electron-updater": "^6.8.9",
     "lucide-react": "^0.546.0",
