@@ -159,7 +159,8 @@ export default function App() {
   };
   const addLog = async (msg: string, type: LogType = 'info') => {
     addLocalLog(msg, type);
-    if (!currentUser) return;
+    // Misafir (anonim) oturumda geçmiş tutulmaz — kayıt yalnızca yereldedir.
+    if (!currentUser || currentUser.is_anonymous) return;
     await supabase.from('logs').insert({ user_id: currentUser.id, msg, type });
   };
 
@@ -339,16 +340,34 @@ export default function App() {
 
   React.useEffect(() => {
     const { data: { subscription } } = supabase.auth.onAuthStateChange(async (_e, session) => {
+      // Realtime WebSocket'i kendi JWT'sini taşır ve RLS'i onunla değerlendirir.
+      // Politikalar auth.uid()'e bağlandığında bu çağrı yapılmazsa postgres_changes
+      // olayları SESSİZCE hiç gelmez — 2026-07-27'de bağlantıyı bozan tam olarak buydu.
+      supabase.realtime.setAuth(session?.access_token ?? null);
+
       const user = session?.user ?? null;
+      const anon = !!user?.is_anonymous;
       setCurrentUser(user);
+      setIsGuest(anon);
       if (user) {
-        setIsEmailVerified(!!user.email_confirmed_at);
+        // Anonim kullanıcının doğrulanacak bir e-postası yoktur.
+        setIsEmailVerified(anon || !!user.email_confirmed_at);
         const pid = generateProfileId(user.id);
         setConnectionId(pid);
         setSessionToken(generateSessionToken());
         const fp = generateDeviceFingerprint();
         setDeviceFingerprint(fp);
-        await supabase.from('users').upsert({ id: user.id, email: user.email, connection_id: pid, device_fingerprint: fp, last_seen: new Date().toISOString() }, { onConflict: 'id' });
+        // Kimlik bağlama: bu satır, display kimliğini (123-456-789) auth.uid()'e
+        // bağlar. signals RLS'ini kimliğe dayandırmanın ön koşulu budur —
+        // misafirler dahil herkes için yazılır.
+        await supabase.from('users').upsert({ id: user.id, email: user.email ?? null, connection_id: pid, device_fingerprint: fp, last_seen: new Date().toISOString() }, { onConflict: 'id' });
+        if (anon) {
+          // Misafir: profil/geçmiş/abonelik yüklenmez, kayıt tutulmaz.
+          setUserProfile(null);
+          setEntitlements(FREE_ENTITLEMENTS);
+          setLogs([{ time: ts(), msg: `Arku Remote v${__APP_VERSION__} baslatildi...`, type: 'sys' }, { time: ts(), msg: 'Misafir olarak devam ediliyor.', type: 'warn' }]);
+          return;
+        }
         const { data: prof } = await supabase.from('users').select('*').eq('id', user.id).single();
         if (prof) {
           setUserProfile(prof as UserProfile);
@@ -371,6 +390,29 @@ export default function App() {
       }
     });
     return () => subscription.unsubscribe();
+  }, []);
+
+  // Her sekmeye gerçek bir oturum kazandır: oturumu olmayanlar anonim olarak
+  // imzalanır. Böylece misafirler dahil her istemcinin bir auth.uid()'i ve
+  // sunucuda kimlik bağlaması olur — signals RLS'ini kimliğe dayandırmanın ön koşulu.
+  //
+  // Supabase'de "Allow anonymous sign-ins" kapalıysa burası sessizce başarısız olur
+  // ve uygulama bugünkü (oturumsuz misafir) davranışıyla çalışmaya devam eder.
+  const anonBootstrapRef = React.useRef(false);
+  React.useEffect(() => {
+    // QRtım SSO dönüşünde atlanır; o akış kendi oturumunu açar.
+    if (new URLSearchParams(window.location.search).get('qrtim_token')) return;
+    if (anonBootstrapRef.current) return;
+    anonBootstrapRef.current = true;
+    (async () => {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (session) return;
+      const { error } = await supabase.auth.signInAnonymously();
+      if (error) {
+        anonBootstrapRef.current = false;
+        addLocalLog('Anonim oturum acilamadi, misafir modunda devam ediliyor.', 'warn');
+      }
+    })();
   }, []);
 
   // QRtım'den ?qrtim_token=... ile dönüşte tek noktadan işle:
@@ -516,8 +558,19 @@ export default function App() {
     setRemoteStream(null); setRtcState('idle'); setIsConnecting(false);
     setConnectionId(getOrCreateGuestId()); setDisplayName(''); setPhone(''); setSessionToken(''); setDeviceFingerprint('');
     setActiveTab('dashboard'); addLocalLog('Oturum kapatildi.', 'warn');
+    // Çıkıştan sonra da ulaşılabilir kal: yeni bir anonim oturum aç.
+    // Aksi halde sekme oturumsuz kalır ve kimliğe bağlı RLS altında kimse ulaşamaz.
+    anonBootstrapRef.current = true;
+    await supabase.auth.signInAnonymously().catch(() => { anonBootstrapRef.current = false; });
   };
-  const handleGuestLogin = () => { setIsGuest(true); setShowAuth(false); setAuthError(''); addLog('Misafir olarak devam ediliyor.', 'warn'); };
+  // Misafir olarak devam: oturum yoksa anonim imzalanır (kimlik bağlaması için).
+  // Oturum zaten varsa yalnızca modalı kapatır — tekrar çağrılması güvenlidir.
+  const handleGuestLogin = async () => {
+    setIsGuest(true); setShowAuth(false); setAuthError('');
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session) await supabase.auth.signInAnonymously().catch(() => {});
+    addLog('Misafir olarak devam ediliyor.', 'warn');
+  };
 
   const refreshEntitlements = async () => {
     try { setEntitlements(await fetchEntitlements()); }

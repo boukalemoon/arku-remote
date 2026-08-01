@@ -253,7 +253,8 @@ export class WebRTCManager {
     if (this.isReceiver) return;
     try {
       const { data: { user } } = await supabase.auth.getUser();
-      if (!user) return;
+      // Misafir (anonim) oturumda bağlantı geçmişi tutulmaz.
+      if (!user || user.is_anonymous) return;
       await supabase.from('connections').insert({
         caller_id: user.id,
         receiver_id: this.peerId,

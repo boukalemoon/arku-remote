@@ -48,6 +48,7 @@ select bolum, ad, detay from (
            || '  insert=' || case when has_table_privilege('anon', 'public.'||t.tbl, 'insert') then 'VAR' else 'yok' end
            || '  delete=' || case when has_table_privilege('anon', 'public.'||t.tbl, 'delete') then 'VAR' else 'yok' end
   from (values ('signals'),('users'),('connections'),('logs')) as t(tbl)
+  where to_regclass('public.' || t.tbl) is not null
 
   union all
 
@@ -82,22 +83,21 @@ select bolum, ad, detay from (
 
   union all
 
-  -- 7) Sunucu tarafı otomatik temizlik kurulmuş mu?
-  select 7, 'G. PG_CRON',
-         case when exists (select 1 from pg_extension where extname='pg_cron')
-              then 'eklenti kurulu' else 'eklenti YOK' end,
-         coalesce((select string_agg(jobname || ' → ' || schedule, ' ; ')
-                   from cron.job
-                   where command ilike '%signals%'), 'signals temizleme gorevi yok')
+  -- 7) Sunucu tarafı otomatik temizlik altyapısı var mı?
+  --    NOT: cron.job tablosuna doğrudan referans verilmiyor — eklenti kurulu
+  --    değilken sorgu planlanırken "relation cron.job does not exist" hatası
+  --    veriyordu (case içinde olması engellemiyor, çünkü ad çözümlemesi
+  --    çalıştırmadan önce yapılıyor).
+  select 7, 'G. OTOMATIK TEMIZLIK', 'pg_cron eklentisi',
+         case when exists (select 1 from pg_extension where extname = 'pg_cron')
+              then 'KURULU — gorevleri gormek icin ayrica: select jobname, schedule, command from cron.job;'
+              else 'kurulu degil — sunucu tarafi TTL temizligi yok, temizlik yalnizca istemciye bagli'
+         end
 
 ) t
 order by sira, ad;
 
 -- =========================================================
--- NOT: 7. bölüm pg_cron kurulu değilse hata verebilir. O durumda
--- betiğin son `union all` bloğunu silip tekrar çalıştırın —
--- diğer bölümler tek başına da yeterlidir.
---
 -- AYRICA elle kontrol edilmesi gereken (SQL'den görünmeyen) tek şey:
 --   Dashboard → Authentication → Sign In / Providers →
 --   "Allow anonymous sign-ins" AÇIK mı?
