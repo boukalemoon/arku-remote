@@ -1,0 +1,9 @@
+{
+  "name": "arku-remote-website",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Arku Remote tanıtım sitesi — statik sayfa + Vercel serverless analitik ucu",
+  "dependencies": {
+    "firebase-admin": "^12.7.0"
+  }
+}

@@ -1,7 +1,7 @@
 {
   "version": 2,
   "buildCommand": "",
-  "installCommand": "",
+  "installCommand": "npm install --omit=dev --ignore-scripts --no-audit --no-fund",
   "outputDirectory": ".",
   "cleanUrls": true,
   "trailingSlash": false,

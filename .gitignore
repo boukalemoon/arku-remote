@@ -13,3 +13,5 @@ firebase-blueprint.json
 firebase.json
 .env
 .env.*supabase/.temp/
+
+.vercel
