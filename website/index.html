@@ -1532,9 +1532,9 @@
 
 <script>
 (function () {
-  var SB = 'https://jpmbttlxyxrqmpghymbq.supabase.co';
-  // Public (anon) anahtar — tasarım gereği herkese açıktır, RLS ile korunur.
-  var KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImpwbWJ0dGx4eXhycW1wZ2h5bWJxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODI5NjU0NDgsImV4cCI6MjA5ODU0MTQ0OH0._zgdzPjHHfoeyzsFqDy7Bi2gz_YqBF_8vez_bgGBCvo';
+  // Yorumlar analitikle aynı hattı kullanır: site → /api/reviews → Firestore.
+  // Moderasyon Nexus CRM → Pazarlama → Arku → Yorumlar sekmesinden yapılır.
+  var API = '/api/reviews';
 
   var list = document.getElementById('revList');
   var form = document.getElementById('revForm');
@@ -1556,9 +1556,7 @@
   }
 
   // ── Yayınlanmış yorumları getir ──
-  fetch(SB + '/rest/v1/arku_public_reviews?select=*&order=published_at.desc&limit=12', {
-    headers: { apikey: KEY }
-  })
+  fetch(API, { headers: { Accept: 'application/json' } })
     .then(function (r) { return r.ok ? r.json() : []; })
     .then(function (rows) {
       if (!rows || !rows.length) {
@@ -1567,8 +1565,8 @@
       }
       list.innerHTML = rows.map(function (r) {
         return '<div class="rev-card">'
-          + '<div class="who"><span class="nm">' + esc(r.author_name) + '</span>'
-          + (r.author_title ? '<span class="tt">' + esc(r.author_title) + '</span>' : '')
+          + '<div class="who"><span class="nm">' + esc(r.authorName) + '</span>'
+          + (r.authorTitle ? '<span class="tt">' + esc(r.authorTitle) + '</span>' : '')
           + '</div>'
           + stars(r.rating)
           + '<p>' + esc(r.body).replace(/\n/g, '<br>') + '</p>'
@@ -1599,9 +1597,7 @@
   form.addEventListener('submit', function (e) {
     e.preventDefault();
 
-    // Bot tuzağı doluysa sessizce başarı göster, hiçbir şey gönderme.
-    if (document.getElementById('revSite').value) { show('ok', 'Yorumunuz alındı.'); return; }
-
+    var hp = document.getElementById('revSite').value;
     var name = document.getElementById('revName').value.trim();
     var title = document.getElementById('revTitle').value.trim();
     var email = document.getElementById('revEmail').value.trim();
@@ -1613,15 +1609,16 @@
     sendBtn.disabled = true;
     show('ok', 'Gönderiliyor…');
 
-    fetch(SB + '/rest/v1/arku_reviews', {
+    fetch(API, {
       method: 'POST',
-      headers: { apikey: KEY, 'Content-Type': 'application/json', Prefer: 'return=minimal' },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        author_name: name,
-        author_title: title || null,
-        contact_email: email || null,
-        rating: rating || null,
-        body: body
+        authorName: name,
+        authorTitle: title,
+        contactEmail: email,
+        rating: rating,
+        body: body,
+        website: hp // bot tuzağı — sunucu doluysa sessizce yok sayar
       })
     })
       .then(function (r) {
