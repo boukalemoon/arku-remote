@@ -10,7 +10,7 @@
 
 Güvenlik açığı tespit ettiyseniz lütfen **GitHub Issues'u kullanmayın**.
 
-Açığı doğrudan şu adrese gönderin: **burakakmese@gmail.com**
+Açığı doğrudan şu adrese gönderin: **info@arku.com.tr**
 
 Bildiriminizde şunları belirtin:
 - Açığın türü (XSS, injection, veri sızıntısı vb.)

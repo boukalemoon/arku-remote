@@ -395,6 +395,50 @@
   /* ───────── Decorative diamond ───────── */
   .diamond{display:inline-block;width:6px;height:6px;background:var(--gold);transform:rotate(45deg);margin:0 8px;vertical-align:middle}
 
+  /* ───────── YORUMLAR ───────── */
+  .rev-grid{display:grid;grid-template-columns:1.15fr 1fr;gap:48px;margin-top:48px;align-items:start}
+  .rev-list{display:flex;flex-direction:column;gap:16px}
+  .rev-card{border:1px solid var(--line);background:var(--stone-2);padding:22px 24px}
+  .rev-card .who{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:4px}
+  .rev-card .nm{font-family:'Cinzel',serif;font-size:14px;color:var(--gold)}
+  .rev-card .tt{font-size:11.5px;color:var(--muted)}
+  .rev-card .stars{color:var(--gold);font-size:12px;letter-spacing:2px;margin-bottom:10px}
+  .rev-card p{font-size:13.5px;color:var(--paper-2);line-height:1.7}
+  .rev-empty{border:1px dashed var(--line-2);padding:34px 26px;text-align:center;color:var(--muted);font-size:13px}
+
+  /* Form */
+  .rev-form{border:1px solid var(--line-2);background:var(--stone-2);padding:28px 26px}
+  .rev-form h3{font-size:16px;margin-bottom:6px}
+  .rev-form .hint{font-size:12px;color:var(--muted);margin-bottom:20px;line-height:1.6}
+  .rev-form label{display:block;font-family:'Cinzel',serif;font-size:9.5px;letter-spacing:.2em;
+    text-transform:uppercase;color:var(--muted);margin:0 0 6px}
+  .rev-form .fld{margin-bottom:16px}
+  .rev-form input[type=text],.rev-form input[type=email],.rev-form textarea{
+    width:100%;background:var(--stone-1);border:1px solid var(--line);color:var(--paper);
+    font-family:inherit;font-size:13.5px;padding:11px 13px;outline:none;transition:border-color .15s;
+  }
+  .rev-form input:focus,.rev-form textarea:focus{border-color:var(--gold-3)}
+  .rev-form textarea{resize:vertical;min-height:118px;line-height:1.6}
+  .rev-form .hp{position:absolute;left:-9999px;width:1px;height:1px;overflow:hidden}
+  .star-row{display:flex;gap:6px}
+  .star-row button{
+    background:none;border:1px solid var(--line);color:var(--muted-2);font-size:15px;
+    width:34px;height:34px;cursor:pointer;transition:all .15s;line-height:1;
+  }
+  .star-row button:hover{border-color:var(--gold-3);color:var(--gold-3)}
+  .star-row button.on{border-color:var(--gold);color:var(--gold)}
+  .rev-form .send{
+    width:100%;font-family:'Cinzel',serif;font-size:11px;letter-spacing:.18em;text-transform:uppercase;
+    padding:13px;background:var(--gold);border:1px solid var(--gold);color:#111010;cursor:pointer;
+    font-weight:600;transition:background .15s;
+  }
+  .rev-form .send:hover:not(:disabled){background:var(--gold-2)}
+  .rev-form .send:disabled{opacity:.5;cursor:not-allowed}
+  .rev-msg{margin-top:14px;font-size:12.5px;line-height:1.6;padding:12px 14px;border:1px solid var(--line-2)}
+  .rev-msg.ok{color:var(--green);border-color:rgba(109,186,114,.4);background:rgba(109,186,114,.06)}
+  .rev-msg.err{color:var(--red);border-color:rgba(213,111,94,.4);background:rgba(213,111,94,.06)}
+  @media (max-width:900px){ .rev-grid{grid-template-columns:1fr;gap:36px} }
+
   /* ───────── SÜRÜM GEÇMİŞİ ───────── */
   .rel-bg{background:var(--stone-2)}
   /* En güncel sürüm — öne çıkan kart */
@@ -521,6 +565,7 @@
       <a href="#temalar">Temalar</a>
       <a href="#guvenlik">Güvenlik</a>
       <a href="#surumler">Sürümler</a>
+      <a href="#yorumlar">Yorumlar</a>
       <a href="#indir">İndir</a>
     </div>
     <div class="nav-cta">
@@ -1379,7 +1424,8 @@
 
       <details class="faq">
         <summary>Kimliğim her seferinde değişiyor mu, sabit kalıyor mu?<span class="plus">+</span></summary>
-        <p>Varsayılan olarak her oturum için yeni bir kimlik üretilir (misafir mod). İsterseniz ayarlardan sabit bir kullanıcı kimliği oluşturabilir, böylece sık iletişimde olduğunuz kişilerin sizi aynı kodla bulmasını sağlayabilirsiniz.</p>
+        <p>Misafir modunda kimliğiniz cihazınıza bağlıdır: aynı cihazdan girdiğiniz sürece aynı kalır, tarayıcı verilerini temizlerseniz yenilenir.</p>
+        <p style="padding-top:0;border-bottom:none">QRtım hesabınız ile bağlantı kurduğunuzda ya da yeni hesap oluşturduğunuzda, QRtım kullanıcısı olarak size özel bir ID tanımlanır ve her zaman giriş yaptığınızda size özel ID üzerinden erişim sağlayabilirsiniz. Böylece sık iletişimde olduğunuz kişiler sizi hep aynı kodla bulur.</p>
       </details>
 
       <details class="faq">
@@ -1389,23 +1435,212 @@
 
       <details class="faq">
         <summary>Açık kaynak — peki güncellemeler güvenli mi?<span class="plus">+</span></summary>
-        <p>Tüm sürümler imzalı yayımlanır. Windows binarileri Authenticode, macOS binarileri Apple Notarization ile imzalıdır. SHA-256 toplamları her indirme sayfasında ve GitHub release notlarında listelenir.</p>
+        <p>Tüm sürümler GitHub Actions üzerinde, herkese açık kaynak koddan otomatik olarak derlenir; hangi commit'ten üretildiği release sayfasında görünür. Uygulama içindeki güncelleme kontrolü de yalnızca bu resmî sürümleri hedefler.</p>
+        <p style="padding-top:0;border-bottom:none">Kurulum dosyaları henüz kod imzalı (Authenticode / Apple Notarization) değildir — bu yüzden Windows'ta "Bilinmeyen yayıncı" uyarısı görebilirsiniz. Kod imzalama sertifikası çalışmalarımız sürüyor.</p>
       </details>
 
       <details class="faq">
         <summary>TrendTech kim?<span class="plus">+</span></summary>
-        <p>TrendTech, Türkiye merkezli bağımsız bir yazılım stüdyosudur. Arku Remote'u uzun süreli bir yan ürün olarak geliştirir; topluluk geri bildirimini, ticari müşteriden gelen feature taleplerinden önce sayar.</p>
+        <p>TrendTech 2015 yılından beri teknoloji alanında Siber Güvenlik, yazılım ve regülasyonlar tarafında danışmanlık hizmetleri veren bir iş ortağıdır. Ayrıntılı bilgi için: <a href="https://www.trendtech.com.tr" target="_blank" rel="noopener" style="color:var(--gold)">www.trendtech.com.tr</a></p>
       </details>
 
       <details class="faq">
         <summary>Bir sorun veya hata buldum — nereye bildireyim?<span class="plus">+</span></summary>
-        <p>GitHub Issues sayfası üzerinden bildirim açabilirsiniz. Güvenlik açıkları için lütfen önce <span class="mono" style="color:var(--gold)">security@trendtech.tr</span> adresine ulaşın — sorumlu yayınlama (responsible disclosure) süreciyle çözeriz.</p>
+        <p>Güvenlik açıkları ve tespit ettiğiniz sorunları lütfen <a href="mailto:info@arku.com.tr" class="mono" style="color:var(--gold)">info@arku.com.tr</a> adresinden bizlere ulaştırın. Güvenlik bildirimlerini sorumlu yayınlama (responsible disclosure) süreciyle ele alırız. Dilerseniz GitHub Issues üzerinden de bildirim açabilirsiniz.</p>
       </details>
     </div>
   </div>
 </section>
 
+<!-- ─────────────────── YORUMLAR ─────────────────── -->
+<!--
+  Yorumlar Supabase'de `arku_reviews` tablosunda tutulur ve HER ZAMAN
+  'pending' olarak kaydedilir. Yayınlanması için Nexus moderasyon panelinden
+  onaylanması gerekir; onaysız hiçbir yorum bu sayfada görünmez.
+  Sayfa yalnızca `arku_public_reviews` görünümünü okur — o görünüm sadece
+  onaylı satırları ve herkese açık kolonları içerir (contact_email yoktur).
+-->
+<section id="yorumlar">
+  <div class="wrap">
+    <div class="secnum">
+      <span class="n">09</span><span class="l">Yorumlar</span><span class="bar"></span>
+    </div>
+
+    <h2 style="margin-bottom:16px">Kullanıcılar ne diyor?</h2>
+    <p style="max-width:600px;font-size:15px">
+      Arku Remote'u kullanıyorsanız deneyiminizi paylaşın. Yorumlar yayımlanmadan önce
+      ekibimizce incelenir.
+    </p>
+
+    <div class="rev-grid">
+      <!-- Yayınlanmış yorumlar -->
+      <div>
+        <div class="rev-list" id="revList">
+          <div class="rev-empty" id="revLoading">Yorumlar yükleniyor…</div>
+        </div>
+      </div>
+
+      <!-- Gönderim formu -->
+      <div class="rev-form">
+        <h3>Deneyiminizi yazın</h3>
+        <p class="hint">
+          Yorumunuz incelendikten sonra yayımlanır. E-posta adresiniz yalnızca gerekirse
+          sizinle iletişim kurmak için kullanılır; sitede <strong>hiçbir zaman</strong> gösterilmez.
+        </p>
+
+        <form id="revForm" novalidate>
+          <div class="fld">
+            <label for="revName">Ad Soyad *</label>
+            <input type="text" id="revName" maxlength="80" required autocomplete="name" />
+          </div>
+          <div class="fld">
+            <label for="revTitle">Ünvan / Kurum</label>
+            <input type="text" id="revTitle" maxlength="120" placeholder="Örn: BT Yöneticisi, Örnek A.Ş." />
+          </div>
+          <div class="fld">
+            <label for="revEmail">E-posta (yayımlanmaz)</label>
+            <input type="email" id="revEmail" maxlength="160" autocomplete="email" />
+          </div>
+          <div class="fld">
+            <label>Puan</label>
+            <div class="star-row" id="revStars">
+              <button type="button" data-v="1" aria-label="1 yıldız">★</button>
+              <button type="button" data-v="2" aria-label="2 yıldız">★</button>
+              <button type="button" data-v="3" aria-label="3 yıldız">★</button>
+              <button type="button" data-v="4" aria-label="4 yıldız">★</button>
+              <button type="button" data-v="5" aria-label="5 yıldız">★</button>
+            </div>
+          </div>
+          <div class="fld">
+            <label for="revBody">Yorumunuz *</label>
+            <textarea id="revBody" maxlength="2000" required placeholder="En az 10 karakter"></textarea>
+          </div>
+          <!-- Bot tuzağı: gerçek kullanıcılar bu alanı görmez ve doldurmaz. -->
+          <div class="hp" aria-hidden="true">
+            <label for="revSite">Bu alanı boş bırakın</label>
+            <input type="text" id="revSite" tabindex="-1" autocomplete="off" />
+          </div>
+          <button type="submit" class="send" id="revSend">Yorumu Gönder</button>
+          <div id="revMsg"></div>
+        </form>
+      </div>
+    </div>
+  </div>
+</section>
+
 </main>
+
+<script>
+(function () {
+  var SB = 'https://jpmbttlxyxrqmpghymbq.supabase.co';
+  // Public (anon) anahtar — tasarım gereği herkese açıktır, RLS ile korunur.
+  var KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImpwbWJ0dGx4eXhycW1wZ2h5bWJxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODI5NjU0NDgsImV4cCI6MjA5ODU0MTQ0OH0._zgdzPjHHfoeyzsFqDy7Bi2gz_YqBF_8vez_bgGBCvo';
+
+  var list = document.getElementById('revList');
+  var form = document.getElementById('revForm');
+  var msg = document.getElementById('revMsg');
+  var sendBtn = document.getElementById('revSend');
+  var rating = 0;
+
+  function esc(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  function stars(n) {
+    if (!n) return '';
+    var out = '';
+    for (var i = 1; i <= 5; i++) out += (i <= n ? '★' : '☆');
+    return '<div class="stars">' + out + '</div>';
+  }
+
+  // ── Yayınlanmış yorumları getir ──
+  fetch(SB + '/rest/v1/arku_public_reviews?select=*&order=published_at.desc&limit=12', {
+    headers: { apikey: KEY }
+  })
+    .then(function (r) { return r.ok ? r.json() : []; })
+    .then(function (rows) {
+      if (!rows || !rows.length) {
+        list.innerHTML = '<div class="rev-empty">Henüz yayımlanmış bir yorum yok — ilk yorumu siz yazın.</div>';
+        return;
+      }
+      list.innerHTML = rows.map(function (r) {
+        return '<div class="rev-card">'
+          + '<div class="who"><span class="nm">' + esc(r.author_name) + '</span>'
+          + (r.author_title ? '<span class="tt">' + esc(r.author_title) + '</span>' : '')
+          + '</div>'
+          + stars(r.rating)
+          + '<p>' + esc(r.body).replace(/\n/g, '<br>') + '</p>'
+          + '</div>';
+      }).join('');
+    })
+    .catch(function () {
+      list.innerHTML = '<div class="rev-empty">Yorumlar şu anda yüklenemedi.</div>';
+    });
+
+  // ── Puan seçimi ──
+  var starBtns = document.querySelectorAll('#revStars button');
+  Array.prototype.forEach.call(starBtns, function (b) {
+    b.addEventListener('click', function () {
+      rating = parseInt(b.getAttribute('data-v'), 10);
+      Array.prototype.forEach.call(starBtns, function (x) {
+        x.className = parseInt(x.getAttribute('data-v'), 10) <= rating ? 'on' : '';
+      });
+    });
+  });
+
+  function show(kind, text) {
+    msg.className = 'rev-msg ' + kind;
+    msg.textContent = text;
+  }
+
+  // ── Gönderim ──
+  form.addEventListener('submit', function (e) {
+    e.preventDefault();
+
+    // Bot tuzağı doluysa sessizce başarı göster, hiçbir şey gönderme.
+    if (document.getElementById('revSite').value) { show('ok', 'Yorumunuz alındı.'); return; }
+
+    var name = document.getElementById('revName').value.trim();
+    var title = document.getElementById('revTitle').value.trim();
+    var email = document.getElementById('revEmail').value.trim();
+    var body = document.getElementById('revBody').value.trim();
+
+    if (name.length < 2) { show('err', 'Lütfen adınızı yazın.'); return; }
+    if (body.length < 10) { show('err', 'Yorumunuz en az 10 karakter olmalı.'); return; }
+
+    sendBtn.disabled = true;
+    show('ok', 'Gönderiliyor…');
+
+    fetch(SB + '/rest/v1/arku_reviews', {
+      method: 'POST',
+      headers: { apikey: KEY, 'Content-Type': 'application/json', Prefer: 'return=minimal' },
+      body: JSON.stringify({
+        author_name: name,
+        author_title: title || null,
+        contact_email: email || null,
+        rating: rating || null,
+        body: body
+      })
+    })
+      .then(function (r) {
+        if (r.status === 201 || r.status === 204) {
+          form.reset();
+          rating = 0;
+          Array.prototype.forEach.call(starBtns, function (x) { x.className = ''; });
+          show('ok', 'Teşekkürler! Yorumunuz alındı ve incelemeye gönderildi. Onaylandıktan sonra bu sayfada yayımlanacak.');
+        } else {
+          show('err', 'Yorum gönderilemedi. Lütfen daha sonra tekrar deneyin.');
+        }
+      })
+      .catch(function () {
+        show('err', 'Bağlantı kurulamadı. İnternet bağlantınızı kontrol edip tekrar deneyin.');
+      })
+      .then(function () { sendBtn.disabled = false; });
+  });
+})();
+</script>
 
 <!-- ─────────────────── FOOTER ─────────────────── -->
 <footer>
@@ -1429,6 +1664,7 @@
         <a href="#karsilastirma">Karşılaştırma</a>
         <a href="#temalar">Temalar</a>
         <a href="#surumler">Sürüm Geçmişi</a>
+        <a href="#yorumlar">Yorumlar</a>
         <a href="#indir">İndir</a>
         <a href="https://arku-remote.vercel.app">Tarayıcıda Kullan</a>
       </div>
@@ -1448,7 +1684,7 @@
         <a href="#">İletişim</a>
         <a href="#">Gizlilik</a>
         <a href="#">Kullanım Şartları</a>
-        <a href="mailto:burakakmese@gmail.com">Güvenlik Bildirimi</a>
+        <a href="mailto:info@arku.com.tr">Güvenlik Bildirimi</a>
       </div>
     </div>
 
