@@ -52,7 +52,16 @@ const THEMES: { id: Theme; label: string; color: string; light?: boolean }[] = [
 export default function App() {
   const [currentUser, setCurrentUser] = React.useState<SupabaseUser | null>(null);
   const [userProfile, setUserProfile] = React.useState<UserProfile | null>(null);
-  const [isGuest, setIsGuest] = React.useState(false);
+  // Kullanıcının AÇIK tercihi ("Misafir olarak devam et"). Anonim Supabase
+  // oturumunun varlığıyla KARIŞTIRILMAMALI: o oturum yalnızca ulaşılabilirlik
+  // içindir (RLS her istemciden bir kimlik ister) ve kullanıcı onayı sayılmaz.
+  const [isGuest, setIsGuest] = React.useState(() => {
+    try { return localStorage.getItem('arku_guest_choice') === '1'; } catch { return false; }
+  });
+  const setGuestChoice = (v: boolean) => {
+    setIsGuest(v);
+    try { if (v) localStorage.setItem('arku_guest_choice', '1'); else localStorage.removeItem('arku_guest_choice'); } catch { /* yok say */ }
+  };
   const [isEmailVerified, setIsEmailVerified] = React.useState(true);
   const [theme, setTheme] = React.useState<Theme>('otuken');
   const [activeTab, setActiveTab] = React.useState<Tab>('dashboard');
@@ -120,6 +129,10 @@ export default function App() {
   const processedOfferIdsRef = React.useRef(new Set<string>());
   // Ref mirror of webrtc state — used inside useEffect callbacks to avoid stale closures
   const webrtcRef = React.useRef<import('./lib/webrtc').WebRTCManager | null>(null);
+
+  // "Gerçekten giriş yapmış kullanıcı". Arayüz ve yetki kararlarının tamamı bunu
+  // kullanmalı; `currentUser` anonim (misafir) oturumda da doludur.
+  const isRegistered = !!currentUser && !currentUser.is_anonymous;
 
   const ts = () => new Date().toLocaleTimeString('tr-TR');
   const addLocalLog = (msg: string, type: LogType = 'info') => setLogs(p => [{ time: ts(), msg, type }, ...p].slice(0, 50));
@@ -348,7 +361,10 @@ export default function App() {
       const user = session?.user ?? null;
       const anon = !!user?.is_anonymous;
       setCurrentUser(user);
-      setIsGuest(anon);
+      // Gerçek bir hesapla giriş yapıldıysa misafir tercihi düşer.
+      // Anonim oturum açılması ise kullanıcıyı "misafir" YAPMAZ — o tercih
+      // yalnızca "Misafir olarak devam et" ile verilir.
+      if (user && !anon) setGuestChoice(false);
       if (user) {
         // Anonim kullanıcının doğrulanacak bir e-postası yoktur.
         setIsEmailVerified(anon || !!user.email_confirmed_at);
@@ -422,9 +438,17 @@ export default function App() {
     if (!qrtimToken) return;
     (async () => {
       const { data: { session } } = await supabase.auth.getSession();
-      if (session?.user) {
+      // DİKKAT: anonim oturum her sekmede açık olduğu için "oturum var mı"
+      // sorusu artık her zaman EVET. Hesap bağlama yolu yalnızca GERÇEK bir
+      // hesap için geçerlidir; aksi halde QRtım kimliği anonim kullanıcıya
+      // bağlanır ve giriş hiç gerçekleşmez.
+      if (session?.user && !session.user.is_anonymous) {
         await handleQrtimCallback(qrtimToken, session.user);
       } else {
+        // Anonim oturumu kapat ki SSO gerçek hesabı açabilsin.
+        if (session?.user?.is_anonymous) {
+          try { await supabase.auth.signOut({ scope: 'local' }); } catch { /* yok say */ }
+        }
         await handleQrtimSsoLogin(qrtimToken);
       }
     })();
@@ -459,7 +483,7 @@ export default function App() {
   React.useEffect(() => {
     if (!EMBED.embed || !EMBED.session) return;
     const t = setTimeout(() => {
-      setIsGuest((g) => (!currentUser && !g ? true : g));
+      setGuestChoice(!isRegistered && !isGuest ? true : isGuest);
     }, 1500);
     return () => clearTimeout(t);
   }, [currentUser]);
@@ -469,7 +493,7 @@ export default function App() {
     if (!EMBED.embed || !EMBED.session || autoConnectRef.current) return;
     if (rtcState !== 'idle' || isConnecting) return;
     if (targetId !== EMBED.session) return;
-    const ready = (currentUser && isEmailVerified) || isGuest;
+    const ready = (isRegistered && isEmailVerified) || isGuest;
     if (!ready) return;
     autoConnectRef.current = true;
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -486,18 +510,46 @@ export default function App() {
     else { const ta = document.createElement('textarea'); ta.value = connectionId; ta.style.cssText = 'position:fixed;opacity:0'; document.body.appendChild(ta); ta.focus(); ta.select(); document.execCommand('copy'); document.body.removeChild(ta); write(); }
   };
 
+  // Oturumsuz kalmamak için: RLS her istemciden bir kimlik ister, oturumsuz
+  // sekmeye kimse bağlanamaz. Kullanıcı arayüzünde "misafir" göstermez.
+  const ensureAnonSession = async () => {
+    const { data: { session } } = await supabase.auth.getSession();
+    if (session) return;
+    try { await supabase.auth.signInAnonymously(); } catch { /* ayar kapaliysa yok say */ }
+  };
+
   const handleRegister = async () => {
     setAuthError('');
     if (!displayName.trim()) { setAuthError('Ad Soyad zorunludur.'); return; }
     if (password.length < 6) { setAuthError('Sifre en az 6 karakter olmali.'); return; }
-    const { error } = await supabase.auth.signUp({ email, password, options: { data: { display_name: displayName, phone } } });
-    if (error) { setAuthError(error.message); return; }
-    setShowAuth(false); addLog('Kayit basarili. E-posta kutunuzu kontrol edin.', 'warn');
+    // Anonim oturum açıkken signUp, YENİ hesap açmak yerine mevcut anonim
+    // kullanıcıya kimlik bağlar. Kayıt akışının öngörülebilir olması ve e-posta
+    // doğrulamasının beklendiği gibi işlemesi için önce anonim oturumu kapatıyoruz.
+    if (currentUser?.is_anonymous) {
+      try { await supabase.auth.signOut({ scope: 'local' }); } catch { /* yok say */ }
+    }
+    const { data, error } = await supabase.auth.signUp({ email, password, options: { data: { display_name: displayName, phone } } });
+    if (error) { setAuthError(error.message); await ensureAnonSession(); return; }
+    // "Confirm email" açıkken Supabase oturum DÖNDÜRMEZ; kullanıcı doğrulamadan giriş yapamaz.
+    const dogrulamaGerekli = !data.session;
+    setShowAuth(false);
+    addLog(dogrulamaGerekli
+      ? 'Kayit alindi. Hesabinizi kullanabilmek icin e-postanizdaki dogrulama baglantisina tiklayin.'
+      : 'Kayit basarili.', 'warn');
+    if (dogrulamaGerekli) await ensureAnonSession();
   };
   const handleLogin = async () => {
     setAuthError('');
     const { error } = await supabase.auth.signInWithPassword({ email, password });
-    if (error) { setAuthError(error.message); return; }
+    if (error) {
+      // Supabase bu durumu İngilizce döndürür; kullanıcıya ne yapacağını söyleyelim.
+      const dogrulanmamis = /confirm/i.test(error.message);
+      setAuthError(dogrulanmamis
+        ? 'E-posta adresiniz henuz dogrulanmamis. Gelen kutunuzdaki dogrulama baglantisina tiklayin.'
+        : error.message);
+      await ensureAnonSession();
+      return;
+    }
     // Check if user has MFA enrolled and requires second factor
     const { data: aal } = await supabase.auth.mfa.getAuthenticatorAssuranceLevel();
     if (aal?.currentLevel === 'aal1' && aal?.nextLevel === 'aal2') {
@@ -553,20 +605,19 @@ export default function App() {
     try { await supabase.auth.signOut({ scope: 'local' }); } catch { /* yok say */ }
     // QRtım yeniden-giriş döngüsünü kır: kalan callback/token izlerini temizle.
     try { sessionStorage.removeItem('partner_callback'); } catch { /* yok say */ }
-    setCurrentUser(null); setUserProfile(null); setIsGuest(false); setConnectionHistory([]);
+    setCurrentUser(null); setUserProfile(null); setGuestChoice(false); setConnectionHistory([]);
     setQrtimUser(null);
     setRemoteStream(null); setRtcState('idle'); setIsConnecting(false);
     setConnectionId(getOrCreateGuestId()); setDisplayName(''); setPhone(''); setSessionToken(''); setDeviceFingerprint('');
     setActiveTab('dashboard'); addLocalLog('Oturum kapatildi.', 'warn');
-    // Çıkıştan sonra da ulaşılabilir kal: yeni bir anonim oturum aç.
-    // Aksi halde sekme oturumsuz kalır ve kimliğe bağlı RLS altında kimse ulaşamaz.
-    anonBootstrapRef.current = true;
-    await supabase.auth.signInAnonymously().catch(() => { anonBootstrapRef.current = false; });
+    // Çıkıştan sonra da ulaşılabilir kal (RLS oturum ister), ama kullanıcı
+    // "misafir" sayılmaz: arayüz yine "Giris Yap" gösterir.
+    await ensureAnonSession();
   };
   // Misafir olarak devam: oturum yoksa anonim imzalanır (kimlik bağlaması için).
   // Oturum zaten varsa yalnızca modalı kapatır — tekrar çağrılması güvenlidir.
   const handleGuestLogin = async () => {
-    setIsGuest(true); setShowAuth(false); setAuthError('');
+    setGuestChoice(true); setShowAuth(false); setAuthError('');
     const { data: { session } } = await supabase.auth.getSession();
     if (!session) await supabase.auth.signInAnonymously().catch(() => {});
     addLog('Misafir olarak devam ediliyor.', 'warn');
@@ -589,7 +640,7 @@ export default function App() {
 
   // Kurumsal/kayıtlı verileri, ilgili sekme açıldığında ve giriş yapılınca yükle
   React.useEffect(() => {
-    if (!currentUser) { setSavedContacts([]); setCategories([]); setOrganizations([]); setOrgMembers([]); setActiveOrgId(null); return; }
+    if (!isRegistered) { setSavedContacts([]); setCategories([]); setOrganizations([]); setOrgMembers([]); setActiveOrgId(null); return; }
     if (activeTab === 'contacts' && caps.savedContacts) refreshContacts();
     if (activeTab === 'organization' && caps.organizations) refreshOrganizations();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -734,7 +785,7 @@ export default function App() {
   };
 
   const handleQrtimConnect = () => {
-    if (!currentUser) { setShowAuth(true); setAuthMode('login'); return; }
+    if (!isRegistered) { setShowAuth(true); setAuthMode('login'); return; }
     window.location.href = `${QRTIM_BASE_URL}/login?callback=${encodeURIComponent(qrtimCallbackUrl())}&source=arku`;
   };
 
@@ -863,8 +914,8 @@ export default function App() {
   };
 
   const handleConnect = async () => {
-    if (!currentUser && !isGuest) { setShowAuth(true); setAuthMode('login'); return; }
-    if (currentUser && !isEmailVerified) { addLog('Baglanmak icin e-posta dogrulamasi gerekli.', 'error'); setShowAuth(true); return; }
+    if (!isRegistered && !isGuest) { setShowAuth(true); setAuthMode('login'); return; }
+    if (isRegistered && !isEmailVerified) { addLog('Baglanmak icin e-posta dogrulamasi gerekli.', 'error'); setShowAuth(true); return; }
     if (!targetId.trim()) return;
     if (targetId.trim() === connectionId || (currentUser && targetId.trim() === currentUser.id)) { addLog('Kendi cihaziniza baglanamazsiniz.', 'error'); return; }
 
@@ -883,7 +934,7 @@ export default function App() {
 
     let peerSignalId = normalizedTarget;
 
-    if (!isGuest && currentUser && !looksLikeUuid) {
+    if (!isGuest && isRegistered && currentUser && !looksLikeUuid) {
       const rawDigits = targetId.replace(/\D/g, '').slice(0, 9);
       // RLS, users tablosunu kendi satırıyla sınırlar; çözümleme yalnızca UUID
       // döndüren resolve_connection_id RPC'si üzerinden yapılır. Fonksiyon henüz
@@ -1051,8 +1102,8 @@ export default function App() {
           </div>
           <nav className="hidden md:flex gap-8 items-center">
             {(['dashboard','connections',
-               ...(currentUser && caps.savedContacts ? ['contacts'] as Tab[] : []),
-               ...(currentUser && caps.organizations ? ['organization'] as Tab[] : []),
+               ...(isRegistered && caps.savedContacts ? ['contacts'] as Tab[] : []),
+               ...(isRegistered && caps.organizations ? ['organization'] as Tab[] : []),
                'settings'] as Tab[]).map(tab => (
               <button key={tab} onClick={() => setActiveTab(tab)} className={`text-[11px] uppercase tracking-widest transition-colors ${activeTab === tab ? 'text-steppe-gold' : 'text-steppe-muted hover:text-steppe-paper'}`}>
                 {tab === 'dashboard' ? 'Panel' : tab === 'connections' ? 'Baglantilar' : tab === 'contacts' ? 'Kayitli' : tab === 'organization' ? 'Kurumsal' : 'Ayarlar'}
@@ -1068,15 +1119,15 @@ export default function App() {
               title="Ayni hesapla ikinci bir musteriye baglanmak icin yeni bagimsiz oturum ac (Ctrl+N)"
               className="flex items-center gap-2 text-[11px] uppercase tracking-widest text-steppe-muted hover:text-steppe-gold transition-colors"
             ><ExternalLink size={12} /> Yeni Oturum</button>
-            {currentUser ? (
+            {isRegistered ? (
               <div className="flex items-center gap-4">
-                <span className="text-[10px] text-steppe-gold opacity-70">{userProfile?.display_name || currentUser.email}</span>
+                <span className="text-[10px] text-steppe-gold opacity-70">{userProfile?.display_name || currentUser?.email}</span>
                 <button onClick={handleLogout} className="flex items-center gap-2 text-[10px] uppercase tracking-widest text-steppe-muted hover:text-red-400 transition-colors"><LogOut size={12} /> Cikis</button>
               </div>
             ) : isGuest ? (
               <div className="flex items-center gap-4">
                 <span className="text-[10px] text-yellow-400 opacity-70">Misafir</span>
-                <button onClick={() => { setShowAuth(true); setAuthMode('login'); setIsGuest(false); }} className="btn-ghost px-5 py-2">Giris Yap</button>
+                <button onClick={() => { setShowAuth(true); setAuthMode('login'); setGuestChoice(false); }} className="btn-ghost px-5 py-2">Giris Yap</button>
               </div>
             ) : (
               <button onClick={() => { setShowAuth(true); setAuthMode('login'); }} className="btn-ghost px-5 py-2">Giris Yap</button>
@@ -1099,15 +1150,15 @@ export default function App() {
                   </button>
                 </div>
                 <div className="flex items-center gap-2 mt-3">
-                  <div className={`w-1.5 h-1.5 rounded-full ${currentUser ? 'bg-green-400' : isGuest ? 'bg-yellow-400' : 'bg-gray-400'}`} />
-                  <span className="text-[9px] text-steppe-muted uppercase tracking-widest">{currentUser ? 'Profil ID' : isGuest ? 'Misafir ID' : 'Cihaz ID (Gecici)'}</span>
-                  {currentUser && entitlements.plan !== 'free' && (
+                  <div className={`w-1.5 h-1.5 rounded-full ${isRegistered ? 'bg-green-400' : isGuest ? 'bg-yellow-400' : 'bg-gray-400'}`} />
+                  <span className="text-[9px] text-steppe-muted uppercase tracking-widest">{isRegistered ? 'Profil ID' : isGuest ? 'Misafir ID' : 'Cihaz ID (Gecici)'}</span>
+                  {isRegistered && entitlements.plan !== 'free' && (
                     <span className="text-[8px] px-1.5 py-0.5 rounded uppercase tracking-widest font-bold" style={{ background: 'var(--accent-primary)', color: 'var(--btn-text)' }}>
                       {entitlements.plan}{entitlements.source === 'qrtim' ? ' · QRtım' : ''}
                     </span>
                   )}
                 </div>
-                {currentUser && sessionToken && (
+                {isRegistered && sessionToken && (
                   <div className="mt-2 p-2 border border-steppe-border" style={{ background: 'var(--log-bg)' }}>
                     <p className="text-[8px] text-steppe-muted font-mono">SESSION: {sessionToken.slice(0,8)}...</p>
                     <p className="text-[8px] text-steppe-muted font-mono">FP: {deviceFingerprint.slice(0,8)}...</p>
@@ -1116,7 +1167,7 @@ export default function App() {
               </div>
 
               <div className="gokturk-border p-6 surface-card">
-                {currentUser && !isEmailVerified && (
+                {isRegistered && !isEmailVerified && (
                   <div className="mb-4 p-3 border border-yellow-500/40 text-yellow-300 text-[10px]" style={{ background: 'rgba(234,179,8,0.08)' }}>
                     Hesabiniz dogrulanmamis. E-posta kutunuzu kontrol edin.
                   </div>
@@ -1124,7 +1175,7 @@ export default function App() {
                 <p className="text-[10px] uppercase tracking-widest text-steppe-muted mb-4 flex items-center gap-2"><Monitor size={12} className="text-steppe-gold" /> Uzak Masaustu Baglan</p>
                 <input type="text" placeholder="HEDEF KIMLIK (Orn: 123-456-789)" className="input-field mb-4" value={targetId}
                   onChange={e => setTargetId(e.target.value)}
-                  onKeyDown={e => { if (e.key === 'Enter' && targetId.trim() && !isConnecting && rtcState !== 'connected') { if (!currentUser && !isGuest) { setShowAuth(true); return; } handleConnect(); } }}
+                  onKeyDown={e => { if (e.key === 'Enter' && targetId.trim() && !isConnecting && rtcState !== 'connected') { if (!isRegistered && !isGuest) { setShowAuth(true); return; } handleConnect(); } }}
                 />
                 {rtcState === 'connected' ? (
                   <button onClick={handleDisconnect} className="btn-primary w-full" style={{ background: 'rgba(239,68,68,0.8)' }}>Baglantıyi Kes</button>
@@ -1136,7 +1187,7 @@ export default function App() {
                 ) : (
                   <button onClick={handleConnect} disabled={!targetId.trim()} className="btn-primary w-full disabled:opacity-40">Baglaniti Kur</button>
                 )}
-                {!currentUser && !isGuest && <p className="text-[9px] text-steppe-muted mt-3 text-center">Giris yapin veya misafir olarak devam edin</p>}
+                {!isRegistered && !isGuest && <p className="text-[9px] text-steppe-muted mt-3 text-center">Giris yapin veya misafir olarak devam edin</p>}
                 {isGuest && <p className="text-[9px] text-yellow-400 mt-3 text-center uppercase tracking-wider">Misafir mod - gecmis kaydedilmez</p>}
               </div>
 
@@ -1294,7 +1345,7 @@ export default function App() {
               </div>
             </div>
             <div className="gokturk-border surface-card p-8">
-              {!currentUser && !isGuest ? (
+              {!isRegistered && !isGuest ? (
                 <div className="text-center py-16"><Monitor size={32} className="text-steppe-muted mx-auto mb-4 opacity-30" /><p className="text-[11px] text-steppe-muted mb-4">Baglaniti gecmisini gormek icin giris yapin.</p><button onClick={() => setShowAuth(true)} className="btn-ghost px-6 py-2">Giris Yap</button></div>
               ) : isGuest ? (
                 <div className="text-center py-16"><Monitor size={32} className="text-steppe-muted mx-auto mb-4 opacity-30" /><p className="text-[11px] text-steppe-muted mb-4">Misafir modunda gecmis kaydedilmez.</p><button onClick={() => { setShowAuth(true); setAuthMode('register'); }} className="btn-ghost px-6 py-2">Hesap Olustur</button></div>
@@ -1510,9 +1561,9 @@ export default function App() {
             </section>
             <section className="gokturk-border surface-card p-8">
               <h3 className="text-[10px] uppercase tracking-widest text-steppe-muted mb-6 flex items-center gap-2"><User size={12} className="text-steppe-gold" /> Profil Bilgileri</h3>
-              {currentUser ? (
+              {isRegistered ? (
                 <div className="space-y-4">
-                  <div className="p-3 border border-steppe-border text-[10px] text-steppe-muted" style={{ background: 'var(--surface-primary)' }}><span className="text-steppe-gold">E-posta:</span> {currentUser.email}</div>
+                  <div className="p-3 border border-steppe-border text-[10px] text-steppe-muted" style={{ background: 'var(--surface-primary)' }}><span className="text-steppe-gold">E-posta:</span> {currentUser?.email}</div>
                   <input type="text" placeholder="AD SOYAD" className="input-field" value={displayName} onChange={e => setDisplayName(e.target.value)} />
                   <input type="tel" placeholder="TELEFON" className="input-field" value={phone} onChange={e => setPhone(e.target.value)} />
                   {profileUpdateDone && <div className="p-3 border border-green-500/30 text-center" style={{ background: 'rgba(34,197,94,0.05)' }}><CheckCircle size={14} className="text-green-400 mx-auto mb-1" /><p className="text-[10px] text-green-400">Profil guncellendi!</p></div>}

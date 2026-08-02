@@ -1,6 +1,17 @@
 const { app, BrowserWindow, session, desktopCapturer, shell, ipcMain, screen, dialog } = require('electron');
 const path = require('path');
 
+// Ana süreçte yakalanmamış bir hata, Electron'un "A JavaScript error occurred in
+// the main process" penceresini açar ve uygulamayı kullanılamaz hâle getirir.
+// Kök nedenler ayrıca düzeltiliyor; bu ağ yalnızca son çare — tek bir hatanın
+// tüm uygulamayı düşürmesini engeller.
+process.on('uncaughtException', (err) => {
+  console.error('[arku] yakalanmamis ana surec hatasi:', err);
+});
+process.on('unhandledRejection', (err) => {
+  console.error('[arku] islenmemis promise reddi:', err);
+});
+
 // ── Otomatik güncelleme ──────────────────────────────────────────────────────
 // Windows (NSIS) ve Linux (AppImage): electron-updater ile indirilir, kullanıcı
 // onayıyla kurulur. macOS imzasız uygulamada ve .deb kurulumlarında otomatik
@@ -154,7 +165,11 @@ if (isDev) {
 
   // Uzaktan kontrol izni pencereye ve o sayfa yüklemesine bağlıdır: sayfa
   // yenilenir veya başka bir adrese gidilirse izin düşer, yeniden sorulur.
-  const dropGrant = () => controlGrants.delete(win.webContents.id);
+  // ÖNEMLİ: id'yi şimdi yakala. 'closed' tetiklendiğinde webContents çoktan yok
+  // edilmiştir ve `win.webContents` okumak "Object has been destroyed" fırlatır —
+  // v1.0.14'te ana süreci çökerten hata buydu.
+  const wcId = win.webContents.id;
+  const dropGrant = () => controlGrants.delete(wcId);
   win.webContents.on('did-start-navigation', dropGrant);
   win.on('closed', dropGrant);
 
@@ -232,13 +247,15 @@ function pickDisplaySource(parent, audioRequested) {
         let settled = false;
         const settle = (value) => { if (!settled) { settled = true; resolve(value); } };
 
-        pickerState.set(picker.webContents.id, {
+        // id'yi kapanmadan önce yakala (bkz. yukarıdaki dropGrant notu).
+        const pickerWcId = picker.webContents.id;
+        pickerState.set(pickerWcId, {
           sources, audioRequested, settle, windowId: picker.id,
         });
 
         // Pencere kapatılırsa (X, Esc, üst pencere kapanması) istek reddedilir.
         picker.on('closed', () => {
-          pickerState.delete(picker.webContents.id);
+          pickerState.delete(pickerWcId);
           settle(null);
         });
 
