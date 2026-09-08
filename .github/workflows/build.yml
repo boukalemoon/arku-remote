@@ -82,6 +82,12 @@ jobs:
       - name: Typecheck
         run: npm run lint
 
+      # Surum tek kaynaktan (package.json + CHANGELOG.md) turer.
+      # Web sitesi ya da CHANGELOG geride kaldiysa BURADA patlar —
+      # yayindan sonra fark etmektense build'i durdurmak iyidir.
+      - name: Version consistency
+        run: npm run release:check
+
       # VITE_ değişkenleri: secret tanımlıysa kullanılır, değilse koddaki public
       # fallback devreye girer (anon key zaten client'a gömülü, RLS ile korunur).
       #
@@ -138,6 +144,33 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # Release aciklamasi CHANGELOG.md'den gelir — surum notlarinin
+      # tek kaynagi orasidir, workflow icinde ikinci bir kopya tutulmaz.
+      - name: Build release notes
+        run: |
+          {
+            echo "## Arku Remote ${GITHUB_REF_NAME}"
+            echo
+            node scripts/release.mjs notes
+            echo
+            echo '### Indirme'
+            echo '| Platform | Dosya |'
+            echo '|----------|-------|'
+            echo '| Windows | `Arku-Remote-Setup.exe` (kurulum) veya `Arku-Remote.exe` (portable) |'
+            echo '| macOS | `Arku-Remote.dmg` |'
+            echo '| Linux | `Arku-Remote.AppImage` veya `.deb` |'
+            echo
+            echo '> macOS: uygulama kod imzali degildir. Ilk acilista **sag tik -> Ac** yapin.'
+            echo '>'
+            echo '> Linux: `chmod +x Arku-Remote.AppImage` ile calistirilabilir yapin.'
+          } > RELEASE_NOTES.md
+          cat RELEASE_NOTES.md
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -153,24 +186,6 @@ jobs:
           draft: ${{ github.event.inputs.draft == 'true' }}
           generate_release_notes: true
           files: release-artifacts/*
-          body: |
-            ## Arku Remote ${{ github.ref_name }}
-
-            ### İndirme
-            | Platform | Dosya |
-            |----------|-------|
-            | Windows  | `Arku-Remote-Setup-*.exe` (kurulum) veya `Arku-Remote-*.exe` (portable) |
-            | macOS    | `Arku-Remote-*.dmg` |
-            | Linux    | `Arku-Remote-*.AppImage` veya `Arku-Remote-*.deb` |
-
-            ### macOS Notu
-            Uygulama kod imzalı değildir. İlk açılışta: **Sağ tık → Aç** yapın.
-
-            ### Linux Notu
-            AppImage dosyasını çalıştırılabilir yapın:
-            ```bash
-            chmod +x Arku-Remote-*.AppImage
-            ./Arku-Remote-*.AppImage
-            ```
+          body_path: RELEASE_NOTES.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
