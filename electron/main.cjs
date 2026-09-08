@@ -1,6 +1,6 @@
 const {
   app, BrowserWindow, session, desktopCapturer, shell, ipcMain, screen, dialog,
-  webContents, systemPreferences,
+  webContents, systemPreferences, clipboard,
 } = require('electron');
 const path = require('path');
 
@@ -417,6 +417,31 @@ ipcMain.handle('remote-control:request', async (e) => {
   if (response !== 0) return { granted: false, pointer: false, reason: 'denied' };
   controlGrants.add(e.sender.id);
   return { granted: true, pointer };
+});
+
+// ── Pano paylasimi ───────────────────────────────────────────────────────────
+// Uzak tarafin panoyu okumasi/yazmasi klavye-fare ile AYNI kapidan gecer:
+// yerel kullanici kontrol izni vermediyse reddedilir. Pano sessiz bir veri
+// sizinti yoludur — ekranda goruneni izlemekten farkli olarak, kopyalanmis
+// bir parola veya sozlesme metni hic belli olmadan disari cikabilir.
+//
+// forRemote/fromRemote bayraklari "bu islemi karsi taraf mi istedi" demektir.
+// Operatorun kendi makinesinde kendi dugmesine basmasi bu kapiya takilmaz.
+const MAX_CLIPBOARD_CHARS = 100000;
+
+ipcMain.handle('clipboard:read', (e, opts) => {
+  if (opts && opts.forRemote && !controlGrants.has(e.sender.id)) return null;
+  try {
+    const text = clipboard.readText();
+    return typeof text === 'string' && text.length <= MAX_CLIPBOARD_CHARS ? text : null;
+  } catch { return null; }
+});
+
+ipcMain.on('clipboard:write', (e, payload) => {
+  const text = payload && typeof payload.text === 'string' ? payload.text : '';
+  if (!text || text.length > MAX_CLIPBOARD_CHARS) return;
+  if (payload.fromRemote && !controlGrants.has(e.sender.id)) return;
+  try { clipboard.writeText(text); } catch { /* yok say */ }
 });
 
 ipcMain.on('remote-control:revoke', (e) => {

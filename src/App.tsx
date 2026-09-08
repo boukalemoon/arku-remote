@@ -13,7 +13,7 @@ import {
 import type { Organization, OrgMember, ContactCategory, SavedContact, OrgRole, PresenceRow } from './lib/enterprise';
 import type { User as SupabaseUser } from '@supabase/supabase-js';
 import { WebRTCManager } from './lib/webrtc';
-import type { ConnectionState, InputEventMsg, RtcQuality } from './lib/webrtc';
+import type { ConnectionState, InputEventMsg, RtcQuality, ControlMsg } from './lib/webrtc';
 import { EMBED, postSessionEvent, resetSessionEvents } from './lib/embed';
 import { resetIceCache } from './lib/ice';
 
@@ -1112,6 +1112,38 @@ export default function App() {
 
   // Uzaktan kontrol iznini kapat. Masaüstünde ana süreçteki yetkiyi de düşürür —
   // asıl kapı orası; buradaki bayrak yalnızca arayüz durumudur.
+  // ── Pano paylasimi ─────────────────────────────────────────────────────────
+  // forRemote/fromRemote = "islemi karsi taraf istedi". Ana surec bu durumda
+  // kontrol iznini arar; operatorun kendi dugmesine basmasi kapiya takilmaz.
+  const readLocalClipboard = async (forRemote: boolean): Promise<string | null> => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const api = (window as any).electronAPI;
+    if (api?.readClipboard) { try { return await api.readClipboard({ forRemote }); } catch { return null; } }
+    // Web surumu: tarayici izin ve odak ister, reddedilebilir.
+    try { return await navigator.clipboard.readText(); } catch { return null; }
+  };
+
+  const writeLocalClipboard = async (text: string, fromRemote: boolean): Promise<boolean> => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const api = (window as any).electronAPI;
+    if (api?.writeClipboard) { api.writeClipboard({ text, fromRemote }); return true; }
+    try { await navigator.clipboard.writeText(text); return true; } catch { return false; }
+  };
+
+  const sendClipboardToRemote = async () => {
+    if (!webrtc || rtcState !== 'connected') return;
+    const text = await readLocalClipboard(false);
+    if (!text) { addLocalLog('Yerel pano bos veya okunamadi.', 'warn'); return; }
+    webrtc.sendControl({ k: 'clip-set', text });
+    addLocalLog(`Pano karsi tarafa gonderildi (${text.length} karakter).`, 'sys');
+  };
+
+  const requestRemoteClipboard = () => {
+    if (!webrtc || rtcState !== 'connected') return;
+    webrtc.sendControl({ k: 'clip-req' });
+    addLocalLog('Uzak pano istendi...', 'info');
+  };
+
   const disableRemoteControl = () => {
     setRemoteControlAllowed(false);
     setControlNotice('');
@@ -1166,6 +1198,34 @@ export default function App() {
     const myId = currentUser?.id || connectionId;
     const m = new WebRTCManager(myId);
     m.onQuality = setQuality;
+    m.onControl = async (msg: ControlMsg) => {
+      const role = m.getRole();
+      if (msg.k === 'clip-req') {
+        // Yalnizca KONTROL EDILEN taraf panosunu verir ve yalnizca izin varsa.
+        // Panodaki bir parola, ekranda hic gorunmeden disari cikabilir —
+        // bu yuzden klavye/fare ile ayni kapidan geciyor.
+        if (role !== 'receiver' || !remoteControlAllowedRef.current) return;
+        const text = await readLocalClipboard(true);
+        if (!text) return;
+        m.sendControl({ k: 'clip-set', text });
+        addLocalLog('Panonuz karsi tarafa gonderildi.', 'warn');
+        return;
+      }
+      if (msg.k === 'clip-set') {
+        const text = typeof msg.text === 'string' ? msg.text : '';
+        if (!text) return;
+        if (role === 'receiver') {
+          // Karsi taraf PANOMUZA yaziyor — kontrol izni sart.
+          if (!remoteControlAllowedRef.current) return;
+          const ok = await writeLocalClipboard(text, true);
+          if (ok) addLocalLog('Karsi taraf panonuza metin yazdi.', 'warn');
+        } else {
+          // Operator: kendi istedigi uzak panonun yaniti.
+          const ok = await writeLocalClipboard(text, false);
+          addLocalLog(ok ? `Uzak pano alindi (${text.length} karakter).` : 'Pano yazilamadi.', ok ? 'sys' : 'warn');
+        }
+      }
+    };
     m.onStateChange = (state) => {
       setRtcState(state);
       if (state === 'connecting') {
@@ -1666,6 +1726,22 @@ export default function App() {
                         style={{ background: inputEnabled ? 'var(--accent-primary)' : 'rgba(0,0,0,0.7)', color: inputEnabled ? '#000' : 'var(--text-muted)' }}
                         title="Klavye/fare kontrolünü aç-kapat"
                       >{inputEnabled ? 'Kontrol: AÇIK' : 'Kontrol'}</button>
+                      )}
+                      {EMBED.mode !== 'view' && (
+                        <>
+                          <button
+                            onClick={sendClipboardToRemote}
+                            className="px-2 py-1 text-[9px] uppercase tracking-widest text-steppe-muted hover:text-steppe-gold rounded"
+                            style={{ background: 'rgba(0,0,0,0.7)' }}
+                            title="Kendi panondaki metni karsi tarafin panosuna yaz (karsi tarafta kontrol izni gerekir)"
+                          >Pano →</button>
+                          <button
+                            onClick={requestRemoteClipboard}
+                            className="px-2 py-1 text-[9px] uppercase tracking-widest text-steppe-muted hover:text-steppe-gold rounded"
+                            style={{ background: 'rgba(0,0,0,0.7)' }}
+                            title="Karsi tarafin panosunu kendi panona al (karsi tarafta kontrol izni gerekir)"
+                          >Pano ←</button>
+                        </>
                       )}
                       <button onClick={() => videoContainerRef.current?.requestFullscreen()} className="px-2 py-1 text-[9px] uppercase tracking-widest text-steppe-muted hover:text-steppe-gold rounded" style={{ background: 'rgba(0,0,0,0.7)' }}>Tam Ekran</button>
                       <button onClick={handleDisconnect} className="px-2 py-1 text-[9px] uppercase tracking-widest text-white rounded bg-red-500/80 hover:bg-red-500">Kes</button>

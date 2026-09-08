@@ -15,6 +15,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   //   pointer=false -> tek pencere paylaşıldı, yalnızca klavye iletilir.
   requestRemoteControl: () => ipcRenderer.invoke('remote-control:request'),
   revokeRemoteControl: () => ipcRenderer.send('remote-control:revoke'),
+  // Pano paylaşımı. forRemote/fromRemote = "işlemi karşı taraf istedi";
+  // bu durumda ana süreç kontrol iznini arar (klavye/fare ile aynı kapı).
+  readClipboard: (opts) => ipcRenderer.invoke('clipboard:read', opts),
+  writeClipboard: (payload) => ipcRenderer.send('clipboard:write', payload),
   // Girdi enjeksiyonu bu makinede çalışabilir mi (nut-js yüklü mü, macOS
   // erişilebilirlik izni var mı). Arayüz sessiz başarısızlık yerine sebebi gösterir.
   remoteControlStatus: () => ipcRenderer.invoke('remote-control:status'),

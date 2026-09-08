@@ -18,6 +18,18 @@ export type InputEventMsg =
   // operatör uzak bilgisayarda Ctrl'ü sonsuza kadar basılı bırakıyordu.
   | { type: 'release-all' };
 
+/**
+ * Veri kanalındaki girdi DIŞI mesajlar.
+ *
+ * GERİYE DÖNÜK UYUMLULUK: girdi mesajları eskiden olduğu gibi düz
+ * InputEventMsg olarak gider (`type` alanı taşır). Kontrol mesajları ise
+ * `k` alanıyla ayrılır. Böylece v1.0.16 istemcileri yeni mesajları
+ * "bozuk girdi" sayıp sessizce atar, girdi akışı da bozulmaz.
+ */
+export type ControlMsg =
+  | { k: 'clip-req' }                 // "panonu bana gönder"
+  | { k: 'clip-set'; text: string };  // "bunu panona yaz"
+
 interface IncomingSignal {
   id?: string;
   type: SignalType;
@@ -105,6 +117,8 @@ export class WebRTCManager {
   onInputEvent?: (event: InputEventMsg) => void;
   /** Oturum boyunca 2 sn'de bir kalite ölçümü. Bağlantı bitince null gelir. */
   onQuality?: (q: RtcQuality | null) => void;
+  /** Girdi disi kontrol mesajlari (pano vb.). */
+  onControl?: (msg: ControlMsg) => void;
 
   constructor(myId: string) {
     this.myId = myId;
@@ -194,8 +208,13 @@ export class WebRTCManager {
     dc.onerror = () => this.log('Veri kanalı hatası.', 'warn');
     dc.onmessage = (e) => {
       try {
-        const event = JSON.parse(e.data as string) as InputEventMsg;
-        this.onInputEvent?.(event);
+        const msg = JSON.parse(e.data as string) as Record<string, unknown>;
+        // `k` tasiyan mesajlar kontrol mesajidir; digerleri eski girdi bicimi.
+        if (msg && typeof msg.k === 'string') {
+          this.onControl?.(msg as unknown as ControlMsg);
+          return;
+        }
+        this.onInputEvent?.(msg as unknown as InputEventMsg);
       } catch {
         // ignore malformed messages
       }
@@ -793,6 +812,16 @@ export class WebRTCManager {
 
     this.log('Yanıt gönderildi, bağlantı kuruluyor...');
     this.cleanupTimer = setInterval(() => this.cleanSignals(), 30000);
+  }
+
+  /** Girdi disi kontrol mesaji gonderir (pano vb.). */
+  sendControl(msg: ControlMsg): void {
+    if (this.dataChannel?.readyState !== 'open') return;
+    try {
+      this.dataChannel.send(JSON.stringify(msg));
+    } catch (err) {
+      this.log(`Kontrol mesaji gonderilemedi: ${String(err)}`, 'warn');
+    }
   }
 
   sendInput(event: InputEventMsg): void {
