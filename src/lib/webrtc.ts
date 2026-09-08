@@ -142,6 +142,8 @@ export class WebRTCManager {
   /** Bu oturum için çözülmüş ICE yapılandırması (STUN + süreli TURN). */
   private iceConfig: IceConfig | null = null;
   private statsTimer: ReturnType<typeof setInterval> | null = null;
+  /** Karşı taraf sessizce gittiğinde bağlantıyı düşüren zamanlayıcı. */
+  private disconnectTimer: ReturnType<typeof setTimeout> | null = null;
   /** Bu oturumun parolasi — dogrulama kodu turetmesine karisir. */
   private sessionPassword = '';
   /** connections satirinin id'si — oturum bitince suresi yazilir. */
@@ -322,7 +324,12 @@ export class WebRTCManager {
       const state = pc.iceConnectionState;
       this.log(`ICE durumu: ${state}`, 'sys');
       if (state === 'failed') {
+        this.clearDisconnectWatchdog();
         this.attemptIceRestart();
+      } else if (state === 'disconnected') {
+        this.startDisconnectWatchdog();
+      } else if (state === 'connected' || state === 'completed') {
+        this.clearDisconnectWatchdog();
       }
     };
 
@@ -423,6 +430,37 @@ export class WebRTCManager {
     const code = await deriveVerificationCode(local, remote, this.sessionPassword);
     this.onVerification?.(code);
     if (code) this.log(`Bağlantı doğrulama kodu: ${code}`, 'sys');
+  }
+
+  /**
+   * Karşı taraf gittiğinde hızlı tepki verir.
+   *
+   * NEDEN: kapanışta gönderilen hangup sinyali HER ZAMAN ulaşmaz — ağ
+   * kesilebilir, oturum düşmüş olabilir (o durumda RLS insert'i reddeder).
+   * Sinyal gelmeyince tek kalan yol ICE'in kendi zaman aşımıydı: kullanıcı
+   * 15-30 saniye donmuş bir görüntüye bakıyordu.
+   *
+   * ICE 'disconnected'a düşünce kısa bir süre toparlanmasını bekliyoruz
+   * (gerçek bir ağ takılması bu sürede düzelebilir); düzelmezse kapatıyoruz.
+   * Denge: çok kısa süre geçici takılmada bağlantıyı gereksiz düşürür,
+   * çok uzun süre donmuş ekran hissini sürdürür.
+   */
+  private static readonly DISCONNECT_GRACE_MS = 6000;
+
+  private startDisconnectWatchdog(): void {
+    if (this.disconnectTimer) return;
+    this.disconnectTimer = setTimeout(() => {
+      this.disconnectTimer = null;
+      const st = this.pc?.iceConnectionState;
+      if (st === 'connected' || st === 'completed') return; // toparlandı
+      this.log('Karşı taraftan yanıt gelmiyor — bağlantı kapatılıyor.', 'warn');
+      this.onStateChange?.('disconnected');
+      this.close();
+    }, WebRTCManager.DISCONNECT_GRACE_MS);
+  }
+
+  private clearDisconnectWatchdog(): void {
+    if (this.disconnectTimer) { clearTimeout(this.disconnectTimer); this.disconnectTimer = null; }
   }
 
   // ── Kalite telemetrisi ─────────────────────────────────────────────────────
@@ -1090,6 +1128,7 @@ export class WebRTCManager {
   private close() {
     this.stopPolling();
     this.stopStats();
+    this.clearDisconnectWatchdog();
     // Devam eden transferler baglantiyla birlikte duser.
     if (this.outgoingFile) this.outgoingFile.cancelled = true;
     this.outgoingFile = null;

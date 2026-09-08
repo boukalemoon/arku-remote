@@ -182,6 +182,16 @@ export default function App() {
   const [targetId, setTargetId] = React.useState('');
   // Arayanin girdigi oturum parolasi (karsi tarafin ekraninda yazan).
   const [targetPassword, setTargetPassword] = React.useState('');
+  /**
+   * Bagli oldugumuz tarafin EKRANDA gosterilecek etiketi.
+   *
+   * Eskiden alici, gelen cagriyi kabul edince `targetId`yi (yani KENDI
+   * hedef kimlik GIRDI ALANINI) arayanin UUID'siyle dolduruyordu. Sonuc:
+   * baglanti bitince kutuda 9 haneli kimlik yerine uzun bir UUID kaliyor,
+   * kullanici onu gercek kimlik saniyordu. Girdi alani yalnizca giden
+   * cagrilar icindir; gosterim ayri tutuluyor.
+   */
+  const [peerLabel, setPeerLabel] = React.useState('');
   // Bu cihazin gecerli oturum parolasi. Her oturum bitiminde yenilenir.
   const [sessionPassword, setSessionPassword] = React.useState(() => generateSessionPassword());
   const [requirePassword, setRequirePassword] = React.useState(() => {
@@ -259,6 +269,10 @@ export default function App() {
   // "Gerçekten giriş yapmış kullanıcı". Arayüz ve yetki kararlarının tamamı bunu
   // kullanmalı; `currentUser` anonim (misafir) oturumda da doludur.
   const isRegistered = !!currentUser && !currentUser.is_anonymous;
+
+  /** UUID biciminde bir kimligi ekranda kisaltir; 9 haneli kimlik oldugu gibi kalir. */
+  const shortPeerId = (id: string): string =>
+    /^[0-9a-f]{8}-[0-9a-f]{4}-/i.test(id) ? `${id.slice(0, 8)}...` : id;
 
   const ts = () => new Date().toLocaleTimeString('tr-TR');
   const addLocalLog = (msg: string, type: LogType = 'info') => setLogs(p => [{ time: ts(), msg, type }, ...p].slice(0, 50));
@@ -699,12 +713,23 @@ export default function App() {
     const { data: { session } } = await supabase.auth.getSession();
     if (session) {
       // getSession YALNIZCA yereldeki kaydı okur — jeton iptal edilmiş ya da
-      // süresi dolmuş olabilir. Sunucuya sorup gerçekten geçerli mi diye
-      // bakmazsak "oturum var" sanıp hiç giriş yapmayız ve hiçbir isteği
-      // geçmeyen ölü bir oturumla kalırız: kullanıcı ekranda kimlik görür,
-      // ama kimse ona ulaşamaz.
+      // süresi dolmuş olabilir. Sunucuya sorup doğruluyoruz.
       const { error: userErr } = await supabase.auth.getUser();
       if (!userErr) return true;
+
+      // DİKKAT: getUser() hatası tek başına "oturum geçersiz" DEMEK DEĞİLDİR.
+      // Ağ kesintisi, 5xx, ya da tarayıcı kalkanlarının (Brave shields) isteği
+      // engellemesi de hata döndürür. İlk sürümde her hatada oturumu
+      // kapatıyordum: sağlam oturum yanıyor, yerine yenisi açılamayınca
+      // kullanıcı kimliksiz kalıyordu — üstelik o durumda kesme sinyali de
+      // yazılamadığı için karşı taraf bağlantının koptuğunu geç anlıyordu.
+      // Yalnızca sunucunun kimliği AÇIKÇA reddettiği durumda kapatıyoruz.
+      const status = (userErr as { status?: number }).status;
+      const kesinGecersiz = status === 401 || status === 403;
+      if (!kesinGecersiz) {
+        addLocalLog(`Oturum dogrulanamadi (gecici olabilir): ${userErr.message}`, 'warn');
+        return true; // mevcut oturumu KORU
+      }
       addLocalLog('Kayitli oturum gecersiz, yenisi aciliyor.', 'warn');
       try { await supabase.auth.signOut({ scope: 'local' }); } catch { /* yok say */ }
     }
@@ -924,7 +949,7 @@ export default function App() {
     resetIceCache();
     setCurrentUser(null); setUserProfile(null); setGuestChoice(false); setConnectionHistory([]);
     setQrtimUser(null);
-    setRemoteStream(null); setQuality(null); setVerifyCode(null); setRtcState('idle'); setIsConnecting(false);
+    setRemoteStream(null); setQuality(null); setVerifyCode(null); setPeerLabel(''); setRtcState('idle'); setIsConnecting(false);
     setConnectionId(getOrCreateGuestId()); setDisplayName(''); setPhone(''); setSessionToken(''); setDeviceFingerprint('');
     setActiveTab('dashboard'); addLocalLog('Oturum kapatildi.', 'warn');
     // Çıkıştan sonra da ulaşılabilir kal (RLS oturum ister), ama kullanıcı
@@ -1483,6 +1508,7 @@ export default function App() {
         setRemoteStream(null);
         setQuality(null);
         setVerifyCode(null);
+        setPeerLabel('');
         setRemoteScreens([]);
         setInputEnabled(false);
         disableRemoteControl();
@@ -1531,7 +1557,7 @@ export default function App() {
     if (targetId.trim() === connectionId || (currentUser && targetId.trim() === currentUser.id)) { addLog('Kendi cihaziniza baglanamazsiniz.', 'error'); return; }
 
     if (webrtc) await webrtc.disconnect();
-    setWebrtc(null); setRemoteStream(null); setQuality(null); setVerifyCode(null); setRtcState('idle'); setIsConnecting(true);
+    setWebrtc(null); setRemoteStream(null); setQuality(null); setVerifyCode(null); setPeerLabel(''); setRtcState('idle'); setIsConnecting(true);
     addLog(`${targetId} adresine baglaniliyor...${EMBED.op ? ` (operator: ${EMBED.op})` : ''}`, 'warn');
     resetSessionEvents();
     postSessionEvent('connecting', targetId, EMBED.mode);
@@ -1616,7 +1642,7 @@ export default function App() {
     if (webrtc) await webrtc.disconnect();
     disableRemoteControl(); // her oturum kontrol izni kapalı başlar
     const m = buildManager();
-    setWebrtc(m); setTargetId(fromId); setIsConnecting(true);
+    setWebrtc(m); setPeerLabel(shortPeerId(fromId)); setIsConnecting(true);
 
     // When the user stops screen sharing via the browser's native "Stop sharing" button,
     // the track fires onended. We use `m` directly (not the `webrtc` state variable) to
@@ -1672,7 +1698,7 @@ export default function App() {
     // Ekran paylaşımını ve arayüzü önce durdur, teardown'ı sonra bekle.
     const m = webrtc;
     if (localVideoRef.current?.srcObject) { (localVideoRef.current.srcObject as MediaStream)?.getTracks().forEach(t => t.stop()); localVideoRef.current.srcObject = null; }
-    setWebrtc(null); setRemoteStream(null); setQuality(null); setVerifyCode(null); setRtcState('idle'); setIsConnecting(false);
+    setWebrtc(null); setRemoteStream(null); setQuality(null); setVerifyCode(null); setPeerLabel(''); setRtcState('idle'); setIsConnecting(false);
     addLog('Baglaniti kesildi.', 'warn');
     postSessionEvent('ended', targetId, EMBED.mode);
     try { await m?.disconnect(); } catch { /* teardown hatasi arayuzu etkilemesin */ }
@@ -1953,7 +1979,7 @@ export default function App() {
                   <div className="flex items-center gap-3">
                     <div className={`w-2 h-2 rounded-full animate-pulse ${rtcState === 'connected' ? 'bg-green-400' : rtcState === 'connecting' ? 'bg-yellow-400' : 'bg-red-400'}`} />
                     <span className="text-[10px] uppercase tracking-widest text-steppe-muted">
-                      {rtcState === 'connected' ? `P2P Bagli - ${targetId}` : rtcState === 'connecting' ? 'Baglaniyor...' : 'Baglaniti Kesildi'}
+                      {rtcState === 'connected' ? `P2P Bagli - ${peerLabel || targetId}` : rtcState === 'connecting' ? 'Baglaniyor...' : 'Baglaniti Kesildi'}
                     </span>
                     {rtcState === 'connected' && <button onClick={handleDisconnect} className="ml-auto text-[9px] text-red-400 hover:text-red-300 uppercase tracking-widest">Kes</button>}
                   </div>
@@ -2042,7 +2068,7 @@ export default function App() {
                     <video ref={remoteVideoRef} autoPlay playsInline className="w-full h-full object-contain bg-black" />
                     <div className="absolute top-3 left-3 flex items-center gap-2 px-2 py-1 rounded" style={{ background: 'rgba(0,0,0,0.7)' }}>
                       <div className="w-2 h-2 rounded-full bg-green-400 animate-pulse" />
-                      <span className="text-[9px] text-green-400 uppercase tracking-widest">Bagli - {targetId}</span>
+                      <span className="text-[9px] text-green-400 uppercase tracking-widest">Bagli - {peerLabel || targetId}</span>
                       <QualityChips compact />
                     </div>
                     <div className="absolute top-3 right-3 flex gap-2">
