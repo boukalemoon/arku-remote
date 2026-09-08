@@ -123,11 +123,11 @@ function createWindow() {
     })
   });
 
-  // Dış linkleri tarayıcıda aç — sadece http/https protokollerine izin ver
+  // Dış linkleri tarayıcıda aç — YALNIZCA https.
+  // Eskiden http:// de kabul ediliyordu; düz metin bir adrese yönlendirme
+  // araya girmeye açıktır ve uygulamanın açtığı bir bağlantı için gereksizdir.
   win.webContents.setWindowOpenHandler(({ url }) => {
-    if (url.startsWith('https://') || url.startsWith('http://')) {
-      shell.openExternal(url);
-    }
+    if (url.startsWith('https://')) shell.openExternal(url);
     return { action: 'deny' };
   });
 
@@ -146,6 +146,50 @@ function createWindow() {
   };
   win.webContents.on('will-navigate', interceptQrtimReturn);
   win.webContents.on('will-redirect', interceptQrtimReturn);
+
+  // Uygulama penceresi KENDİ içeriğinden başka bir yere gitmemeli.
+  //
+  // NEDEN: pencerenin webContents'i preload köprüsünü (window.electronAPI)
+  // taşır. Kötü niyetli bir bağlantı veya yönlendirme pencereyi dışarıdaki
+  // bir sayfaya taşırsa, o sayfa köprüyü miras alır ve panoyu okumaya
+  // (readClipboard) veya dosya yazmaya (saveFile) çalışabilir.
+  // Uzaktan kontrol izni gezinmede zaten düşüyor (dropGrant), ama diğer
+  // köprü uçları açık kalıyordu. Bu kapı onları da kapatır.
+  //
+  // İzin verilenler dar tutuldu:
+  //   file:                        paketlenmiş uygulamanın kendi sayfası
+  //   http://localhost:3000        geliştirme sunucusu
+  //   https://qartim.com           QRtım SSO giriş sayfası
+  //   https://arku-remote.vercel.app  QRtım'in döndüğü callback adresi
+  //
+  // Son ikisi AKIŞ GEREĞİ zorunlu: handleQrtimConnect pencereyi QRtım'e
+  // yönlendirir, QRtım callback'e döner ve interceptQrtimReturn token'ı
+  // yakalayıp yerel sayfayı yükler. Bu iki origin bizim kendi mülkümüz.
+  //
+  // DAHA İYİSİ: QRtım girişini varsayılan tarayıcıda açıp dönüşü özel bir
+  // protokolle (arku://) almak. O zaman hiçbir uzak sayfa uygulama
+  // penceresinde açılmaz ve köprüye hiç yaklaşamaz. Ayrı bir iş kalemi.
+  const NAV_ALLOWED_ORIGINS = new Set([
+    'http://localhost:3000',
+    'https://qartim.com',
+    'https://arku-remote.vercel.app',
+  ]);
+
+  const isInternalUrl = (url) => {
+    try {
+      const u = new URL(url);
+      if (u.protocol === 'file:') return true;
+      return NAV_ALLOWED_ORIGINS.has(u.origin);
+    } catch { return false; }
+  };
+
+  const guardNavigation = (event, url) => {
+    if (isInternalUrl(url)) return;
+    event.preventDefault();
+    if (url.startsWith('https://')) shell.openExternal(url);
+  };
+  win.webContents.on('will-navigate', guardNavigation);
+  win.webContents.on('will-redirect', guardNavigation);
 
   const isDev = process.env.NODE_ENV === 'development' || !app.isPackaged;
 if (isDev) {
