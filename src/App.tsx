@@ -26,6 +26,25 @@ interface LogEntryLocal { time: string; msg: string; type: LogType; }
 interface IncomingCall { fromId: string; toId?: string; offerPayload: Record<string, unknown>; sessionId?: string; signalId?: string; }
 interface QrtimUser { qrtim_id: string; email: string; name: string; username: string; photo_url: string | null; title: string | null; company: string | null; plan: string; }
 
+/**
+ * QRtim SSO ASKIYA ALINDI (2026-09-08).
+ *
+ * IKI SEBEP:
+ *  1) URUN: QRtim dijital kimlik yapisina gecirilmek uzere bastan tasarlaniyor.
+ *     Entegrasyon, yeni kimlik modeli netlestikten sonra yeniden kurulacak.
+ *  2) GUVENLIK (S1): qrtim-auth, QRtim'in dondurdugu e-postayi dogrulanmis
+ *     kabul edip o e-posta icin oturum uretiyordu. QRtim tarafinda e-posta
+ *     dogrulamasi zorunlu degilse, saldirgan kurban@firma.com ile QRtim
+ *     hesabi acip AYNI e-postaya ait Arku hesabini devralabilirdi.
+ *     Cozum QRtim tarafinda `email_verified` iddiasini eklemek; o gelene
+ *     kadar yol kapali.
+ *
+ * Kod SILINMEDI: bayrak true yapilinca akis geri gelir. Sunucu tarafinda da
+ * ayri bir kill switch var (qrtim-auth / QRTIM_SSO_ENABLED) — arayuzu acmak
+ * tek basina yetmez, ikisi birden acilmalidir.
+ */
+const QRTIM_ENABLED = false;
+
 const QRTIM_BASE_URL = import.meta.env.VITE_QRTIM_URL ?? 'https://qartim.com';
 // QRtım entegrasyonu artık Arku edge fonksiyonları üzerinden yürür:
 //   qrtim-auth  -> SSO ile giriş, qrtim-sync -> hesap bağlama + abonelik senkronu.
@@ -651,7 +670,7 @@ export default function App() {
   const anonBootstrapRef = React.useRef(false);
   React.useEffect(() => {
     // QRtım SSO dönüşünde atlanır; o akış kendi oturumunu açar.
-    if (new URLSearchParams(window.location.search).get('qrtim_token')) return;
+    if (QRTIM_ENABLED && new URLSearchParams(window.location.search).get('qrtim_token')) return;
     if (anonBootstrapRef.current) return;
     anonBootstrapRef.current = true;
     (async () => {
@@ -670,6 +689,11 @@ export default function App() {
   React.useEffect(() => {
     const qrtimToken = new URLSearchParams(window.location.search).get('qrtim_token');
     if (!qrtimToken) return;
+    if (!QRTIM_ENABLED) {
+      // Askidayken gelen token islenmez; adres cubugundan da temizlenir.
+      window.history.replaceState({}, '', window.location.pathname);
+      return;
+    }
     (async () => {
       const { data: { session } } = await supabase.auth.getSession();
       // DİKKAT: anonim oturum her sekmede açık olduğu için "oturum var mı"
@@ -1073,12 +1097,14 @@ export default function App() {
   };
 
   const handleQrtimConnect = () => {
+    if (!QRTIM_ENABLED) return;
     if (!isRegistered) { setShowAuth(true); setAuthMode('login'); return; }
     window.location.href = `${QRTIM_BASE_URL}/login?callback=${encodeURIComponent(qrtimCallbackUrl())}&source=arku`;
   };
 
   // Giriş ekranından QRtım ile tek tıkla giriş (oturum gerekmez).
   const handleQrtimLogin = () => {
+    if (!QRTIM_ENABLED) return;
     window.location.href = `${QRTIM_BASE_URL}/login?callback=${encodeURIComponent(qrtimCallbackUrl())}&source=arku`;
   };
 
@@ -2327,6 +2353,7 @@ export default function App() {
                 </div>
               </div>
             </section>
+            {QRTIM_ENABLED && (
             <section className="gokturk-border surface-card p-8">
               <h3 className="text-[10px] uppercase tracking-widest text-steppe-muted mb-6 flex items-center gap-2"><QrCode size={12} className="text-steppe-gold" /> QRtim Entegrasyonu</h3>
               {qrtimLinking ? (
@@ -2368,6 +2395,7 @@ export default function App() {
                 </>
               )}
             </section>
+            )}
           </div>
         )}
       </main>
@@ -2430,10 +2458,12 @@ export default function App() {
                   {authError && <p className="text-[10px] text-red-400">{authError}</p>}
                   <button onClick={handleLogin} className="btn-primary">Devam Et</button>
                   <button onClick={() => { setAuthMode('reset'); setAuthError(''); setResetSent(false); setResetEmail(''); }} className="w-full text-[10px] text-steppe-muted hover:text-steppe-gold transition-colors text-center">Sifremi Unuttum</button>
+                  {QRTIM_ENABLED && (<>
                   <div className="flex items-center gap-3 py-1"><div className="flex-1 h-px bg-steppe-border" /><span className="text-[9px] uppercase tracking-widest text-steppe-muted">veya</span><div className="flex-1 h-px bg-steppe-border" /></div>
                   <button onClick={handleQrtimLogin} className="w-full flex items-center justify-center gap-2 p-3 border border-steppe-gold/40 hover:border-steppe-gold hover:bg-steppe-gold/5 transition-all">
                     <QrCode size={14} className="text-steppe-gold" /><span className="text-[10px] uppercase tracking-widest text-steppe-gold">QRtım ile Giriş Yap</span>
                   </button>
+                  </>)}
                   <button onClick={handleGuestLogin} className="w-full flex items-center justify-center gap-2 p-3 border border-steppe-border hover:border-steppe-gold transition-all" style={{ background: 'var(--surface-primary)' }}>
                     <User size={14} className="text-steppe-muted" /><span className="text-[10px] uppercase tracking-widest text-steppe-muted">Hesap Acmadan Devam Et</span>
                   </button>

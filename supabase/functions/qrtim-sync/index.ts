@@ -66,6 +66,15 @@ Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
   if (req.method !== "POST") return json({ error: "Yalnızca POST desteklenir" }, 405);
 
+  // ── ASKIYA ALINDI (2026-09-08) ─────────────────────────────────────────────
+  // qrtim-auth ile aynı gerekçe. Bu uç nokta hesap DEVRALMA yolu değildir
+  // (oturum zaten gerekli) ama sahibi olunmayan bir QRtım kimliği hesaba
+  // bağlanıp ücretsiz plan alınabilir. QRtım yeniden tasarlanana kadar kapalı.
+  // Açmak için: Supabase secret QRTIM_SSO_ENABLED=true
+  if (Deno.env.get("QRTIM_SSO_ENABLED") !== "true") {
+    return json({ error: "QRtım entegrasyonu geçici olarak devre dışı." }, 503);
+  }
+
   try {
     const authHeader = req.headers.get("Authorization") ?? "";
     const jwt = authHeader.replace(/^Bearer\s+/i, "");
