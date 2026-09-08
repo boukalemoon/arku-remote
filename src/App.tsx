@@ -65,6 +65,20 @@ const generateSessionToken = (): string => Array.from(crypto.getRandomValues(new
  * karıştırılabilen karakterler (0/O, 1/I/L) çıkarılmıştır.
  * 32 karakter, 256 % 32 === 0 olduğu için modulo sapması yok.
  */
+/**
+ * Oturum kaydi riza metni ve SURUMU.
+ *
+ * Surum, kaydin hangi metne dayanarak alindiginin sonradan ispatlanabilmesi
+ * icin hem karsi tarafa gonderilir hem de kayit ustverisine yazilir.
+ * Metin degistiginde SURUM DE DEGISMELIDIR.
+ */
+const RECORDING_CONSENT_VERSION = '2026-09-09.1';
+const RECORDING_CONSENT_TEXT =
+  'Bu oturumun ekran goruntusu video olarak kaydedilecektir. Kayit, baglanan '
+  + 'tarafin bilgisayarindaki bir klasore yazilir; Arku sunucularina '
+  + 'gonderilmez. Kayit suresince her iki ekranda da "KAYIT" gostergesi yanar. '
+  + 'Onayi istediginiz an geri cekebilir, kaydi durdurabilirsiniz.';
+
 const PW_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
 
 /**
@@ -192,6 +206,20 @@ export default function App() {
    * cagrilar icindir; gosterim ayri tutuluyor.
    */
   const [peerLabel, setPeerLabel] = React.useState('');
+  // ── Oturum kaydi ──
+  // 'off' | 'requesting' (izleyen onay bekliyor) | 'recording'
+  const [recState, setRecState] = React.useState<'off' | 'requesting' | 'recording'>('off');
+  /** Ekrani paylasan tarafta: karsi taraf kayit izni istedi. */
+  const [recPrompt, setRecPrompt] = React.useState(false);
+  const [recFolder, setRecFolder] = React.useState('');
+  const [recElapsed, setRecElapsed] = React.useState(0);
+  // onControl bagimliliklari dar bir closure icinde calisiyor; kayit durumunu
+  // ref uzerinden okumak bayat deger riskini kaldirir.
+  const recStateRef = React.useRef(recState);
+  React.useEffect(() => { recStateRef.current = recState; }, [recState]);
+  const mediaRecorderRef = React.useRef<MediaRecorder | null>(null);
+  const recChunksRef = React.useRef<Blob[]>([]);
+  const recStartedAtRef = React.useRef(0);
   // Bu cihazin gecerli oturum parolasi. Her oturum bitiminde yenilenir.
   const [sessionPassword, setSessionPassword] = React.useState(() => generateSessionPassword());
   const [requirePassword, setRequirePassword] = React.useState(() => {
@@ -1019,6 +1047,23 @@ export default function App() {
     addLocalLog(v ? 'Baglanti icin parola zorunlu.' : 'Parola zorunlulugu kapatildi.', v ? 'sys' : 'warn');
   };
 
+  // Kayit suresi sayaci.
+  React.useEffect(() => {
+    if (recState !== 'recording') return;
+    const t = setInterval(() => {
+      setRecElapsed(recStartedAtRef.current ? Math.round((Date.now() - recStartedAtRef.current) / 1000) : 0);
+    }, 1000);
+    return () => clearInterval(t);
+  }, [recState]);
+
+  // Kayit klasorunu acilista oku (masaustu).
+  React.useEffect(() => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const api = (window as any).electronAPI;
+    if (!api?.getRecordingFolder) return;
+    api.getRecordingFolder().then((d: string) => { if (d) setRecFolder(d); }).catch(() => { /* yok say */ });
+  }, []);
+
   // Kalp atışı: karşı taraf bizi ancak last_seen güncel kalırsa "çevrimiçi"
   // görebilir. 60 sn aralık, sunucudaki 90 sn eşiğiyle uyumlu — bir atış
   // kaçtığında cihaz çevrimdışı görünmez.
@@ -1322,6 +1367,127 @@ export default function App() {
     setIncomingFile(null);
   };
 
+  // ── Oturum kaydi ───────────────────────────────────────────────────────────
+  // Kayit IZLEYEN tarafta alinir: gelen MediaStream zaten elimizde, ajanda
+  // ek yuk ve yukleme yok. Dosya Arku sunucularina HIC ugramaz.
+
+  /** Tarayicinin destekledigi ilk kayit bicimini secer. */
+  const pickRecorderMime = (): string => {
+    const adaylar = [
+      'video/webm;codecs=vp9',
+      'video/webm;codecs=vp8',
+      'video/webm',
+    ];
+    for (const m of adaylar) {
+      if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported?.(m)) return m;
+    }
+    return '';
+  };
+
+  /** Kaydi fiilen baslatir (onay ALINDIKTAN sonra cagrilir). */
+  const startRecording = (stream: MediaStream): boolean => {
+    if (typeof MediaRecorder === 'undefined') {
+      addLocalLog('Bu tarayici kayit desteklemiyor.', 'error');
+      return false;
+    }
+    try {
+      const mimeType = pickRecorderMime();
+      const mr = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      recChunksRef.current = [];
+      mr.ondataavailable = (e) => { if (e.data && e.data.size > 0) recChunksRef.current.push(e.data); };
+      mr.onerror = () => addLocalLog('Kayit sirasinda hata olustu.', 'error');
+      mr.onstop = () => { void finalizeRecording(); };
+      // 1 sn'lik parcalar: kayit ortasinda cokme olursa o ana kadarki veri durur.
+      mr.start(1000);
+      mediaRecorderRef.current = mr;
+      recStartedAtRef.current = Date.now();
+      setRecElapsed(0);
+      setRecState('recording');
+      addLocalLog('Oturum kaydi basladi.', 'warn');
+      return true;
+    } catch (err) {
+      addLocalLog(`Kayit baslatilamadi: ${String(err)}`, 'error');
+      return false;
+    }
+  };
+
+  /** Kaydi durdurur; dosya yazma onStop -> finalizeRecording icinde olur. */
+  const stopRecording = (bildir = true) => {
+    const mr = mediaRecorderRef.current;
+    if (mr && mr.state !== 'inactive') { try { mr.stop(); } catch { /* yok say */ } }
+    mediaRecorderRef.current = null;
+    setRecState('off');
+    if (bildir) webrtcRef.current?.sendControl({ k: 'rec-stopped' });
+  };
+
+  /** Toplanan parcalari birlestirip diske yazar. */
+  const finalizeRecording = async () => {
+    const parts = recChunksRef.current;
+    recChunksRef.current = [];
+    const saniye = recStartedAtRef.current
+      ? Math.round((Date.now() - recStartedAtRef.current) / 1000) : 0;
+    recStartedAtRef.current = 0;
+    setRecElapsed(0);
+    if (!parts.length) { addLocalLog('Kayit bos, dosya yazilmadi.', 'warn'); return; }
+
+    const blob = new Blob(parts, { type: 'video/webm' });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const api = (window as any).electronAPI;
+    if (api?.saveRecording) {
+      const buf = await blob.arrayBuffer();
+      const res = await api.saveRecording({
+        data: new Uint8Array(buf),
+        peer: peerLabel || targetId,
+      });
+      if (res?.ok) {
+        if (res.folder) setRecFolder(res.folder);
+        addLocalLog(`Kayit kaydedildi (${saniye} sn): ${res.path}`, 'sys');
+      } else if (res?.cancelled) {
+        addLocalLog('Kayit klasoru secilmedi, dosya yazilmadi.', 'warn');
+      } else {
+        addLocalLog(`Kayit yazilamadi: ${res?.error ?? 'bilinmeyen hata'}`, 'error');
+      }
+      return;
+    }
+    // Web surumu: tarayici indirmesi.
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `arku-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.webm`;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+    addLocalLog(`Kayit indirildi (${saniye} sn).`, 'sys');
+  };
+
+  /** Izleyen taraf: kayit izni ister. */
+  const requestRecording = () => {
+    if (!webrtc || rtcState !== 'connected' || !remoteStream) return;
+    setRecState('requesting');
+    webrtc.sendControl({ k: 'rec-request', consentVersion: RECORDING_CONSENT_VERSION });
+    addLocalLog('Kayit icin karsi tarafin onayi bekleniyor...', 'info');
+  };
+
+  /** Paylasan taraf: onay verir. */
+  const acceptRecording = () => {
+    setRecPrompt(false);
+    webrtcRef.current?.sendControl({ k: 'rec-accept', consentVersion: RECORDING_CONSENT_VERSION });
+    addLocalLog('Oturum kaydina onay verildi.', 'warn');
+  };
+
+  const rejectRecording = () => {
+    setRecPrompt(false);
+    webrtcRef.current?.sendControl({ k: 'rec-reject' });
+    addLocalLog('Oturum kaydi reddedildi.', 'warn');
+  };
+
+  const chooseRecordingFolder = async () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const api = (window as any).electronAPI;
+    if (!api?.pickRecordingFolder) return;
+    const dir = await api.pickRecordingFolder();
+    if (dir) { setRecFolder(dir); addLocalLog(`Kayit klasoru: ${dir}`, 'sys'); }
+  };
+
   const disableRemoteControl = () => {
     setRemoteControlAllowed(false);
     setControlNotice('');
@@ -1434,6 +1600,44 @@ export default function App() {
         return;
       }
 
+      // ── Oturum kaydi ──
+      if (msg.k === 'rec-request') {
+        // Ekrani PAYLASAN taraf onaylar: kaydedilen onun ekrani.
+        if (role !== 'receiver') return;
+        setRecPrompt(true);
+        addLocalLog('Karsi taraf oturumu kaydetmek istiyor.', 'warn');
+        return;
+      }
+      if (msg.k === 'rec-accept') {
+        // Yalnizca BIZ istediysek kabul edilir. Aksi halde kotu niyetli bir es,
+        // istenmemis bir "onay" gonderip bizde kayit baslatabilirdi.
+        if (recStateRef.current !== 'requesting') return;
+        // Izleyen taraf: onay geldi, kaydi baslat.
+        const stream = remoteVideoRef.current?.srcObject as MediaStream | null;
+        if (!stream) { addLocalLog('Kayit baslatilamadi: goruntu akisi yok.', 'error'); setRecState('off'); return; }
+        if (startRecording(stream)) m.sendControl({ k: 'rec-started' });
+        else { setRecState('off'); m.sendControl({ k: 'rec-stopped' }); }
+        return;
+      }
+      if (msg.k === 'rec-reject') {
+        setRecState('off');
+        addLocalLog('Karsi taraf kaydi reddetti.', 'warn');
+        return;
+      }
+      if (msg.k === 'rec-started') {
+        // Paylasan taraf: gosterge yansin.
+        setRecState('recording');
+        addLocalLog('Oturum KAYDEDILIYOR.', 'warn');
+        return;
+      }
+      if (msg.k === 'rec-stopped') {
+        // Karsi taraf durdurdu. Biz kaydediyorsak dosyayi yaz.
+        if (mediaRecorderRef.current) stopRecording(false);
+        else setRecState('off');
+        addLocalLog('Oturum kaydi durduruldu.', 'warn');
+        return;
+      }
+
       // ── Coklu monitor ──
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const api = (window as any).electronAPI;
@@ -1504,6 +1708,10 @@ export default function App() {
         if (connTimeoutRef.current) { clearTimeout(connTimeoutRef.current); connTimeoutRef.current = null; }
       }
       if (state === 'disconnected') {
+        // Kayit varsa ONCE kapat: aksi halde toplanan parcalar diske yazilmadan
+        // durum temizlenir ve kayit kaybolur. Karsi tarafa bildirmiyoruz;
+        // baglanti zaten dustu.
+        if (mediaRecorderRef.current) stopRecording(false);
         setIsConnecting(false);
         setRemoteStream(null);
         setQuality(null);
@@ -1519,7 +1727,7 @@ export default function App() {
         }
         if (connTimeoutRef.current) { clearTimeout(connTimeoutRef.current); connTimeoutRef.current = null; }
       }
-      if (state === 'idle') { setIsConnecting(false); setRemoteStream(null); setQuality(null); setInputEnabled(false); disableRemoteControl(); }
+      if (state === 'idle') { if (mediaRecorderRef.current) stopRecording(false); setIsConnecting(false); setRemoteStream(null); setQuality(null); setInputEnabled(false); disableRemoteControl(); }
     };
     m.onRemoteStream = (stream) => {
       setRemoteStream(stream);
@@ -2110,6 +2318,17 @@ export default function App() {
                             title="Kendi panondaki metni karsi tarafin panosuna yaz (karsi tarafta kontrol izni gerekir)"
                           >Pano →</button>
                           <button
+                            onClick={() => (recState === 'recording' ? stopRecording() : requestRecording())}
+                            disabled={recState === 'requesting'}
+                            className="px-2 py-1 text-[9px] uppercase tracking-widest rounded transition-colors disabled:opacity-50"
+                            style={{
+                              background: recState === 'recording' ? '#dc2626' : 'rgba(0,0,0,0.7)',
+                              color: recState === 'recording' ? '#fff' : 'var(--text-muted)',
+                            }}
+                            title="Oturumu videoya kaydet (karsi tarafin onayi gerekir)"
+                          >{recState === 'recording' ? `KAYIT ${Math.floor(recElapsed / 60)}:${String(recElapsed % 60).padStart(2, '0')}`
+                            : recState === 'requesting' ? 'Onay bekleniyor' : 'Kayit'}</button>
+                          <button
                             onClick={requestRemoteClipboard}
                             className="px-2 py-1 text-[9px] uppercase tracking-widest text-steppe-muted hover:text-steppe-gold rounded"
                             style={{ background: 'rgba(0,0,0,0.7)' }}
@@ -2135,6 +2354,13 @@ export default function App() {
                       <span className={`text-[9px] uppercase tracking-widest ${rtcState === 'connected' ? 'text-green-400' : 'text-yellow-400'}`}>
                         {rtcState === 'connected' ? 'Ekran Paylasiliyor - Bagli' : 'Ekran Paylasiliyor - Baglaniliyor...'}
                       </span>
+                      {/* Kayit gostergesi HER IKI tarafta da yanar — sessiz kayit yok. */}
+                      {recState === 'recording' && (
+                        <span className="flex items-center gap-1 px-1.5 py-0.5 rounded" style={{ background: '#dc2626' }}>
+                          <span className="w-1.5 h-1.5 rounded-full bg-white animate-pulse" />
+                          <span className="text-[9px] uppercase tracking-widest text-white">Kayit</span>
+                        </span>
+                      )}
                       <QualityChips compact />
                     </div>
                     <div className="absolute top-3 right-3 flex gap-2">
@@ -2485,6 +2711,35 @@ export default function App() {
                     ))}
                   </select>
                 </div>
+
+                {/* Oturum kaydi hedefi. Kayit dosyasi Arku sunucularina HIC
+                    gitmez; yalnizca bu makinede secilen klasorde durur. */}
+                {isElectron && (
+                  <div className="pt-4 border-t" style={{ borderColor: 'var(--border-primary)' }}>
+                    <div className="flex items-center justify-between gap-4">
+                      <div className="min-w-0">
+                        <p className="text-[10px] text-steppe-paper">Kayit Klasoru</p>
+                        <p className="text-[9px] text-steppe-muted mt-0.5 break-all">
+                          {recFolder || 'Secilmedi — ilk kayitta sorulacak.'}
+                        </p>
+                      </div>
+                      <div className="flex gap-2 shrink-0">
+                        {recFolder && (
+                          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                          <button onClick={() => (window as any).electronAPI?.openRecordingFolder?.()}
+                            className="text-[9px] uppercase tracking-widest text-steppe-muted hover:text-steppe-gold border border-steppe-border hover:border-steppe-gold px-2 py-1 transition-colors">Ac</button>
+                        )}
+                        <button onClick={chooseRecordingFolder}
+                          className="text-[9px] uppercase tracking-widest text-steppe-muted hover:text-steppe-gold border border-steppe-border hover:border-steppe-gold px-2 py-1 transition-colors">Degistir</button>
+                      </div>
+                    </div>
+                    <p className="text-[9px] text-steppe-muted mt-3 leading-relaxed">
+                      Kayit yalnizca iki taraf da onay verdiginde baslar ve kayit
+                      suresince iki ekranda da gosterge yanar. Dosya Arku
+                      sunucularina gonderilmez.
+                    </p>
+                  </div>
+                )}
               </div>
             </section>
             {QRTIM_ENABLED && (
@@ -2535,6 +2790,31 @@ export default function App() {
       </main>
 
       {/* Gelen Cagri Modali */}
+      {/* Oturum kaydi riza onayi. Kayit ASLA onay alinmadan baslamaz ve
+          onay veren taraf istedigi an durdurabilir. */}
+      <AnimatePresence>
+        {recPrompt && (
+          <div className="fixed inset-0 z-[220] flex items-center justify-center p-6 bg-black/80 backdrop-blur-sm">
+            <motion.div initial={{ opacity: 0, scale: 0.9 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.9 }} className="w-full max-w-md gokturk-border p-8" style={{ background: 'var(--bg-primary)' }}>
+              <div className="flex items-center gap-2 mb-4">
+                <span className="w-2.5 h-2.5 rounded-full" style={{ background: '#dc2626' }} />
+                <p className="text-[10px] uppercase tracking-widest text-steppe-muted">Oturum Kaydi Izni</p>
+              </div>
+              <p className="text-[11px] text-steppe-paper leading-relaxed mb-4">
+                {RECORDING_CONSENT_TEXT}
+              </p>
+              <p className="text-[9px] text-steppe-muted mb-6 font-mono">
+                Metin surumu: {RECORDING_CONSENT_VERSION}
+              </p>
+              <div className="flex gap-3">
+                <button onClick={rejectRecording} className="btn-ghost flex-1 py-2">Reddet</button>
+                <button onClick={acceptRecording} className="btn-primary flex-1 py-2">Onayliyorum</button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
       {/* Gelen dosya onayi. Dosya ASLA sorulmadan yazilmaz; kaydetme yerini de
           kullanici secer (masaustunde kaydetme penceresi acilir). */}
       <AnimatePresence>

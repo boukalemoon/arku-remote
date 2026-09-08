@@ -8,6 +8,46 @@ Sürümleme: [Semantic Versioning](https://semver.org/lang/tr/)
 
 ---
 
+## [1.2.0] — 2026-09-09
+
+> Yayınlanmamış 1.1.0'ın tamamını içerir; 1.1.0 etiketi hiç yayına çıkmadı.
+
+### Eklendi
+
+- **Oturum kaydı.** Uzak masaüstü oturumunu videoya kaydedin ve sonradan
+  izleyin. Kayıt **yalnızca iki taraf da onay verdiğinde** başlar: bağlanan
+  taraf ister, ekranı paylaşan taraf onaylar. Kayıt süresince **iki ekranda
+  da gösterge yanar** — sessiz kayıt yoktur. Her iki taraf da istediği an
+  durdurabilir (onayın geri çekilmesi).
+- Kayıt dosyası **Arku sunucularına hiç gitmez**; yalnızca kaydeden makinede
+  seçilen klasöre yazılır. Klasör Ayarlar → Ekran Yakalama altından seçilir.
+- Onay ekranında gösterilen rıza metninin **sürümü** karşı tarafa iletilir ve
+  kayıtla birlikte tutulur; kaydın hangi metne dayandığı sonradan bellidir.
+
+### Düzeltildi
+
+- **Kimlik alınamadığında sessizce ulaşılamaz kalma.** Oturum açılamazsa
+  uygulama yine geçerli görünen bir kimlik gösteriyordu; o kimliğe gelen
+  hiçbir sinyal okunamadığı için kimse bağlanamıyor, iki taraf da sebebini
+  öğrenemiyordu. Artık kimlik sunucuda kayıtlı değilse açıkça belirtiliyor.
+- **Geçerli oturumun gereksiz kapatılması.** Oturum doğrulaması ağ hatası
+  verdiğinde sağlam oturum kapatılıyordu (tarayıcı kalkanları bunu
+  tetikleyebiliyor). Artık yalnızca sunucu kimliği açıkça reddederse kapatılır.
+- **Bağlantı geç kopuyordu.** Kesme sinyali ulaşmadığında ekran 15–30 saniye
+  donuk kalıyordu; artık 6 saniyede kapanıyor.
+- **Hedef kimlik alanına UUID yazılması.** Gelen çağrıyı kabul eden taraf,
+  kendi hedef kimlik kutusunda 9 haneli kimlik yerine uzun bir kimlik
+  görüyordu.
+
+### Güvenlik
+
+- Kayıt klasörünü **arayüz belirleyemez**; yol yalnızca yerel klasör seçme
+  penceresinden gelir ve ana süreçte saklanır. Dosya adı da ana süreçte
+  üretilir.
+- Talep edilmemiş bir "kayıt onayı" mesajı yok sayılır.
+
+---
+
 ## [1.1.0] — 2026-09-08
 
 Bağlantı kurulamama, yanlış yere tıklama ve bulanık görüntü şikâyetlerinin

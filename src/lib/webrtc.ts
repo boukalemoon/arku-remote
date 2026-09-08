@@ -41,7 +41,17 @@ export type ControlMsg =
   | { k: 'file-accept'; id: string }
   | { k: 'file-reject'; id: string }
   | { k: 'file-end'; id: string }
-  | { k: 'file-cancel'; id: string; reason?: string };
+  | { k: 'file-cancel'; id: string; reason?: string }
+  // ── Oturum kaydı ──
+  // Kayıt YALNIZCA iki taraf da onayladıktan sonra başlar. İzleyen taraf
+  // ister (kendi rızası), ekranı paylaşan taraf onaylar (asıl veri sahibi o).
+  // Rıza metninin sürümü mesajda taşınır ki kaydın hangi metne dayandığı
+  // sonradan ispatlanabilsin.
+  | { k: 'rec-request'; consentVersion: string }
+  | { k: 'rec-accept'; consentVersion: string }
+  | { k: 'rec-reject' }
+  | { k: 'rec-started' }
+  | { k: 'rec-stopped' };
 
 /** Karşı tarafın göndermek istediği dosyanın künyesi. */
 export interface FileOffer { id: string; name: string; size: number }

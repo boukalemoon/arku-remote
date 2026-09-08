@@ -15,6 +15,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
   //   pointer=false -> tek pencere paylaşıldı, yalnızca klavye iletilir.
   requestRemoteControl: () => ipcRenderer.invoke('remote-control:request'),
   revokeRemoteControl: () => ipcRenderer.send('remote-control:revoke'),
+  // Oturum kaydi. Klasor yolu ana surecte saklanir; renderer yol belirleyemez.
+  getRecordingFolder: () => ipcRenderer.invoke('recording:get-folder'),
+  pickRecordingFolder: () => ipcRenderer.invoke('recording:pick-folder'),
+  saveRecording: (payload) => ipcRenderer.invoke('recording:save', payload),
+  openRecordingFolder: () => ipcRenderer.invoke('recording:open-folder'),
   // Alinan dosyayi diske kaydet (kaydetme penceresi ana surecte acilir).
   saveFile: (payload) => ipcRenderer.invoke('file:save', payload),
   // Coklu monitor: paylasilan ekrani oturum ortasinda degistirme.

@@ -492,6 +492,82 @@ ipcMain.on('clipboard:write', (e, payload) => {
   try { clipboard.writeText(text); } catch { /* yok say */ }
 });
 
+// -- Oturum kaydi: hedef klasor ve diske yazma --------------------------------
+// GUVENLIK: kayit klasorunu RENDERER BELIRLEMEZ. Yol yalnizca kullanicinin
+// yerel klasor secme penceresinden gelir ve ana surecte saklanir; renderer
+// yalnizca "kaydet" diyebilir. Boylece web icerigi ele gecirilse bile
+// dosyayi istedigi yere yazdiramaz (orn. Baslangic klasoru).
+//
+// Kayit dosyasi ASLA Arku sunucularina gitmez; yalnizca bu makinede
+// kullanicinin sectigi klasorde durur.
+const RECORDING_CONFIG_FILE = () => path.join(app.getPath('userData'), 'arku-recording.json');
+
+function readRecordingFolder() {
+  try {
+    const raw = fs.readFileSync(RECORDING_CONFIG_FILE(), 'utf8');
+    const cfg = JSON.parse(raw);
+    const dir = typeof cfg.folder === 'string' ? cfg.folder : '';
+    // Klasor silinmis olabilir; yoksa bos don ki arayuz tekrar sorsun.
+    return dir && fs.existsSync(dir) ? dir : '';
+  } catch { return ''; }
+}
+
+function writeRecordingFolder(dir) {
+  try {
+    fs.writeFileSync(RECORDING_CONFIG_FILE(), JSON.stringify({ folder: dir }), 'utf8');
+    return true;
+  } catch { return false; }
+}
+
+ipcMain.handle('recording:get-folder', () => readRecordingFolder());
+
+ipcMain.handle('recording:pick-folder', async (e) => {
+  const win = BrowserWindow.fromWebContents(e.sender);
+  const { canceled, filePaths } = await dialog.showOpenDialog(win, {
+    title: 'Kayitlarin saklanacagi klasoru secin',
+    properties: ['openDirectory', 'createDirectory'],
+  });
+  if (canceled || !filePaths || !filePaths[0]) return readRecordingFolder();
+  writeRecordingFolder(filePaths[0]);
+  return filePaths[0];
+});
+
+// Dosya adini ana surec uretir; renderer'dan gelen ad kullanilmaz (yol gecisi).
+ipcMain.handle('recording:save', async (e, payload) => {
+  const data = payload && payload.data;
+  if (!data) return { ok: false, error: 'Veri yok' };
+
+  let dir = readRecordingFolder();
+  if (!dir) {
+    // Klasor henuz secilmemis: kaydetme penceresiyle sor.
+    const win = BrowserWindow.fromWebContents(e.sender);
+    const { canceled, filePaths } = await dialog.showOpenDialog(win, {
+      title: 'Kayitlarin saklanacagi klasoru secin',
+      properties: ['openDirectory', 'createDirectory'],
+    });
+    if (canceled || !filePaths || !filePaths[0]) return { ok: false, cancelled: true };
+    dir = filePaths[0];
+    writeRecordingFolder(dir);
+  }
+
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const peer = String((payload && payload.peer) || 'oturum').replace(/[^A-Za-z0-9._-]/g, '').slice(0, 40);
+  const file = path.join(dir, `arku-${stamp}-${peer || 'oturum'}.webm`);
+  try {
+    await fs.promises.writeFile(file, Buffer.from(data));
+    return { ok: true, path: file, folder: dir };
+  } catch (err) {
+    return { ok: false, error: String((err && err.message) || err) };
+  }
+});
+
+ipcMain.handle('recording:open-folder', async () => {
+  const dir = readRecordingFolder();
+  if (!dir) return false;
+  shell.openPath(dir);
+  return true;
+});
+
 // -- Alinan dosyayi diske yaz --------------------------------------------------
 // GUVENLIK: dosya adini KARSI TARAF belirler. path.basename ile yol
 // ayiricilari temizlenmezse "../../Startup/x.exe" gibi bir ad varsayilan
