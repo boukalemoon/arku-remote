@@ -167,6 +167,18 @@ export default function App() {
   const [passwordChangeDone, setPasswordChangeDone] = React.useState(false);
   const [profileUpdateDone, setProfileUpdateDone] = React.useState(false);
   const [connectionId, setConnectionId] = React.useState(() => getOrCreateGuestId());
+  /**
+   * Kimlik SUNUCU tarafindan taniniyor mu?
+   *
+   * Oturum acilamazsa arayuz yine bir kimlik gosteriyordu ama o kimlik
+   * yalnizca localStorage'da vardi. signals RLS'i `arku_owns_identity(to_id)`
+   * istedigi ve politikalar `to authenticated` oldugu icin o kullaniciya
+   * gelen HICBIR sinyal okunamiyordu: karsi taraf ariyor, hicbir sey olmuyor,
+   * iki taraf da sebebini ogrenemiyordu. Artik kimlik hazir degilse arayuz
+   * bunu acikca soyluyor.
+   */
+  const [identityReady, setIdentityReady] = React.useState(false);
+  const [identityError, setIdentityError] = React.useState('');
   const [targetId, setTargetId] = React.useState('');
   // Arayanin girdigi oturum parolasi (karsi tarafin ekraninda yazan).
   const [targetPassword, setTargetPassword] = React.useState('');
@@ -616,6 +628,9 @@ export default function App() {
         // o kullanıcı kimliksiz — yani ulaşılamaz — kalıyordu.
         const { id: pid, fromServer } = await resolveMyConnectionId(user.id);
         setConnectionId(pid);
+        // Kimlik sunucuda kayitli: artik bu kimlige sinyal gelebilir.
+        setIdentityReady(true);
+        setIdentityError('');
         // Kimlik bağlama: bu satır, display kimliğini (123-456-789) auth.uid()'e
         // bağlar. signals RLS'ini kimliğe dayandırmanın ön koşulu budur —
         // misafirler dahil herkes için yazılır.
@@ -656,6 +671,8 @@ export default function App() {
           .catch(() => { /* RPC yoksa yok say */ });
       } else {
         setIsEmailVerified(true); setUserProfile(null); setSessionToken(''); setDeviceFingerprint(''); setConnectionId(getOrCreateGuestId());
+        // Oturum yok -> bu kimlige kimse ulasamaz.
+        setIdentityReady(false);
         setEntitlements(FREE_ENTITLEMENTS);
         setLogs([{ time: ts(), msg: `Arku Remote v${__APP_VERSION__} baslatildi...`, type: 'sys' }, { time: ts(), msg: 'Lutfen giris yapin.', type: 'warn' }]);
       }
@@ -670,21 +687,58 @@ export default function App() {
   // Supabase'de "Allow anonymous sign-ins" kapalıysa burası sessizce başarısız olur
   // ve uygulama bugünkü (oturumsuz misafir) davranışıyla çalışmaya devam eder.
   const anonBootstrapRef = React.useRef(false);
+
+  /**
+   * Oturum acmayi dener. Basarisizsa SEBEBI saklar ve gosterir.
+   *
+   * Eskiden hata `catch(() => {})` ile yutuluyor, yalnizca gunluge tek satir
+   * dusuyordu. Kullanici ekranda gecerli gorunen bir kimlik goruyor ama
+   * kimse ona ulasamiyordu.
+   */
+  const ensureSession = React.useCallback(async (): Promise<boolean> => {
+    const { data: { session } } = await supabase.auth.getSession();
+    if (session) {
+      // getSession YALNIZCA yereldeki kaydı okur — jeton iptal edilmiş ya da
+      // süresi dolmuş olabilir. Sunucuya sorup gerçekten geçerli mi diye
+      // bakmazsak "oturum var" sanıp hiç giriş yapmayız ve hiçbir isteği
+      // geçmeyen ölü bir oturumla kalırız: kullanıcı ekranda kimlik görür,
+      // ama kimse ona ulaşamaz.
+      const { error: userErr } = await supabase.auth.getUser();
+      if (!userErr) return true;
+      addLocalLog('Kayitli oturum gecersiz, yenisi aciliyor.', 'warn');
+      try { await supabase.auth.signOut({ scope: 'local' }); } catch { /* yok say */ }
+    }
+    const { error } = await supabase.auth.signInAnonymously();
+    if (!error) { setIdentityError(''); return true; }
+    setIdentityError(error.message || 'Bilinmeyen hata');
+    addLocalLog(`Oturum acilamadi: ${error.message}`, 'error');
+    return false;
+  }, []);
+
   React.useEffect(() => {
     // QRtım SSO dönüşünde atlanır; o akış kendi oturumunu açar.
     if (QRTIM_ENABLED && new URLSearchParams(window.location.search).get('qrtim_token')) return;
     if (anonBootstrapRef.current) return;
     anonBootstrapRef.current = true;
+    let cancelled = false;
     (async () => {
-      const { data: { session } } = await supabase.auth.getSession();
-      if (session) return;
-      const { error } = await supabase.auth.signInAnonymously();
-      if (error) {
-        anonBootstrapRef.current = false;
-        addLocalLog('Anonim oturum acilamadi, misafir modunda devam ediliyor.', 'warn');
+      // Gecici ag hatasi acilista siktir; birkac kez, artan bekleme ile dene.
+      for (let deneme = 1; deneme <= 3 && !cancelled; deneme++) {
+        if (await ensureSession()) return;
+        if (deneme < 3) await new Promise(r => setTimeout(r, deneme * 1500));
       }
+      if (!cancelled) anonBootstrapRef.current = false; // elle tekrar denenebilsin
     })();
-  }, []);
+    return () => { cancelled = true; };
+  }, [ensureSession]);
+
+  /** Arayuzdeki "Tekrar Dene" dugmesi. */
+  const retryIdentity = async () => {
+    setIdentityError('');
+    addLocalLog('Kimlik yeniden alinmaya calisiliyor...', 'info');
+    anonBootstrapRef.current = true;
+    if (!(await ensureSession())) anonBootstrapRef.current = false;
+  };
 
   // QRtım'den ?qrtim_token=... ile dönüşte tek noktadan işle:
   // oturum açıksa hesabı bağla, açık değilse QRtım ile giriş yap (SSO).
@@ -1465,6 +1519,13 @@ export default function App() {
 
   const handleConnect = async () => {
     if (!isRegistered && !isGuest) { setShowAuth(true); setAuthMode('login'); return; }
+    // Kimlik sunucuda yoksa baglanti kurulamaz: karsi taraf cevap verse bile
+    // yanit bize ulasmaz (RLS okumaya izin vermez). Zaman asimini beklemek
+    // yerine sebebi simdi soyleyelim.
+    if (!identityReady) {
+      addLog('Kimliginiz sunucuda olusturulamadi, baglanti kurulamaz. Kimlik kartindaki "Tekrar Dene" ile yeniden deneyin.', 'error');
+      return;
+    }
     if (isRegistered && !isEmailVerified) { addLog('Baglanmak icin e-posta dogrulamasi gerekli.', 'error'); setShowAuth(true); return; }
     if (!targetId.trim()) return;
     if (targetId.trim() === connectionId || (currentUser && targetId.trim() === currentUser.id)) { addLog('Kendi cihaziniza baglanamazsiniz.', 'error'); return; }
@@ -1750,11 +1811,37 @@ export default function App() {
               <div className="gokturk-border p-6 surface-card">
                 <p className="text-[10px] uppercase tracking-widest text-steppe-muted mb-4 flex items-center gap-2"><User size={12} className="text-steppe-gold" /> Sizin Kimliginiz</p>
                 <div className="flex items-center justify-between">
-                  <span className="text-2xl font-display text-steppe-gold">{connectionId}</span>
-                  <button onClick={copyId} className="p-2 border border-steppe-border hover:border-steppe-gold transition-colors text-steppe-muted hover:text-steppe-gold">
+                  {/* Kimlik sunucuda kayitli degilse numarayi gecerliymis gibi
+                      GOSTERME: kullanici onu karsi tarafa okur, kimse ulasamaz
+                      ve iki taraf da sebebini anlamaz. */}
+                  <span
+                    className="text-2xl font-display"
+                    style={{
+                      color: identityReady ? 'var(--accent-primary)' : 'var(--text-muted)',
+                      opacity: identityReady ? 1 : 0.45,
+                      textDecoration: identityReady ? 'none' : 'line-through',
+                    }}
+                  >{connectionId}</span>
+                  <button onClick={copyId} disabled={!identityReady}
+                    className="p-2 border border-steppe-border hover:border-steppe-gold transition-colors text-steppe-muted hover:text-steppe-gold disabled:opacity-30 disabled:cursor-not-allowed">
                     {copied ? <CheckCircle size={16} className="text-green-400" /> : <Copy size={16} />}
                   </button>
                 </div>
+                {!identityReady && (
+                  <div className="mt-3 p-3 border border-red-500/40 text-[10px] leading-relaxed text-red-300" style={{ background: 'rgba(239,68,68,0.08)' }}>
+                    <p className="mb-2">
+                      <strong>Kimliğiniz sunucuda oluşturulamadı.</strong> Bu kimliği karşı tarafa
+                      vermeyin — size ulaşamazlar.
+                    </p>
+                    {identityError && (
+                      <p className="mb-2 font-mono opacity-80 break-all">{identityError}</p>
+                    )}
+                    <button onClick={retryIdentity}
+                      className="text-[9px] uppercase tracking-widest border border-red-400/50 hover:border-red-400 px-2 py-1 transition-colors">
+                      Tekrar Dene
+                    </button>
+                  </div>
+                )}
                 <div className="flex items-center gap-2 mt-3">
                   <div className={`w-1.5 h-1.5 rounded-full ${isRegistered ? 'bg-green-400' : isGuest ? 'bg-yellow-400' : 'bg-gray-400'}`} />
                   <span className="text-[9px] text-steppe-muted uppercase tracking-widest">{isRegistered ? 'Profil ID' : isGuest ? 'Misafir ID' : 'Cihaz ID (Gecici)'}</span>
