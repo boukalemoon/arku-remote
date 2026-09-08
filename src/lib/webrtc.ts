@@ -92,6 +92,9 @@ export class WebRTCManager {
   /** Bu oturum için çözülmüş ICE yapılandırması (STUN + süreli TURN). */
   private iceConfig: IceConfig | null = null;
   private statsTimer: ReturnType<typeof setInterval> | null = null;
+  /** connections satirinin id'si — oturum bitince suresi yazilir. */
+  private connectionRowId: string | null = null;
+  private connectedAt: number | null = null;
   /** Bit hızı/kayıp farkını hesaplamak için bir önceki ölçüm. */
   private lastStatsSample: { at: number; bytes: number; lost: number; packets: number } | null = null;
 
@@ -441,18 +444,47 @@ export class WebRTCManager {
       const { data: { user } } = await supabase.auth.getUser();
       // Misafir (anonim) oturumda bağlantı geçmişi tutulmaz.
       if (!user || user.is_anonymous) return;
-      await supabase.from('connections').insert({
+      // Satırın id'si tutulur: oturum bitince süre ve bitiş zamanı yazılacak.
+      const { data, error } = await supabase.from('connections').insert({
         caller_id: user.id,
         receiver_id: this.peerId,
         status: 'active',
         duration_seconds: 0,
         created_at: new Date().toISOString(),
-      });
+      }).select('id').single();
+      if (error) throw new Error(error.message);
+      this.connectionRowId = (data as { id: string } | null)?.id ?? null;
+      this.connectedAt = Date.now();
       this.onConnectionSaved?.(this.peerId);
       this.log('Bağlantı geçmişe kaydedildi.', 'sys');
     } catch (err) {
       this.log(`Geçmiş kaydedilemedi: ${String(err)}`, 'warn');
     }
+  }
+
+  /**
+   * Oturumu geçmişte KAPATIR: bitiş zamanı, süre ve durum yazılır.
+   *
+   * Eskiden bu hiç yapılmıyordu — her kayıt sonsuza kadar status='active',
+   * duration_seconds=0 olarak kalıyordu. Bağlantı geçmişi hem yanıltıcıydı
+   * hem de KVKK/denetim izi olarak kullanılamıyordu.
+   *
+   * Beklenmez (fire-and-forget): kapanış akışını yavaşlatmamalı.
+   */
+  private finishConnectionRecord(): void {
+    const rowId = this.connectionRowId;
+    const startedAt = this.connectedAt;
+    this.connectionRowId = null;
+    this.connectedAt = null;
+    if (!rowId) return;
+    const seconds = startedAt ? Math.max(0, Math.round((Date.now() - startedAt) / 1000)) : 0;
+    void supabase.from('connections').update({
+      status: 'ended',
+      ended_at: new Date().toISOString(),
+      duration_seconds: seconds,
+    }).eq('id', rowId).then(({ error }) => {
+      if (error) this.log(`Oturum kaydı kapatılamadı: ${error.message}`, 'warn');
+    });
   }
 
   private sanitizeDescription(desc: Record<string, unknown>): RTCSessionDescriptionInit {
@@ -793,6 +825,8 @@ export class WebRTCManager {
   private close() {
     this.stopPolling();
     this.stopStats();
+    // Oturum suresi ve bitis zamani geceye yazilir (beklenmez).
+    this.finishConnectionRecord();
     this.dataChannel?.close();
     this.dataChannel = null;
     this.pc?.close();

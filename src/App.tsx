@@ -8,8 +8,9 @@ import {
   listOrgMembers, addOrgMember, updateOrgMember, removeOrgMember,
   listCategories, createCategory, deleteCategory,
   listSavedContacts, createSavedContact, deleteSavedContact, touchSavedContact,
+  fetchPresence, sendHeartbeat, bindOrgInvites,
 } from './lib/enterprise';
-import type { Organization, OrgMember, ContactCategory, SavedContact, OrgRole } from './lib/enterprise';
+import type { Organization, OrgMember, ContactCategory, SavedContact, OrgRole, PresenceRow } from './lib/enterprise';
 import type { User as SupabaseUser } from '@supabase/supabase-js';
 import { WebRTCManager } from './lib/webrtc';
 import type { ConnectionState, InputEventMsg, RtcQuality } from './lib/webrtc';
@@ -40,8 +41,47 @@ const generateDeviceFingerprint = (): string => {
 };
 const generateSessionToken = (): string => Array.from(crypto.getRandomValues(new Uint8Array(16))).map(b => b.toString(16).padStart(2, '0')).join('');
 const formatId = (raw: string): string => { const c = raw.replace(/\D/g, '').padStart(9, '0').slice(0, 9); return `${c.slice(0,3)}-${c.slice(3,6)}-${c.slice(6,9)}`; };
+/**
+ * ESKİ kimlik üretimi — yalnızca yedek yol olarak duruyor.
+ *
+ * 32-bit djb2 hash, sonra 9 haneye KIRPMA ("2147483647" -> "214748364").
+ * Doğum günü sınırı ~33.000 kullanıcıda %50. users.connection_id unique
+ * olduğu için çakışma yanlış kişiye bağlanmaya yol açmaz; onun yerine
+ * upsert sessizce başarısız olur ve kullanıcı ULAŞILAMAZ hâle gelir.
+ * arku_ensure_connection_id RPC'si uygulandıktan sonra bu yol kullanılmaz.
+ */
 const generateProfileId = (uid: string): string => formatId(Math.abs(uid.split('').reduce((a, c) => ((a << 5) - a + c.charCodeAt(0)) | 0, 0)).toString());
-const getOrCreateGuestId = (): string => { const k = 'arku_guest_id'; let id = localStorage.getItem(k); if (!id) { id = formatId(Math.abs(generateDeviceFingerprint().split('').reduce((a, c) => ((a << 5) - a + c.charCodeAt(0)) | 0, 0)).toString()); localStorage.setItem(k, id); } return id; };
+
+/**
+ * Kimliği sunucudan ister (benzersizliği veritabanı garanti eder).
+ * Migration henüz uygulanmamışsa eski istemci üretimine düşer, böylece
+ * migration ile uygulama sürümünün yayın sırası önemsizdir.
+ */
+const resolveMyConnectionId = async (uid: string): Promise<{ id: string; fromServer: boolean }> => {
+  try {
+    const { data, error } = await supabase.rpc('arku_ensure_connection_id');
+    if (!error && typeof data === 'string' && data.trim()) return { id: data.trim(), fromServer: true };
+  } catch { /* fonksiyon yok / ağ hatası — yedek yola düş */ }
+  return { id: generateProfileId(uid), fromServer: false };
+};
+/**
+ * Oturumsuz misafir kimliği.
+ *
+ * Eskiden cihaz PARMAK İZİNDEN türetiliyordu (userAgent + dil + çözünürlük +
+ * timezone + çekirdek sayısı). Aynı imajla kurulmuş kurumsal bir filoda tüm
+ * makineler aynı parmak izini üretir, dolayısıyla AYNI misafir kimliğini
+ * alırdı — çağrılar yanlış makinede çalardı. Artık rastgele.
+ */
+const getOrCreateGuestId = (): string => {
+  const k = 'arku_guest_id';
+  let id = localStorage.getItem(k);
+  if (!id) {
+    const n = (crypto.getRandomValues(new Uint32Array(1))[0] % 900000000) + 100000000;
+    id = formatId(String(n));
+    localStorage.setItem(k, id);
+  }
+  return id;
+};
 
 const THEMES: { id: Theme; label: string; color: string; light?: boolean }[] = [
   { id: 'otuken', label: 'Otüken', color: '#c5a059' },
@@ -129,6 +169,8 @@ export default function App() {
   const [organizations, setOrganizations] = React.useState<Organization[]>([]);
   const [activeOrgId, setActiveOrgId] = React.useState<string | null>(null);
   const [orgMembers, setOrgMembers] = React.useState<OrgMember[]>([]);
+  // Kayitli musterilerin cevrimici durumu (kimlik -> durum).
+  const [presence, setPresence] = React.useState<Map<string, PresenceRow>>(new Map());
   const caps = planCapabilities(entitlements.plan);
   const lastMouseMoveRef = React.useRef(0);
   // Şu an basılı tuttuğumuz tuşlar (KeyboardEvent.code). Odak kaybedilirse
@@ -472,15 +514,25 @@ export default function App() {
       if (user) {
         // Anonim kullanıcının doğrulanacak bir e-postası yoktur.
         setIsEmailVerified(anon || !!user.email_confirmed_at);
-        const pid = generateProfileId(user.id);
-        setConnectionId(pid);
         setSessionToken(generateSessionToken());
         const fp = generateDeviceFingerprint();
         setDeviceFingerprint(fp);
+        // Kimlik artık SUNUCUDA üretiliyor: benzersizliği veritabanı garanti
+        // eder ve mevcut kimlik asla değişmez. Eski istemci üretimi 32-bit
+        // hash'ti; çakışan kullanıcının upsert'ü sessizce başarısız oluyor ve
+        // o kullanıcı kimliksiz — yani ulaşılamaz — kalıyordu.
+        const { id: pid, fromServer } = await resolveMyConnectionId(user.id);
+        setConnectionId(pid);
         // Kimlik bağlama: bu satır, display kimliğini (123-456-789) auth.uid()'e
         // bağlar. signals RLS'ini kimliğe dayandırmanın ön koşulu budur —
         // misafirler dahil herkes için yazılır.
-        await supabase.from('users').upsert({ id: user.id, email: user.email ?? null, connection_id: pid, device_fingerprint: fp, last_seen: new Date().toISOString() }, { onConflict: 'id' });
+        const profileRow: Record<string, unknown> = {
+          id: user.id, email: user.email ?? null,
+          device_fingerprint: fp, last_seen: new Date().toISOString(),
+        };
+        // Sunucu atadıysa kimliği tekrar yazmayız (RPC zaten yazdı).
+        if (!fromServer) profileRow.connection_id = pid;
+        await supabase.from('users').upsert(profileRow, { onConflict: 'id' });
         if (anon) {
           // Misafir: profil/geçmiş/abonelik yüklenmez, kayıt tutulmaz.
           setUserProfile(null);
@@ -503,6 +555,12 @@ export default function App() {
         const { data: cxData } = await supabase.from('connections').select('*').eq('caller_id', user.id).order('created_at', { ascending: false }).limit(20);
         if (cxData) setConnectionHistory(cxData as ConnectionEntry[]);
         setEntitlements(await fetchEntitlements());
+        // Kurumsal davetleri hesaba bagla. Bu cagri olmadan admin'in ekledigi
+        // cihaz etiketleri hicbir zaman cozumlenmez ve kurumsal vanity kimlik
+        // (acme-01) calismaz — organization_members.user_id NULL kalirdi.
+        bindOrgInvites()
+          .then(n => { if (n > 0) addLocalLog(`${n} kurumsal davet hesabiniza baglandi.`, 'sys'); })
+          .catch(() => { /* RPC yoksa yok say */ });
       } else {
         setIsEmailVerified(true); setUserProfile(null); setSessionToken(''); setDeviceFingerprint(''); setConnectionId(getOrCreateGuestId());
         setEntitlements(FREE_ENTITLEMENTS);
@@ -757,6 +815,31 @@ export default function App() {
   React.useEffect(() => {
     if (activeOrgId) listOrgMembers(activeOrgId).then(setOrgMembers); else setOrgMembers([]);
   }, [activeOrgId]);
+
+  // Kalp atışı: karşı taraf bizi ancak last_seen güncel kalırsa "çevrimiçi"
+  // görebilir. 60 sn aralık, sunucudaki 90 sn eşiğiyle uyumlu — bir atış
+  // kaçtığında cihaz çevrimdışı görünmez.
+  React.useEffect(() => {
+    if (!currentUser) return;
+    const uid = currentUser.id;
+    const beat = () => { sendHeartbeat(uid).catch(() => { /* geçici ağ hatası */ }); };
+    beat();
+    const timer = setInterval(beat, 60000);
+    // Sekme geri geldiğinde hemen bildir (uyku sonrası bekleme olmasın).
+    const onVisible = () => { if (!document.hidden) beat(); };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => { clearInterval(timer); document.removeEventListener('visibilitychange', onVisible); };
+  }, [currentUser?.id]);
+
+  // Kayıtlı müşterilerin çevrimiçi durumu — yalnızca Kayıtlı sekmesi açıkken.
+  React.useEffect(() => {
+    if (activeTab !== 'contacts' || savedContacts.length === 0) { return; }
+    const ids = savedContacts.map(c => c.connection_id);
+    const load = () => { fetchPresence(ids).then(setPresence).catch(() => { /* RPC yoksa boş kalır */ }); };
+    load();
+    const timer = setInterval(load, 30000);
+    return () => clearInterval(timer);
+  }, [activeTab, savedContacts]);
 
   // ── Kayıtlı müşteri form durumu + eylemleri ────────────────────────────────
   const [scConnId, setScConnId] = React.useState('');
@@ -1624,10 +1707,23 @@ export default function App() {
                   <div className="space-y-2">
                     {savedContacts.map(sc => {
                       const cat = categories.find(c => c.id === sc.category_id);
+                      // Durum bilinmiyorsa (RPC yok / hiç okunmadı) nokta gösterilmez;
+                      // "çevrimdışı" demek yanlış bilgi vermek olurdu.
+                      const pres = presence.get(sc.connection_id);
                       return (
                         <div key={sc.id} className="flex items-center justify-between p-3 border border-steppe-border hover:border-steppe-gold transition-colors">
                           <div className="min-w-0">
                             <div className="flex items-center gap-2">
+                              {pres && (
+                                <span
+                                  title={pres.online
+                                    ? 'Cevrimici'
+                                    : pres.last_seen
+                                      ? `Son gorulme: ${new Date(pres.last_seen).toLocaleString('tr-TR')}`
+                                      : 'Cevrimdisi'}
+                                  className={`w-2 h-2 rounded-full shrink-0 ${pres.online ? 'bg-green-400' : 'bg-steppe-muted opacity-40'}`}
+                                />
+                              )}
                               <span className="text-sm text-steppe-gold font-mono">{sc.connection_id}</span>
                               {sc.org_id && <span className="text-[8px] uppercase tracking-widest text-steppe-muted border border-steppe-border px-1">Kurumsal</span>}
                               {cat && <span className="text-[8px] uppercase tracking-widest px-1.5 py-0.5 flex items-center gap-1" style={{ color: cat.color }}><span className="w-1.5 h-1.5 rounded-full" style={{ background: cat.color }} />{cat.name}</span>}

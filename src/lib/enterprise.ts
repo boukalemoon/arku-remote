@@ -166,6 +166,49 @@ export async function deleteSavedContact(id: string): Promise<{ error?: string }
   return error ? { error: error.message } : {};
 }
 
+// ── Çevrimiçi durum (presence) ──────────────────────────────────────────────
+// users tablosunun RLS'i başkasının satırını vermez (PII koruması). Bu yüzden
+// durum bilgisi yalnızca kimlik + son görülme döndüren bir RPC'den gelir.
+
+export interface PresenceRow {
+  connection_id: string;
+  last_seen: string | null;
+  online: boolean;
+}
+
+/**
+ * Verilen kimliklerin çevrimiçi durumunu getirir.
+ * RPC henüz uygulanmadıysa (eski şema) boş harita döner — arayüz durumu
+ * "bilinmiyor" olarak gösterir, hiçbir şey bozulmaz.
+ */
+export async function fetchPresence(ids: string[]): Promise<Map<string, PresenceRow>> {
+  const unique = Array.from(new Set(ids.filter(Boolean))).slice(0, 200);
+  if (unique.length === 0) return new Map();
+  const { data, error } = await supabase.rpc('arku_presence', { p_ids: unique });
+  if (error || !Array.isArray(data)) return new Map();
+  return new Map((data as PresenceRow[]).map((r) => [r.connection_id, r]));
+}
+
+/**
+ * Kendi son görülme zamanımızı güncelle (kalp atışı).
+ * Karşı taraf bizim çevrimiçi olduğumuzu ancak böyle görebilir.
+ */
+export async function sendHeartbeat(userId: string): Promise<void> {
+  await supabase.from('users').update({ last_seen: new Date().toISOString() }).eq('id', userId);
+}
+
+/**
+ * Kullanıcının e-postasına açılmış kurumsal davetleri hesabına bağlar.
+ * Bu çağrı olmadan admin'in eklediği cihaz etiketleri hiçbir zaman
+ * çözümlenemez ve kurumsal vanity kimlik (acme-01) çalışmaz.
+ * Bağlanan satır sayısını döndürür; RPC yoksa 0.
+ */
+export async function bindOrgInvites(): Promise<number> {
+  const { data, error } = await supabase.rpc('arku_bind_org_invites');
+  if (error || typeof data !== 'number') return 0;
+  return data;
+}
+
 export async function touchSavedContact(connectionId: string): Promise<void> {
   // Bir kayıtlı kişiye bağlanınca son bağlantı zamanını güncelle (varsa)
   await supabase.from('saved_contacts')
