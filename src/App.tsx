@@ -232,6 +232,8 @@ export default function App() {
   // Coklu monitor: karsi tarafin ekran listesi ve su an paylasilan ekran.
   const [remoteScreens, setRemoteScreens] = React.useState<RemoteScreen[]>([]);
   const [currentRemoteScreen, setCurrentRemoteScreen] = React.useState('');
+  // Baglanti dogrulama kodu (SAS) — iki ekranda ayni olmali.
+  const [verifyCode, setVerifyCode] = React.useState<string | null>(null);
   // Dosya transferi: gelen teklif ve devam eden aktarimin ilerlemesi.
   const [incomingFile, setIncomingFile] = React.useState<FileOffer | null>(null);
   const [fileProgress, setFileProgress] = React.useState<{ id: string; done: number; total: number; dir: 'in' | 'out' } | null>(null);
@@ -868,7 +870,7 @@ export default function App() {
     resetIceCache();
     setCurrentUser(null); setUserProfile(null); setGuestChoice(false); setConnectionHistory([]);
     setQrtimUser(null);
-    setRemoteStream(null); setQuality(null); setRtcState('idle'); setIsConnecting(false);
+    setRemoteStream(null); setQuality(null); setVerifyCode(null); setRtcState('idle'); setIsConnecting(false);
     setConnectionId(getOrCreateGuestId()); setDisplayName(''); setPhone(''); setSessionToken(''); setDeviceFingerprint('');
     setActiveTab('dashboard'); addLocalLog('Oturum kapatildi.', 'warn');
     // Çıkıştan sonra da ulaşılabilir kal (RLS oturum ister), ama kullanıcı
@@ -1295,6 +1297,7 @@ export default function App() {
     const myId = currentUser?.id || connectionId;
     const m = new WebRTCManager(myId);
     m.onQuality = setQuality;
+    m.onVerification = setVerifyCode;
     m.onFile = async (ev) => {
       if (ev.t === 'offer') { setIncomingFile(ev.offer); return; }
       if (ev.t === 'accepted') { addLocalLog('Karsi taraf dosyayi kabul etti, gonderiliyor...', 'sys'); return; }
@@ -1425,6 +1428,7 @@ export default function App() {
         setIsConnecting(false);
         setRemoteStream(null);
         setQuality(null);
+        setVerifyCode(null);
         setRemoteScreens([]);
         setInputEnabled(false);
         disableRemoteControl();
@@ -1466,7 +1470,7 @@ export default function App() {
     if (targetId.trim() === connectionId || (currentUser && targetId.trim() === currentUser.id)) { addLog('Kendi cihaziniza baglanamazsiniz.', 'error'); return; }
 
     if (webrtc) await webrtc.disconnect();
-    setWebrtc(null); setRemoteStream(null); setQuality(null); setRtcState('idle'); setIsConnecting(true);
+    setWebrtc(null); setRemoteStream(null); setQuality(null); setVerifyCode(null); setRtcState('idle'); setIsConnecting(true);
     addLog(`${targetId} adresine baglaniliyor...${EMBED.op ? ` (operator: ${EMBED.op})` : ''}`, 'warn');
     resetSessionEvents();
     postSessionEvent('connecting', targetId, EMBED.mode);
@@ -1570,7 +1574,12 @@ export default function App() {
       };
     });
 
-    try { await m.accept(fromId, offerPayload, screen, { sessionId, addressedAs: toId, offerSignalId: signalId }); }
+    // DIKKAT: turetmede ARAYANIN gonderdigi parola kullanilir, bizimki degil.
+    // Parola zorunlu degilken arayan bos ya da baska bir sey gondermis
+    // olabilir; kendi parolamizi kullanirsak kodlar tutmaz ve kullaniciya
+    // sahte bir 'araya girme' uyarisi gostermis oluruz.
+    const offeredPw = String((offerPayload as { pw?: unknown })?.pw ?? '');
+    try { await m.accept(fromId, offerPayload, screen, { sessionId, addressedAs: toId, offerSignalId: signalId, password: offeredPw }); }
     catch (err) {
       screen?.getTracks().forEach(t => { t.onended = null; t.stop(); });
       addLog(`Baglaniti kabul edilemedi: ${String(err)}`, 'error');
@@ -1602,7 +1611,7 @@ export default function App() {
     // Ekran paylaşımını ve arayüzü önce durdur, teardown'ı sonra bekle.
     const m = webrtc;
     if (localVideoRef.current?.srcObject) { (localVideoRef.current.srcObject as MediaStream)?.getTracks().forEach(t => t.stop()); localVideoRef.current.srcObject = null; }
-    setWebrtc(null); setRemoteStream(null); setQuality(null); setRtcState('idle'); setIsConnecting(false);
+    setWebrtc(null); setRemoteStream(null); setQuality(null); setVerifyCode(null); setRtcState('idle'); setIsConnecting(false);
     addLog('Baglaniti kesildi.', 'warn');
     postSessionEvent('ended', targetId, EMBED.mode);
     try { await m?.disconnect(); } catch { /* teardown hatasi arayuzu etkilemesin */ }
@@ -1864,6 +1873,18 @@ export default function App() {
                   {rtcState === 'connected' && quality && (
                     <div className="mt-2 pt-2 border-t" style={{ borderColor: 'var(--border-primary)' }}>
                       <QualityChips />
+                    </div>
+                  )}
+                  {/* Baglanti dogrulama kodu. Iki ekrandaki kod AYNI degilse
+                      araya giren biri var demektir. */}
+                  {rtcState === 'connected' && verifyCode && (
+                    <div className="mt-2 pt-2 border-t flex items-center gap-2 flex-wrap" style={{ borderColor: 'var(--border-primary)' }}>
+                      <Shield size={11} className="text-steppe-gold shrink-0" />
+                      <span className="text-[9px] uppercase tracking-widest text-steppe-muted">Dogrulama</span>
+                      <span className="text-sm font-display tracking-[0.25em] text-steppe-gold select-all">{verifyCode}</span>
+                      <span className="text-[9px] text-steppe-muted leading-tight">
+                        Karsi taraftaki kodla ayni mi? Degilse baglantiyi kesin.
+                      </span>
                     </div>
                   )}
                   {/* Dosya transferi - her iki taraf da gonderebilir; alan taraf

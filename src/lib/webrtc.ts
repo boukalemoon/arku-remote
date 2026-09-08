@@ -1,5 +1,6 @@
 import { supabase } from './supabase';
 import { getIceConfig, describeIce } from './ice';
+import { fingerprintFromSdp, deriveVerificationCode } from './verify';
 import type { IceConfig } from './ice';
 
 export type ConnectionState = 'idle' | 'connecting' | 'connected' | 'disconnected';
@@ -141,6 +142,8 @@ export class WebRTCManager {
   /** Bu oturum için çözülmüş ICE yapılandırması (STUN + süreli TURN). */
   private iceConfig: IceConfig | null = null;
   private statsTimer: ReturnType<typeof setInterval> | null = null;
+  /** Bu oturumun parolasi — dogrulama kodu turetmesine karisir. */
+  private sessionPassword = '';
   /** connections satirinin id'si — oturum bitince suresi yazilir. */
   private connectionRowId: string | null = null;
   private connectedAt: number | null = null;
@@ -162,6 +165,8 @@ export class WebRTCManager {
   onControl?: (msg: ControlMsg) => void;
   /** Dosya transferi olaylari. */
   onFile?: (ev: FileEvent) => void;
+  /** Baglanti dogrulama kodu (SAS). Baglanti kurulunca bir kez gelir. */
+  onVerification?: (code: string | null) => void;
 
   constructor(myId: string) {
     this.myId = myId;
@@ -304,6 +309,7 @@ export class WebRTCManager {
         this.log('P2P bağlantısı kuruldu!', 'sys');
         this.saveConnection();
         this.startStats();
+        void this.computeVerification();
       } else if (s === 'disconnected') {
         this.onStateChange?.('connecting');
       } else if (s === 'failed' || s === 'closed') {
@@ -400,6 +406,23 @@ export class WebRTCManager {
     } catch (err) {
       this.log(`Video kodlayıcı ayarlanamadı (varsayılanlarla devam): ${String(err)}`, 'warn');
     }
+  }
+
+  /**
+   * Bağlantı doğrulama kodunu (SAS) hesaplar ve arayüze bildirir.
+   *
+   * Kod, iki tarafın DTLS sertifika parmak izinden türetilir. Sinyalleşmeyi
+   * ele geçirip araya giren biri iki AYRI DTLS oturumu kurmak zorundadır;
+   * o zaman parmak izleri farklı olur ve iki ekrandaki kod TUTMAZ.
+   * Detaylı gerekçe: lib/verify.ts
+   */
+  private async computeVerification(): Promise<void> {
+    const local = fingerprintFromSdp(this.pc?.localDescription?.sdp);
+    const remote = fingerprintFromSdp(this.pc?.remoteDescription?.sdp);
+    if (!local || !remote) { this.onVerification?.(null); return; }
+    const code = await deriveVerificationCode(local, remote, this.sessionPassword);
+    this.onVerification?.(code);
+    if (code) this.log(`Bağlantı doğrulama kodu: ${code}`, 'sys');
   }
 
   // ── Kalite telemetrisi ─────────────────────────────────────────────────────
@@ -742,6 +765,7 @@ export class WebRTCManager {
   // Böylece kimliği bilen/tahmin eden herkesin karşı tarafı çaldırması biter.
   async call(peerId: string, opts: { password?: string } = {}): Promise<void> {
     if (peerId === this.myId) throw new Error('Kendi cihazınıza bağlanamazsınız.');
+    this.sessionPassword = opts.password ?? '';
 
     this.isReceiver = false;
     this.setPeer(peerId);
@@ -798,9 +822,10 @@ export class WebRTCManager {
     fromId: string,
     offerPayload: Record<string, unknown>,
     screenStream: MediaStream,
-    opts: { sessionId?: string; addressedAs?: string; offerSignalId?: string } = {},
+    opts: { sessionId?: string; addressedAs?: string; offerSignalId?: string; password?: string } = {},
   ): Promise<void> {
     const { sessionId, addressedAs, offerSignalId } = opts;
+    this.sessionPassword = opts.password ?? '';
     this.isReceiver = true;
     if (addressedAs && addressedAs.trim()) this.myId = addressedAs.trim();
     this.setPeer(fromId);
@@ -1069,6 +1094,8 @@ export class WebRTCManager {
     if (this.outgoingFile) this.outgoingFile.cancelled = true;
     this.outgoingFile = null;
     this.incomingFile = null;
+    this.sessionPassword = '';
+    this.onVerification?.(null);
     // Oturum suresi ve bitis zamani geceye yazilir (beklenmez).
     this.finishConnectionRecord();
     this.dataChannel?.close();
