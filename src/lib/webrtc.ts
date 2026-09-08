@@ -664,7 +664,11 @@ export class WebRTCManager {
   }
 
   // CALLER – sends offer, waits for receiver's screen
-  async call(peerId: string): Promise<void> {
+  //
+  // `password`: alıcının ekranında gösterdiği oturum parolası. Alıcı bunu
+  // kendi parolasıyla karşılaştırır; tutmazsa çağrı hiç gösterilmeden reddedilir.
+  // Böylece kimliği bilen/tahmin eden herkesin karşı tarafı çaldırması biter.
+  async call(peerId: string, opts: { password?: string } = {}): Promise<void> {
     if (peerId === this.myId) throw new Error('Kendi cihazınıza bağlanamazsınız.');
 
     this.isReceiver = false;
@@ -696,7 +700,12 @@ export class WebRTCManager {
 
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
-    await this.send('offer', offer);
+    // Parola offer ile birlikte gider. Alıcı, sanitizeDescription ile yalnızca
+    // {type, sdp} alanlarını setRemoteDescription'a verdiği için ek alan zararsızdır.
+    await this.send('offer', {
+      type: offer.type, sdp: offer.sdp,
+      ...(opts.password ? { pw: opts.password } : {}),
+    });
 
     this.log('Bağlantı isteği gönderildi, yanıt bekleniyor...');
     this.cleanupTimer = setInterval(() => this.cleanSignals(), 30000);

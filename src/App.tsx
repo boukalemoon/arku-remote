@@ -40,6 +40,25 @@ const generateDeviceFingerprint = (): string => {
   return Math.abs(raw.split('').reduce((a, c) => ((a << 5) - a + c.charCodeAt(0)) | 0, 0)).toString(36).toUpperCase();
 };
 const generateSessionToken = (): string => Array.from(crypto.getRandomValues(new Uint8Array(16))).map(b => b.toString(16).padStart(2, '0')).join('');
+
+/**
+ * Oturum parolası alfabesi — telefonda okunacak bir değer olduğu için
+ * karıştırılabilen karakterler (0/O, 1/I/L) çıkarılmıştır.
+ * 32 karakter, 256 % 32 === 0 olduğu için modulo sapması yok.
+ */
+const PW_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+
+/**
+ * Her oturum için yeni üretilen 6 karakterlik parola (~1,07 milyar olasılık).
+ *
+ * NEDEN: Eskiden kimliği bilen HERKES karşı tarafı çaldırabiliyordu ve
+ * kimlikler 9 haneli olduğu için taranabilirdi. Parola, "kimliği bilmek"
+ * ile "bağlanma yetkisi" arasındaki farkı kurar — TeamViewer'ın temel
+ * güvenlik modeli budur.
+ */
+const generateSessionPassword = (): string =>
+  Array.from(crypto.getRandomValues(new Uint8Array(6)))
+    .map(b => PW_ALPHABET[b % PW_ALPHABET.length]).join('');
 const formatId = (raw: string): string => { const c = raw.replace(/\D/g, '').padStart(9, '0').slice(0, 9); return `${c.slice(0,3)}-${c.slice(3,6)}-${c.slice(6,9)}`; };
 /**
  * ESKİ kimlik üretimi — yalnızca yedek yol olarak duruyor.
@@ -130,6 +149,19 @@ export default function App() {
   const [profileUpdateDone, setProfileUpdateDone] = React.useState(false);
   const [connectionId, setConnectionId] = React.useState(() => getOrCreateGuestId());
   const [targetId, setTargetId] = React.useState('');
+  // Arayanin girdigi oturum parolasi (karsi tarafin ekraninda yazan).
+  const [targetPassword, setTargetPassword] = React.useState('');
+  // Bu cihazin gecerli oturum parolasi. Her oturum bitiminde yenilenir.
+  const [sessionPassword, setSessionPassword] = React.useState(() => generateSessionPassword());
+  const [requirePassword, setRequirePassword] = React.useState(() => {
+    try { return localStorage.getItem('arku_require_password') !== '0'; } catch { return true; }
+  });
+  // processIncomingOffer, bagimliliklari dar olan bir effect icinden cagriliyor;
+  // parola durumunu ref uzerinden okumak bayat closure'i onler.
+  const sessionPasswordRef = React.useRef(sessionPassword);
+  const requirePasswordRef = React.useRef(requirePassword);
+  // Kaba kuvvet frenleme: from_id basina yanlis deneme sayisi.
+  const badPasswordTriesRef = React.useRef(new Map<string, number>());
   const [connectionHistory, setConnectionHistory] = React.useState<ConnectionEntry[]>([]);
   const [copied, setCopied] = React.useState(false);
   const [sessionToken, setSessionToken] = React.useState('');
@@ -285,6 +317,8 @@ export default function App() {
   React.useEffect(() => { rtcStateRef.current = rtcState; }, [rtcState]);
   React.useEffect(() => { webrtcRef.current = webrtc; }, [webrtc]);
   React.useEffect(() => { remoteControlAllowedRef.current = remoteControlAllowed; }, [remoteControlAllowed]);
+  React.useEffect(() => { sessionPasswordRef.current = sessionPassword; }, [sessionPassword]);
+  React.useEffect(() => { requirePasswordRef.current = requirePassword; }, [requirePassword]);
   React.useEffect(() => { document.documentElement.setAttribute('data-theme', theme); }, [theme]);
   React.useEffect(() => { if (showAuth && authMode === 'mfa') setTimeout(() => mfaRefs.current[0]?.focus(), 100); }, [showAuth, authMode]);
   React.useEffect(() => {
@@ -375,11 +409,11 @@ export default function App() {
 
   // Meşgul/red bildirimini, arayanın bizi çağırdığı kimlikle imzala; aksi halde
   // arayan bu sinyali "başkasından" sanıp yok sayar.
-  const sendBusySignal = async (toId: string, addressedAs?: string) => {
+  const sendBusySignal = async (toId: string, addressedAs?: string, reason = 'busy') => {
     try {
       await supabase.from('signals').insert({
         from_id: addressedAs || currentUser?.id || connectionId,
-        to_id: toId, type: 'hangup', payload: { reason: 'busy' },
+        to_id: toId, type: 'hangup', payload: { reason },
       });
     } catch { /* bildirim gönderilemedi — arayan zaman aşımına düşer */ }
   };
@@ -398,6 +432,24 @@ export default function App() {
 
     const decision = decideIncomingOffer(sig.from_id);
     if (decision === 'ignore') return;
+
+    // Parola kontrolu, cagri ekranda GOSTERILMEDEN ve kendi giden cagrimiz
+    // geri cekilmeden ONCE yapilir: yanlis parola ile arayan ne rahatsizlik
+    // verebilir ne de cagri cakismasi uydurup bizi geri cekilmeye zorlayabilir.
+    // Kimligi bilmek artik tek basina yetmiyor.
+    if (requirePasswordRef.current) {
+      const given = String((sig.payload as { pw?: unknown } | null)?.pw ?? '').trim().toUpperCase();
+      if (given !== sessionPasswordRef.current) {
+        const tries = (badPasswordTriesRef.current.get(sig.from_id) ?? 0) + 1;
+        badPasswordTriesRef.current.set(sig.from_id, tries);
+        addLocalLog(`${sig.from_id} yanlis parola ile baglanmak istedi (${tries}. deneme).`, 'warn');
+        // Ilk denemelerde sebebi bildir ki mesru kullanici parolayi duzeltsin;
+        // sonrasinda sessizce yut — kaba kuvvet icin geri bildirim vermeyelim.
+        if (tries <= 3) await sendBusySignal(sig.from_id, sig.to_id, 'badpass');
+        return;
+      }
+      badPasswordTriesRef.current.delete(sig.from_id);
+    }
     if (decision === 'busy') {
       addLocalLog(`${sig.from_id} baglanmak istedi, mesgul oldugunuz bildirildi.`, 'warn');
       await sendBusySignal(sig.from_id, sig.to_id);
@@ -434,9 +486,14 @@ export default function App() {
             addLocalLog(
               reason === 'busy' ? 'Karsi taraf mesgul, su an baska bir oturumda.'
               : reason === 'rejected' ? 'Baglanti istegi reddedildi.'
+              : reason === 'badpass' ? 'Oturum parolasi hatali. Karsi tarafin ekranindaki parolayi kontrol edin.'
               : 'Karsi taraf baglantıyi kesti.',
               'warn',
             );
+            // Bekleyen 30 sn zaman aşımını iptal et. Aksi halde reddedilen veya
+            // yanlış parolayla düşen bir çağrıdan 30 sn SONRA "yanit vermedi
+            // (zaman asimi)" satırı düşüyor ve gerçek sebebin üstünü örtüyordu.
+            if (connTimeoutRef.current) { clearTimeout(connTimeoutRef.current); connTimeoutRef.current = null; }
             // Disconnect the active WebRTCManager (uses ref to avoid stale closure)
             webrtcRef.current?.disconnect().catch(() => {});
             setWebrtc(null);
@@ -816,6 +873,32 @@ export default function App() {
     if (activeOrgId) listOrgMembers(activeOrgId).then(setOrgMembers); else setOrgMembers([]);
   }, [activeOrgId]);
 
+  // Oturum bitince parolayı yenile — bir kez paylaşılan parola tekrar
+  // kullanılamasın. YALNIZCA gerçekten biten bir oturumdan sonra: aksi halde
+  // karşı taraf parolayı okuyup çevirene kadar parola değişebilirdi.
+  const prevRtcStateRef = React.useRef<ConnectionState>('idle');
+  React.useEffect(() => {
+    const prev = prevRtcStateRef.current;
+    prevRtcStateRef.current = rtcState;
+    if (rtcState === 'idle' && (prev === 'connected' || prev === 'disconnected')) {
+      setSessionPassword(generateSessionPassword());
+      badPasswordTriesRef.current.clear();
+      addLocalLog('Oturum parolasi yenilendi.', 'sys');
+    }
+  }, [rtcState]);
+
+  const regenerateSessionPassword = () => {
+    setSessionPassword(generateSessionPassword());
+    badPasswordTriesRef.current.clear();
+    addLocalLog('Oturum parolasi yenilendi.', 'sys');
+  };
+
+  const toggleRequirePassword = (v: boolean) => {
+    setRequirePassword(v);
+    try { localStorage.setItem('arku_require_password', v ? '1' : '0'); } catch { /* yok say */ }
+    addLocalLog(v ? 'Baglanti icin parola zorunlu.' : 'Parola zorunlulugu kapatildi.', v ? 'sys' : 'warn');
+  };
+
   // Kalp atışı: karşı taraf bizi ancak last_seen güncel kalırsa "çevrimiçi"
   // görebilir. 60 sn aralık, sunucudaki 90 sn eşiğiyle uyumlu — bir atış
   // kaçtığında cihaz çevrimdışı görünmez.
@@ -1185,7 +1268,7 @@ export default function App() {
 
     const m = buildManager();
     setWebrtc(m);
-    try { await m.call(peerSignalId); }
+    try { await m.call(peerSignalId, { password: targetPassword.trim().toUpperCase() }); }
     catch (err) { postSessionEvent('error', targetId, EMBED.mode); addLog(`Baglantiyi gonderilemedi: ${String(err)}`, 'error'); setWebrtc(null); setIsConnecting(false); return; }
     // Kayıtlı bir müşteriye bağlanıldıysa son bağlantı zamanını güncelle (RLS izin verirse)
     if (currentUser) touchSavedContact(normalizedTarget).catch(() => {});
@@ -1429,6 +1512,39 @@ export default function App() {
                     </span>
                   )}
                 </div>
+                {/* Oturum parolasi — kimlikle birlikte karsi tarafa okunur.
+                    Kimligi bilmek tek basina baglanmaya yetmez. */}
+                <div className="mt-4 pt-4 border-t" style={{ borderColor: 'var(--border-primary)' }}>
+                  <div className="flex items-center justify-between mb-2">
+                    <p className="text-[10px] uppercase tracking-widest text-steppe-muted flex items-center gap-2">
+                      <Lock size={11} className="text-steppe-gold" /> Oturum Parolasi
+                    </p>
+                    <label className="flex items-center gap-1.5 cursor-pointer" title="Kapatirsaniz kimliginizi bilen herkes size baglanma istegi gonderebilir.">
+                      <input
+                        type="checkbox"
+                        checked={requirePassword}
+                        onChange={e => toggleRequirePassword(e.target.checked)}
+                        className="w-3 h-3 accent-current"
+                        style={{ accentColor: 'var(--accent-primary)' }}
+                      />
+                      <span className="text-[9px] uppercase tracking-widest text-steppe-muted">Zorunlu</span>
+                    </label>
+                  </div>
+                  {requirePassword ? (
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-xl font-display tracking-[0.2em] text-steppe-gold select-all">{sessionPassword}</span>
+                      <button
+                        onClick={regenerateSessionPassword}
+                        className="text-[9px] uppercase tracking-widest text-steppe-muted hover:text-steppe-gold border border-steppe-border hover:border-steppe-gold px-2 py-1 transition-colors"
+                        title="Yeni parola uret"
+                      >Yenile</button>
+                    </div>
+                  ) : (
+                    <p className="text-[10px] text-yellow-400 leading-relaxed">
+                      Parola kapali. Kimliginizi bilen herkes baglanti istegi gonderebilir.
+                    </p>
+                  )}
+                </div>
                 {isRegistered && sessionToken && (
                   <div className="mt-2 p-2 border border-steppe-border" style={{ background: 'var(--log-bg)' }}>
                     <p className="text-[8px] text-steppe-muted font-mono">SESSION: {sessionToken.slice(0,8)}...</p>
@@ -1444,8 +1560,15 @@ export default function App() {
                   </div>
                 )}
                 <p className="text-[10px] uppercase tracking-widest text-steppe-muted mb-4 flex items-center gap-2"><Monitor size={12} className="text-steppe-gold" /> Uzak Masaustu Baglan</p>
-                <input type="text" placeholder="HEDEF KIMLIK (Orn: 123-456-789)" className="input-field mb-4" value={targetId}
+                <input type="text" placeholder="HEDEF KIMLIK (Orn: 123-456-789)" className="input-field mb-3" value={targetId}
                   onChange={e => setTargetId(e.target.value)}
+                  onKeyDown={e => { if (e.key === 'Enter' && targetId.trim() && !isConnecting && rtcState !== 'connected') { if (!isRegistered && !isGuest) { setShowAuth(true); return; } handleConnect(); } }}
+                />
+                {/* Karsi tarafin ekraninda yazan oturum parolasi. Parola
+                    zorunlulugunu kapatmis bir hedefe bos birakilabilir. */}
+                <input type="text" placeholder="OTURUM PAROLASI" className="input-field mb-4 tracking-[0.2em] uppercase"
+                  value={targetPassword} maxLength={12} autoComplete="off" spellCheck={false}
+                  onChange={e => setTargetPassword(e.target.value.toUpperCase())}
                   onKeyDown={e => { if (e.key === 'Enter' && targetId.trim() && !isConnecting && rtcState !== 'connected') { if (!isRegistered && !isGuest) { setShowAuth(true); return; } handleConnect(); } }}
                 />
                 {rtcState === 'connected' ? (
