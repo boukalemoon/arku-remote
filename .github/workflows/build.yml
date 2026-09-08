@@ -84,12 +84,20 @@ jobs:
 
       # VITE_ değişkenleri: secret tanımlıysa kullanılır, değilse koddaki public
       # fallback devreye girer (anon key zaten client'a gömülü, RLS ile korunur).
+      #
+      # TURN: üretimde kimlik bilgisi turn-credentials edge fonksiyonundan
+      # SÜRELİ olarak alınır — build'e gömülmez. VITE_TURN_* yalnızca kendi
+      # TURN'ünü statik kimlikle işleten kurulumlar için yedek yoldur;
+      # tanımlı değilse istemci edge fonksiyonunu kullanır (TURN_SETUP.md).
       - name: Build React app
         run: npm run build
         env:
           VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
           VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
           VITE_QRTIM_URL: ${{ secrets.VITE_QRTIM_URL }}
+          VITE_TURN_URL: ${{ secrets.VITE_TURN_URL }}
+          VITE_TURN_USERNAME: ${{ secrets.VITE_TURN_USERNAME }}
+          VITE_TURN_CREDENTIAL: ${{ secrets.VITE_TURN_CREDENTIAL }}
 
       - name: Build Electron — ${{ matrix.name }}
         run: npm run desktop:build:${{ matrix.platform }}
@@ -98,6 +106,9 @@ jobs:
           VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
           VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
           VITE_QRTIM_URL: ${{ secrets.VITE_QRTIM_URL }}
+          VITE_TURN_URL: ${{ secrets.VITE_TURN_URL }}
+          VITE_TURN_USERNAME: ${{ secrets.VITE_TURN_USERNAME }}
+          VITE_TURN_CREDENTIAL: ${{ secrets.VITE_TURN_CREDENTIAL }}
           # macOS: kod imzalama olmadan Gatekeeper uyarısı görünür.
           # Sertifika eklemek için CSC_LINK ve CSC_KEY_PASSWORD secret'larını tanımlayın.
           CSC_IDENTITY_AUTO_DISCOVERY: false

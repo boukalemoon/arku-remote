@@ -1,19 +1,6 @@
 import { supabase } from './supabase';
-
-const STUN_SERVERS: RTCIceServer[] = [
-  { urls: 'stun:stun.l.google.com:19302' },
-  { urls: 'stun:stun1.l.google.com:19302' },
-];
-
-const turnUrl = import.meta.env.VITE_TURN_URL as string | undefined;
-const turnUsername = import.meta.env.VITE_TURN_USERNAME as string | undefined;
-const turnCredential = import.meta.env.VITE_TURN_CREDENTIAL as string | undefined;
-
-const ICE_SERVERS: RTCConfiguration = {
-  iceServers: turnUrl && turnUsername && turnCredential
-    ? [...STUN_SERVERS, { urls: turnUrl, username: turnUsername, credential: turnCredential }]
-    : STUN_SERVERS,
-};
+import { getIceConfig, describeIce } from './ice';
+import type { IceConfig } from './ice';
 
 export type ConnectionState = 'idle' | 'connecting' | 'connected' | 'disconnected';
 export type SignalType = 'offer' | 'answer' | 'ice-candidate' | 'hangup';
@@ -33,6 +20,35 @@ interface IncomingSignal {
   from_id: string;
   payload: Record<string, unknown>;
 }
+
+/**
+ * Bağlantı yolu — hangi ICE aday çiftinin seçildiği.
+ *   host  : aynı yerel ağ (en hızlı)
+ *   srflx : NAT delindi, doğrudan P2P
+ *   relay : TURN sunucusu üzerinden aktarılıyor (bant genişliği bize maliyet)
+ */
+export type IcePath = 'host' | 'srflx' | 'relay' | 'unknown';
+
+/** Canlı oturum kalite ölçümleri (2 sn'de bir getStats() ile toplanır). */
+export interface RtcQuality {
+  path: IcePath;
+  /** Gidiş-dönüş gecikmesi (ms). */
+  rttMs: number | null;
+  /** Video bit hızı (kbit/sn). */
+  kbps: number;
+  /** Son ölçüm aralığındaki paket kaybı yüzdesi. */
+  lossPct: number | null;
+  width: number | null;
+  height: number | null;
+  fps: number | null;
+  /** Ölçüm gelen akıştan mı (izleyen taraf) yoksa giden akıştan mı (paylaşan taraf). */
+  direction: 'in' | 'out';
+}
+
+/** getStats() çıktısı sürücüye göre değişken; alanları gevşek okuyoruz. */
+type StatsRow = Record<string, unknown> & { id?: string; type?: string };
+
+const num = (v: unknown): number | null => (typeof v === 'number' && isFinite(v) ? v : null);
 
 export class WebRTCManager {
   private pc: RTCPeerConnection | null = null;
@@ -61,12 +77,19 @@ export class WebRTCManager {
   private isReceiver = false;
   private processedSignalIds = new Set<string>();
   private pollSince = '';
+  /** Bu oturum için çözülmüş ICE yapılandırması (STUN + süreli TURN). */
+  private iceConfig: IceConfig | null = null;
+  private statsTimer: ReturnType<typeof setInterval> | null = null;
+  /** Bit hızı/kayıp farkını hesaplamak için bir önceki ölçüm. */
+  private lastStatsSample: { at: number; bytes: number; lost: number; packets: number } | null = null;
 
   onConnectionSaved?: (receiverId: string) => void;
   onStateChange?: (state: ConnectionState) => void;
   onRemoteStream?: (stream: MediaStream) => void;
   onLog?: (msg: string, type?: string) => void;
   onInputEvent?: (event: InputEventMsg) => void;
+  /** Oturum boyunca 2 sn'de bir kalite ölçümü. Bağlantı bitince null gelir. */
+  onQuality?: (q: RtcQuality | null) => void;
 
   constructor(myId: string) {
     this.myId = myId;
@@ -164,11 +187,20 @@ export class WebRTCManager {
     };
   }
 
+  /**
+   * Bu oturumun ICE sunucularını çözer ve günlüğe yazar. TURN yoksa kullanıcı
+   * bunu ÖNCEDEN görmeli: "bağlanamıyoruz" şikayetlerinin çoğunun sebebi budur.
+   */
+  private async prepareIce(): Promise<void> {
+    this.iceConfig = await getIceConfig();
+    this.log(describeIce(this.iceConfig), this.iceConfig.hasTurn ? 'sys' : 'warn');
+  }
+
   private buildPC(): RTCPeerConnection {
     if (this.pc) { this.pc.close(); this.pc = null; }
     this.reconnectAttempts = 0;
 
-    const pc = new RTCPeerConnection(ICE_SERVERS);
+    const pc = new RTCPeerConnection(this.iceConfig?.rtc ?? { iceServers: [] });
     this.pc = pc;
 
     pc.onicecandidate = async (e) => {
@@ -184,9 +216,11 @@ export class WebRTCManager {
         this.onStateChange?.('connected');
         this.log('P2P bağlantısı kuruldu!', 'sys');
         this.saveConnection();
+        this.startStats();
       } else if (s === 'disconnected') {
         this.onStateChange?.('connecting');
       } else if (s === 'failed' || s === 'closed') {
+        this.stopStats();
         this.onStateChange?.('disconnected');
       }
     };
@@ -247,6 +281,114 @@ export class WebRTCManager {
       this.log(`ICE restart başarısız: ${String(err)}`, 'error');
       this.onStateChange?.('disconnected');
     }
+  }
+
+  // ── Kalite telemetrisi ─────────────────────────────────────────────────────
+  // Eskiden getStats() hiç çağrılmıyordu: destek ekibi "yavaş/bulanık" şikayeti
+  // geldiğinde bağlantının relay üzerinden mi gittiğini, gecikmeyi veya paket
+  // kaybını göremiyordu. Artık 2 sn'de bir ölçülüp arayüze veriliyor.
+  private startStats(): void {
+    if (this.statsTimer) return;
+    this.lastStatsSample = null;
+    const tick = () => { void this.collectStats(); };
+    tick();
+    this.statsTimer = setInterval(tick, 2000);
+  }
+
+  private stopStats(): void {
+    if (this.statsTimer) { clearInterval(this.statsTimer); this.statsTimer = null; }
+    this.lastStatsSample = null;
+    this.onQuality?.(null);
+  }
+
+  /** Seçili aday çiftinden bağlantı yolunu (host/srflx/relay) çıkarır. */
+  private static resolvePath(rows: StatsRow[], byId: Map<string, StatsRow>): { path: IcePath; rttMs: number | null } {
+    // Nominated + succeeded çift tercih edilir; yoksa succeeded olan ilk çift.
+    let pair: StatsRow | null = null;
+    for (const r of rows) {
+      if (r.type !== 'candidate-pair' || r.state !== 'succeeded') continue;
+      if (!pair || (r.nominated === true && pair.nominated !== true)) pair = r;
+    }
+    if (!pair) return { path: 'unknown', rttMs: null };
+
+    const local = byId.get(String(pair.localCandidateId ?? ''));
+    const remote = byId.get(String(pair.remoteCandidateId ?? ''));
+    const types = [local?.candidateType, remote?.candidateType];
+
+    const path: IcePath = types.includes('relay') ? 'relay'
+      : types.includes('srflx') || types.includes('prflx') ? 'srflx'
+      : types.includes('host') ? 'host'
+      : 'unknown';
+
+    const rtt = num(pair.currentRoundTripTime);
+    return { path, rttMs: rtt === null ? null : Math.round(rtt * 1000) };
+  }
+
+  private async collectStats(): Promise<void> {
+    const pc = this.pc;
+    if (!pc || pc.connectionState !== 'connected') return;
+
+    let report: RTCStatsReport;
+    try { report = await pc.getStats(); } catch { return; }
+
+    const rows: StatsRow[] = [];
+    const byId = new Map<string, StatsRow>();
+    report.forEach((s) => {
+      const row = s as unknown as StatsRow;
+      rows.push(row);
+      if (row.id) byId.set(row.id, row);
+    });
+
+    const { path, rttMs } = WebRTCManager.resolvePath(rows, byId);
+
+    // İzleyen taraf gelen akışı, paylaşan taraf giden akışı ölçer.
+    let video: StatsRow | null = null;
+    let direction: 'in' | 'out' = 'in';
+    for (const r of rows) {
+      if (r.type === 'inbound-rtp' && r.kind === 'video') { video = r; direction = 'in'; break; }
+    }
+    if (!video) {
+      for (const r of rows) {
+        if (r.type === 'outbound-rtp' && r.kind === 'video') { video = r; direction = 'out'; break; }
+      }
+    }
+
+    let kbps = 0;
+    let lossPct: number | null = null;
+    if (video) {
+      const bytes = num(direction === 'in' ? video.bytesReceived : video.bytesSent) ?? 0;
+      const lost = num(video.packetsLost) ?? 0;
+      const packets = num(direction === 'in' ? video.packetsReceived : video.packetsSent) ?? 0;
+      const at = num(video.timestamp) ?? Date.now();
+
+      const prev = this.lastStatsSample;
+      if (prev && at > prev.at) {
+        const seconds = (at - prev.at) / 1000;
+        kbps = Math.max(0, Math.round(((bytes - prev.bytes) * 8) / 1000 / seconds));
+        const dLost = Math.max(0, lost - prev.lost);
+        const dPackets = Math.max(0, packets - prev.packets);
+        const total = dLost + dPackets;
+        // Kayıp yüzdesi yalnızca anlamlı bir örneklem varsa raporlanır.
+        if (total >= 10) lossPct = Math.round((dLost / total) * 1000) / 10;
+      }
+      this.lastStatsSample = { at, bytes, lost, packets };
+    }
+
+    // Çözünürlük/kare hızı: gelen akışta frameWidth, giden akışta da aynı ad kullanılır.
+    const width = video ? num(video.frameWidth) : null;
+    const height = video ? num(video.frameHeight) : null;
+    const fpsRaw = video ? num(video.framesPerSecond) : null;
+
+    this.onQuality?.({
+      path,
+      rttMs,
+      kbps,
+      lossPct,
+      width,
+      height,
+      fps: fpsRaw === null ? null : Math.round(fpsRaw),
+      direction,
+    });
   }
 
   private async saveConnection() {
@@ -356,18 +498,25 @@ export class WebRTCManager {
         .from('signals')
         .select('id, type, from_id, payload, created_at')
         .eq('to_id', this.myId)
-        .eq('from_id', this.peerId)
+        // DİKKAT: burada from_id'ye göre FİLTRELEME YOK ve bu kasıtlı.
+        // Karşı taraf bize çevirdiğimizden BAŞKA bir kimlikle cevap verebilir
+        // (profil kimliği 123-456-789 ile arayıp UUID ile yanıt gelmesi).
+        // `from_id = peerId` filtresi tam da beklediğimiz answer'ı eliyordu:
+        // WebSocket düştüğünde (kurumsal proxy) bağlantı sessizce kuruluyordu.
+        // Eleme işini handleSignal yapıyor; o alias'ı tanıyıp benimsiyor,
+        // tanımadığı ICE adaylarını kuyruğa alıyor, gerisini yok sayıyor.
+        // RLS zaten yalnızca bizim taraf olduğumuz satırları döndürür.
         // gte: aynı milisaniyede yazılan ICE adayları .gt ile atlanıyordu;
         // processedSignalIds zaten mükerrer işlemeyi engelliyor.
         .gte('created_at', this.pollSince)
         .order('created_at', { ascending: true })
-        .limit(20);
+        .limit(50);
 
       if (!data || data.length === 0) return;
 
       for (const row of data) {
         if (this.processedSignalIds.has(row.id)) continue;
-        this.processedSignalIds.add(row.id);
+        this.markProcessed(row.id);
         this.pollSince = row.created_at;
         await this.handleSignal({
           id: row.id,
@@ -379,6 +528,19 @@ export class WebRTCManager {
     } catch {
       // Silently ignore to avoid log spam during brief network hiccups
     }
+  }
+
+  /**
+   * İşlenmiş sinyal kimliğini kaydeder. Uzun oturumlarda ICE adayları
+   * birikip kümeyi sınırsız büyütüyordu; üst sınıra gelince en eskiler düşer.
+   * (Sıra ekleme sırasıdır; düşenler zaten çoktan işlenmiş eski adaylardır.)
+   */
+  private markProcessed(id: string): void {
+    if (this.processedSignalIds.size >= 500) {
+      const keep = [...this.processedSignalIds].slice(-250);
+      this.processedSignalIds = new Set(keep);
+    }
+    this.processedSignalIds.add(id);
   }
 
   private async subscribe(): Promise<void> {
@@ -393,7 +555,7 @@ export class WebRTCManager {
         async (payload) => {
           const sig = payload.new as IncomingSignal & { id: string };
           if (this.processedSignalIds.has(sig.id)) return;
-          this.processedSignalIds.add(sig.id);
+          this.markProcessed(sig.id);
           await this.handleSignal(sig);
         }
       );
@@ -435,6 +597,11 @@ export class WebRTCManager {
     this.pendingRemoteCandidates = [];
     this.onStateChange?.('connecting');
     this.log(`${peerId} adresine bağlantı isteği gönderiliyor...`, 'warn');
+
+    // ICE sunucuları (süreli TURN dahil) peer connection'dan ÖNCE çözülmeli:
+    // RTCPeerConnection yapılandırmayı kurulumda alır, sonradan eklenen TURN
+    // o oturumda kullanılmaz.
+    await this.prepareIce();
 
     const pc = this.buildPC();
 
@@ -487,6 +654,8 @@ export class WebRTCManager {
     this.pendingRemoteCandidates = [];
     this.onStateChange?.('connecting');
     this.log('Bağlantı kabul edildi, ekran paylaşılıyor...', 'sys');
+
+    await this.prepareIce();
 
     const pc = this.buildPC();
     screenStream.getTracks().forEach(track => pc.addTrack(track, screenStream));
@@ -573,6 +742,7 @@ export class WebRTCManager {
 
   private close() {
     this.stopPolling();
+    this.stopStats();
     this.dataChannel?.close();
     this.dataChannel = null;
     this.pc?.close();
@@ -607,4 +777,7 @@ export class WebRTCManager {
 
   /** Bu oturumun karşı taraf kimliği — App seviyesindeki sinyal filtreleri için. */
   getPeerId(): string { return this.peerId; }
+
+  /** Bu oturumda kullanılan ICE yapılandırması (TURN var mı, kaynağı ne). */
+  getIce(): IceConfig | null { return this.iceConfig; }
 }

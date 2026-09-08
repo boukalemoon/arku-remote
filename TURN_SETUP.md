@@ -1,213 +1,270 @@
-# Arku Remote - TURN Sunucusu Kurulumu
+# Arku Remote — TURN Relay Kurulumu (Üretim)
 
-## Seçenek 1: Docker Desktop ile (Windows)
+## Neden gerekli?
 
-### Adım 1: Docker Desktop Kurulumu
+WebRTC iki cihazı doğrudan bağlamaya çalışır. Bunun için STUN yeterlidir —
+**ancak taraflardan biri simetrik NAT, kurumsal güvenlik duvarı veya CGNAT
+arkasındaysa doğrudan bağlantı kurulamaz.** Bu durumda trafiğin bir relay
+(TURN) sunucusu üzerinden aktarılması gerekir.
 
-1. [Docker Desktop İndir](https://www.docker.com/products/docker-desktop) (Windows)
-2. Kurulum dosyasını çalıştır
-3. İşlem tamamlandıktan sonra PowerShell'i yeniden aç
-4. Kontrol et:
-   ```powershell
-   docker --version
-   ```
+Türkiye'de mobil operatörlerin çoğu CGNAT kullanır ve kurumsal ağların önemli
+bir kısmı UDP hole-punching'e izin vermez. **TURN olmadan bu kullanıcılar
+Arku'ya hiç bağlanamaz** — arayüzde yalnızca "zaman aşımı" görürler.
 
-### Adım 2: Coturn Docker Image Hazırlama
-
-Proje klasöründe `docker-compose.yml` oluştur:
-
-```yaml
-version: '3.8'
-services:
-  coturn:
-    image: coturn/coturn:latest
-    ports:
-      - "3478:3478/udp"
-      - "3478:3478/tcp"
-      - "5349:5349/udp"
-      - "5349:5349/tcp"
-    volumes:
-      - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
-    restart: always
-    environment:
-      - TURNSERVER_ENABLED=1
-```
-
-### Adım 3: Coturn Yapılandırması
-
-Proje klasöründe `turnserver.conf` oluştur:
-
-```conf
-# TURN Server configuration for Arku Remote
-
-# Network settings
-listening-port=3478
-listening-ip=0.0.0.0
-external-ip=YOUR_PUBLIC_IP/YOUR_PRIVATE_IP
-
-# Firewall ports
-min-bps-capacity=0
-
-# User database
-user=turnuser:turnpass123
-
-# Logging
-log-file=/var/log/coturn/turnserver.log
-log-file-max=10M
-
-# Performance
-bps-capacity=0
-max-bps=0
-max-sessions=0
-
-# Security
-realm=turn.arku.local
-server-name=turn.arku.local
-
-# WebRTC friendly settings
-fingerprint
-verbose
-```
-
-### Adım 4: Docker Konteynerini Başlat
-
-```powershell
-cd C:\Users\BurakAkmeşeITrendTec\Desktop\Otukenrdp
-docker-compose up -d
-```
-
-Kontrol et:
-```powershell
-docker ps
-```
+> v1.0.16'ya kadar yayınlanan kurulumlarda TURN yapılandırması CI'ya hiç
+> geçirilmiyordu; tüm binary'ler yalnızca STUN ile çıkıyordu. Bu belge o
+> eksiği kapatır.
 
 ---
 
-## Seçenek 2: Bulut Sunucuda (DigitalOcean / Linode) - ÖNERİLEN
+## Mimari
 
-### Adım 1: Sunucu Oluştur
-
-1. [DigitalOcean](https://www.digitalocean.com/?refcode=YOUR_CODE) üzerinde hesap aç
-2. **Create** > **Droplet** > **Ubuntu 22.04**
-3. Plan: **$5/month** yeterli
-4. Bölge: Türkiye veya Avrupa
-5. **Create Droplet**
-
-### Adım 2: SSH ile Bağlan
-
-```powershell
-ssh root@YOUR_DROPLET_IP
+```
+İstemci ──1── turn-credentials (Supabase Edge Function)
+   │              │  HMAC-SHA1(paylaşılan sır, "expiry:userId")
+   │              └─> { iceServers: [...], ttl: 43200 }
+   │
+   └──2── coturn (VPS)  ── use-auth-secret ile aynı sırdan doğrular
 ```
 
-### Adım 3: Coturn Kur
+**Paylaşılan sır yalnızca iki yerde bulunur:** coturn'ün `turnserver.conf`
+dosyasında ve Supabase Edge Function secret'ında. İstemciye asla gitmez;
+istemci yalnızca 12 saat geçerli türetilmiş bir kimlik bilgisi alır.
+
+---
+
+## 1. Sunucu gereksinimleri
+
+| Kalem | Öneri |
+|---|---|
+| Sunucu | 2 vCPU / 2 GB RAM VPS — relay CPU değil bant genişliği tüketir |
+| Konum | Türkiye veya AB (gecikme + KVKK) |
+| IP | **Genel (public), statik** IPv4 |
+| Bant genişliği | Oturum başına ~0.4–2 Mbps çift yönlü. 100 eşzamanlı ≈ 200 Mbps |
+| Alan adı | `turn.arku.com.tr` → sunucunun IP'sine A kaydı |
+
+Relay trafiği ücretlidir; TURN yalnızca P2P kurulamadığında devreye girer
+(tipik olarak oturumların %15–25'i).
+
+---
+
+## 2. Güvenlik duvarı
+
+Açılacak portlar:
+
+| Port | Protokol | Amaç |
+|---|---|---|
+| 3478 | UDP + TCP | STUN/TURN (düz) |
+| 5349 | TCP | TURN over TLS (`turns:`) — kısıtlı ağları aşar |
+| 49160–49300 | UDP | Relay port aralığı (`turnserver.conf` ile eşleşmeli) |
 
 ```bash
-apt update
-apt install -y coturn
-
-# TURN sunucusunu etkinleştir
-nano /etc/default/coturn
-# TURNSERVER_ENABLED=1 değerini kaldır mı #
-
-# Yapılandırma dosyasını düzenle
-nano /etc/coturn/turnserver.conf
-```
-
-Düzenle:
-```conf
-listening-port=3478
-listening-ip=0.0.0.0
-external-ip=YOUR_DROPLET_IP
-
-user=turnuser:turnpass123
-realm=turn.arku.local
-
-fingerprint
-verbose
-```
-
-### Adım 4: Başlat
-
-```bash
-systemctl restart coturn
-systemctl enable coturn
-
-# Status kontrol et
-systemctl status coturn
-```
-
----
-
-## Adım 5: Uygulamaya Entegre Et
-
-### .env.local Dosyanı Güncelle
-
-```env
-VITE_SUPABASE_URL=https://YOUR_PROJECT.supabase.co
-VITE_SUPABASE_ANON_KEY=your_anon_key
-
-# TURN Sunucusu (değiştir)
-VITE_TURN_URL=turn:YOUR_PUBLIC_IP:3478
-VITE_TURN_USERNAME=turnuser
-VITE_TURN_CREDENTIAL=turnpass123
-```
-
-### Build ve Deploy
-
-```powershell
-npm run build
-vercel --prod
-```
-
----
-
-## Adım 6: Test Et
-
-1. https://arku-remote.vercel.app açın
-2. İki cihazdan:
-   - Cihaz A: Kimlik kopyala
-   - Cihaz B: Kimliği gir, Bağlantı Kur
-3. Ekran paylaşımını seç
-4. Sistem Günlüğüne bak:
-   - `ICE durumu: checking`
-   - `ICE durumu: connected`
-   - `P2P bağlantısı kuruldu!`
-
----
-
-## Sorun Giderme
-
-### TURN Sunucusu Bağlanmıyor
-
-```bash
-# Port açık mı?
-netstat -an | grep 3478
-
-# Firewall açık mı?
 sudo ufw allow 3478/udp
 sudo ufw allow 3478/tcp
-```
-
-### TURN Sunucusu Çok Yavaş
-
-- CPU/RAM artır
-- TURN sunucusunun bölgesini kontrol et
-
-### Docker Konteyneri Çöküyor
-
-```powershell
-docker logs coturn
+sudo ufw allow 5349/tcp
+sudo ufw allow 49160:49300/udp
 ```
 
 ---
 
-## 📊 Maliyet Özeti
+## 3. TLS sertifikası
 
-| Yöntem | Aylık Maliyet | Setup | Hız |
-|--------|--------------|-------|-----|
-| Docker Desktop (Local) | Ücretsiz | 15 min | Orta |
-| DigitalOcean $5 | $5 | 20 min | İyi |
-| Metered.ca Free | Ücretsiz (100 min) | 5 min | Hızlı |
+Kurumsal güvenlik duvarlarının çoğu 443/TLS dışını engeller; `turns:` desteği
+bu yüzden opsiyonel değil, pratikte zorunludur.
 
-**Tavsiye**: Başta Metered.ca ile test et, sonra DigitalOcean'a geç.
+```bash
+sudo apt install certbot
+sudo certbot certonly --standalone -d turn.arku.com.tr
+```
 
+Yenilemede coturn'ün sertifikayı yeniden okuması için:
+
+```bash
+sudo crontab -e
+# Ayda bir yenile ve konteyneri döndür
+0 3 1 * * certbot renew --quiet && docker restart arku-turn
+```
+
+---
+
+## 4. Paylaşılan sırrı üret
+
+```bash
+openssl rand -hex 32
+```
+
+Çıktıyı **iki yere** yazın (birebir aynı olmalı):
+
+1. `turnserver.conf` → `static-auth-secret=...`
+2. Supabase → Edge Functions → Secrets → `TURN_STATIC_AUTH_SECRET`
+
+---
+
+## 5. coturn'ü çalıştır
+
+`turnserver.conf` içindeki `###` ile işaretli 4 yeri doldurun:
+`external-ip`, `realm`/`server-name`, `static-auth-secret`, `cert`/`pkey`.
+
+```bash
+git clone https://github.com/boukalemoon/arku-remote.git
+cd arku-remote
+nano turnserver.conf          # ### satırlarını doldurun
+docker compose up -d
+docker compose logs -f coturn
+```
+
+Başarılı başlangıçta log'da şunlar görünür:
+
+```
+0: : Listener address to use: 0.0.0.0
+0: : Relay address to use: <genel-ip>
+0: : TLS listener opened on: 0.0.0.0:5349
+```
+
+---
+
+## 6. Supabase Edge Function'ı yayına al
+
+### Secret'ları tanımla
+
+Supabase Dashboard → **Edge Functions → Secrets**:
+
+| Ad | Değer |
+|---|---|
+| `TURN_STATIC_AUTH_SECRET` | 4. adımdaki sır (A modu — kendi coturn'ünüz) |
+| `TURN_URLS` | `turn:turn.arku.com.tr:3478?transport=udp,turn:turn.arku.com.tr:3478?transport=tcp,turns:turn.arku.com.tr:5349?transport=tcp` |
+| `TURN_TTL_SECONDS` | `43200` (opsiyonel, 12 saat) |
+
+### Fonksiyonu dağıt
+
+```bash
+supabase functions deploy turn-credentials
+```
+
+`verify_jwt` **açık kalmalıdır** (varsayılan). Her Arku istemcisinin bir
+oturumu vardır (misafirler dahil anonim oturum), dolayısıyla bu kimseyi
+dışarıda bırakmaz ama oturumsuz kazıyıcıların relay kimliği almasını engeller.
+
+---
+
+## 7. Doğrulama
+
+### a) Edge function yanıt veriyor mu?
+
+```bash
+curl -s -X POST \
+  -H "apikey: <ANON_KEY>" \
+  -H "Authorization: Bearer <ANON_KEY>" \
+  -H "Content-Type: application/json" -d '{}' \
+  https://jpmbttlxyxrqmpghymbq.supabase.co/functions/v1/turn-credentials | jq
+```
+
+Beklenen: `"turn": true` ve `iceServers` içinde `turn:`/`turns:` girdileri.
+`"turn": false` dönüyorsa secret'lar tanımlanmamıştır.
+
+### b) TURN gerçekten relay veriyor mu?
+
+<https://icetest.info> veya Trickle ICE aracına aynı `iceServers` değerlerini
+girin. **`typ relay` satırı görünmelidir.** Görünmüyorsa: sır uyuşmuyor,
+`external-ip` yanlış veya relay port aralığı kapalı.
+
+### c) Uygulamada
+
+Bağlantı kurarken sistem günlüğünde şu satır görünmeli:
+
+```
+ICE: STUN + TURN (süreli kimlik)
+```
+
+Bağlantı kurulduğunda durum çubuğundaki rozet:
+- **P2P** → doğrudan bağlantı (relay kullanılmadı, ideal)
+- **RELAY** → TURN üzerinden aktarılıyor (çalışıyor, bant genişliği tüketiyor)
+- **YEREL AG** → aynı ağdaki iki cihaz
+
+`ICE: yalnızca STUN` yazıyorsa TURN devre dışıdır ve kısıtlı ağlardaki
+kullanıcılar bağlanamaz.
+
+---
+
+## 8. İzleme
+
+```bash
+# Anlık relay oturumu sayısı
+docker exec arku-turn turnutils_uclient -h 2>/dev/null; docker logs --tail 100 arku-turn | grep -c "allocated"
+
+# Bant genişliği
+docker stats arku-turn --no-stream
+```
+
+Relay oranı sürekli %40'ın üzerindeyse ağ tarafında bir sorun vardır
+(UDP engelli olabilir) — `turns:` girdisinin `TURN_URLS` içinde olduğundan
+emin olun.
+
+---
+
+## Alternatif: yönetilen TURN (hızlı başlangıç)
+
+Kendi sunucunuzu işletmeden başlamak isterseniz edge fonksiyonu **B modunu**
+destekler.
+
+> **Önemli:** Yönetilen sağlayıcılar coturn'ün `use-auth-secret` (HMAC paylaşılan
+> sır) şemasını **desteklemez**. Metered kimliği kendi REST API'sinden verir;
+> bu yüzden **C modu** (`TURN_PROVIDER_URL`) kullanılır. İsteği edge fonksiyonu
+> sunucu tarafında yapar, böylece `apiKey` istemciye hiç gitmez.
+
+| Sağlayıcı | Ücretsiz kademe | Uygun mod |
+|---|---|---|
+| **Metered.ca** | Var (Open Relay; kota panelde görünür) | **C** — `TURN_PROVIDER_URL` |
+| Twilio Network Traversal | Yok | C (kendi API adresiyle) veya B |
+| Cloudflare Calls TURN | Var (sınırlı) | ⚠️ POST + API token ister; fonksiyona ek mod gerekir |
+
+### Metered ile 10 dakikada devreye alma
+
+**Metered tarafı**
+
+1. <https://dashboard.metered.ca/signup?tool=turnserver> → ücretsiz hesap açın
+   > Ücretsiz kademede bile **kredi kartı bilgisi ister** (2026-09 itibarıyla
+   > doğrulandı). Pazarlama sayfası "kredi kartı gerekmez" dese de kayıt
+   > akışında isteniyor. Kota aşımında otomatik ücretlendirme riskine karşı
+   > panelden kullanım uyarısı tanımlayın.
+2. **TURN Servers** sayfasında **Add Project** → projeye bir ad verin
+   (örn. `arku`). Bu ad size `arku.metered.live` biçiminde bir alan adı verir
+3. Proje kartında **Manage TURN Credentials** → **Add Credential**
+4. Projenin **API Key**'ini kopyalayın (proje sayfasında görünür)
+
+**Supabase tarafı** — Dashboard → Edge Functions → **Secrets**:
+
+| Ad | Değer |
+|---|---|
+| `TURN_PROVIDER_URL` | `https://<proje>.metered.live/api/v1/turn/credentials?apiKey=<API_KEY>` |
+
+Bu **tek secret yeterlidir**. `TURN_URLS`, `TURN_USERNAME`, `TURN_CREDENTIAL`
+ve `TURN_STATIC_AUTH_SECRET` **tanımlanmamalıdır** — Metered adresleri ve
+kimliği kendi yanıtında döndürür, `TURN_STATIC_AUTH_SECRET` tanımlıysa A modu
+öncelik alır ve Metered devre dışı kalır.
+
+Secret ekledikten sonra fonksiyonu yeniden dağıtmaya gerek yoktur; yeni
+çağrılar secret'ı hemen görür.
+
+### Kendi sunucunuza geçiş
+
+Hacim büyüyünce coturn'ü kurun (bölüm 1-5), sonra secret'ları değiştirin:
+`TURN_PROVIDER_URL` **silin**, `TURN_STATIC_AUTH_SECRET` + `TURN_URLS`
+**ekleyin**. İstemcide değişiklik gerekmez, yeni sürüm yayınlamaya gerek
+yoktur — kimlik bilgisi zaten sunucudan geliyor.
+
+---
+
+## Geliştirme ortamı (yerel test)
+
+Yerel ağda TURN'e gerek yoktur (host adayları çalışır). Yine de test etmek
+isterseniz `.env.local` içine build zamanı TURN tanımlayabilirsiniz —
+istemci, edge fonksiyonu TURN veremediğinde buna düşer:
+
+```env
+VITE_TURN_URL=turn:localhost:3478
+VITE_TURN_USERNAME=test
+VITE_TURN_CREDENTIAL=test
+```
+
+Bu yol yalnızca geliştirme içindir; üretimde **edge fonksiyonu kullanılmalıdır**.

@@ -12,8 +12,9 @@ import {
 import type { Organization, OrgMember, ContactCategory, SavedContact, OrgRole } from './lib/enterprise';
 import type { User as SupabaseUser } from '@supabase/supabase-js';
 import { WebRTCManager } from './lib/webrtc';
-import type { ConnectionState, InputEventMsg } from './lib/webrtc';
+import type { ConnectionState, InputEventMsg, RtcQuality } from './lib/webrtc';
 import { EMBED, postSessionEvent, resetSessionEvents } from './lib/embed';
+import { resetIceCache } from './lib/ice';
 
 type Theme = 'otuken' | 'umay' | 'gok' | 'gece';
 type Tab = 'dashboard' | 'connections' | 'contacts' | 'organization' | 'settings';
@@ -97,6 +98,12 @@ export default function App() {
   const [rtcState, setRtcState] = React.useState<ConnectionState>('idle');
   const [isConnecting, setIsConnecting] = React.useState(false);
   const [remoteStream, setRemoteStream] = React.useState<MediaStream | null>(null);
+  // Canlı bağlantı kalitesi (yol, gecikme, bit hızı, kayıp). Destek ekibinin
+  // "yavaş/bulanık" şikayetlerini teşhis edebilmesi için görünür kılınır.
+  const [quality, setQuality] = React.useState<RtcQuality | null>(null);
+  // Bu oturumda TURN (relay) kullanılabiliyor mu — yoksa kısıtlı ağlarda
+  // bağlantı hiç kurulamaz ve kullanıcı sebebini bilmelidir.
+  const [turnAvailable, setTurnAvailable] = React.useState(true);
   const [incomingCall, setIncomingCall] = React.useState<IncomingCall | null>(null);
   const connTimeoutRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
   const rtcStateRef = React.useRef<ConnectionState>('idle');
@@ -297,6 +304,7 @@ export default function App() {
             setWebrtc(null);
             setRtcState('idle');
             setRemoteStream(null);
+            setQuality(null);
             setIsConnecting(false);
             setInputEnabled(false);
             if (localVideoRef.current?.srcObject) {
@@ -605,9 +613,12 @@ export default function App() {
     try { await supabase.auth.signOut({ scope: 'local' }); } catch { /* yok say */ }
     // QRtım yeniden-giriş döngüsünü kır: kalan callback/token izlerini temizle.
     try { sessionStorage.removeItem('partner_callback'); } catch { /* yok say */ }
+    // TURN kimlik bilgisi çağıranın kimliğine bağlıdır — sonraki kullanıcı
+    // öncekinin kimliğiyle relay kullanmasın.
+    resetIceCache();
     setCurrentUser(null); setUserProfile(null); setGuestChoice(false); setConnectionHistory([]);
     setQrtimUser(null);
-    setRemoteStream(null); setRtcState('idle'); setIsConnecting(false);
+    setRemoteStream(null); setQuality(null); setRtcState('idle'); setIsConnecting(false);
     setConnectionId(getOrCreateGuestId()); setDisplayName(''); setPhone(''); setSessionToken(''); setDeviceFingerprint('');
     setActiveTab('dashboard'); addLocalLog('Oturum kapatildi.', 'warn');
     // Çıkıştan sonra da ulaşılabilir kal (RLS oturum ister), ama kullanıcı
@@ -867,19 +878,24 @@ export default function App() {
   const buildManager = (): WebRTCManager => {
     const myId = currentUser?.id || connectionId;
     const m = new WebRTCManager(myId);
+    m.onQuality = setQuality;
     m.onStateChange = (state) => {
       setRtcState(state);
       if (state === 'connecting') {
         postSessionEvent('connecting', targetId, EMBED.mode);
+        // ICE prepareIce() sırasında çözülür; TURN yoksa kullanıcıyı uyaralım.
+        setTurnAvailable(m.getIce()?.hasTurn !== false);
       }
       if (state === 'connected') {
         setIsConnecting(false);
+        setTurnAvailable(m.getIce()?.hasTurn !== false);
         postSessionEvent('connected', targetId, EMBED.mode);
         if (connTimeoutRef.current) { clearTimeout(connTimeoutRef.current); connTimeoutRef.current = null; }
       }
       if (state === 'disconnected') {
         setIsConnecting(false);
         setRemoteStream(null);
+        setQuality(null);
         setInputEnabled(false);
         disableRemoteControl();
         postSessionEvent('ended', targetId, EMBED.mode);
@@ -889,7 +905,7 @@ export default function App() {
         }
         if (connTimeoutRef.current) { clearTimeout(connTimeoutRef.current); connTimeoutRef.current = null; }
       }
-      if (state === 'idle') { setIsConnecting(false); setRemoteStream(null); setInputEnabled(false); disableRemoteControl(); }
+      if (state === 'idle') { setIsConnecting(false); setRemoteStream(null); setQuality(null); setInputEnabled(false); disableRemoteControl(); }
     };
     m.onRemoteStream = (stream) => {
       setRemoteStream(stream);
@@ -920,7 +936,7 @@ export default function App() {
     if (targetId.trim() === connectionId || (currentUser && targetId.trim() === currentUser.id)) { addLog('Kendi cihaziniza baglanamazsiniz.', 'error'); return; }
 
     if (webrtc) await webrtc.disconnect();
-    setWebrtc(null); setRemoteStream(null); setRtcState('idle'); setIsConnecting(true);
+    setWebrtc(null); setRemoteStream(null); setQuality(null); setRtcState('idle'); setIsConnecting(true);
     addLog(`${targetId} adresine baglaniliyor...${EMBED.op ? ` (operator: ${EMBED.op})` : ''}`, 'warn');
     resetSessionEvents();
     postSessionEvent('connecting', targetId, EMBED.mode);
@@ -1012,6 +1028,7 @@ export default function App() {
         setWebrtc(null);
         setRtcState('idle');
         setRemoteStream(null);
+        setQuality(null);
         setIsConnecting(false);
         setInputEnabled(false);
         if (localVideoRef.current) { localVideoRef.current.srcObject = null; }
@@ -1050,7 +1067,7 @@ export default function App() {
     // Ekran paylaşımını ve arayüzü önce durdur, teardown'ı sonra bekle.
     const m = webrtc;
     if (localVideoRef.current?.srcObject) { (localVideoRef.current.srcObject as MediaStream)?.getTracks().forEach(t => t.stop()); localVideoRef.current.srcObject = null; }
-    setWebrtc(null); setRemoteStream(null); setRtcState('idle'); setIsConnecting(false);
+    setWebrtc(null); setRemoteStream(null); setQuality(null); setRtcState('idle'); setIsConnecting(false);
     addLog('Baglaniti kesildi.', 'warn');
     postSessionEvent('ended', targetId, EMBED.mode);
     try { await m?.disconnect(); } catch { /* teardown hatasi arayuzu etkilemesin */ }
@@ -1080,6 +1097,51 @@ export default function App() {
   };
 
   const isLight = theme === 'umay';
+
+  // ── Bağlantı kalitesi göstergesi ───────────────────────────────────────────
+  // "Yavaş / bulanık / kopuyor" şikayetlerinin teşhisi buradan yapılır:
+  // RELAY etiketi TURN üzerinden gidildiğini (yani P2P delinemediğini),
+  // gecikme ve kayıp ise hattın durumunu gösterir.
+  const PATH_LABEL: Record<RtcQuality['path'], string> = {
+    host: 'YEREL AG', srflx: 'P2P', relay: 'RELAY', unknown: 'ANALIZ',
+  };
+  const rttColor = (ms: number | null) =>
+    ms === null ? 'var(--text-muted)' : ms < 80 ? '#4ade80' : ms < 200 ? '#facc15' : '#f87171';
+  const lossColor = (pct: number | null) =>
+    pct === null ? 'var(--text-muted)' : pct < 2 ? '#4ade80' : pct < 8 ? '#facc15' : '#f87171';
+
+  const QualityChips = ({ compact = false }: { compact?: boolean }) => {
+    if (!quality) return null;
+    const q = quality;
+    const mbps = q.kbps >= 1000 ? `${(q.kbps / 1000).toFixed(1)} Mbps` : `${q.kbps} kbps`;
+    const chip = 'px-1.5 py-0.5 text-[8px] uppercase tracking-widest whitespace-nowrap';
+    return (
+      <div className={`flex items-center gap-1.5 ${compact ? '' : 'flex-wrap'}`}>
+        <span
+          className={chip}
+          title={q.path === 'relay'
+            ? 'Trafik TURN sunucusu üzerinden aktarılıyor (doğrudan bağlantı kurulamadı).'
+            : 'Doğrudan uçtan uca bağlantı.'}
+          style={{
+            border: `1px solid ${q.path === 'relay' ? 'rgba(250,204,21,0.5)' : 'rgba(74,222,128,0.5)'}`,
+            color: q.path === 'relay' ? '#facc15' : '#4ade80',
+          }}
+        >{PATH_LABEL[q.path]}</span>
+        {q.rttMs !== null && (
+          <span className={chip} title="Gidiş-dönüş gecikmesi" style={{ color: rttColor(q.rttMs) }}>{q.rttMs} ms</span>
+        )}
+        <span className={chip} title="Video bit hızı" style={{ color: 'var(--text-muted)' }}>{mbps}</span>
+        {!compact && q.width && q.height && (
+          <span className={chip} title="Çözünürlük ve kare hızı" style={{ color: 'var(--text-muted)' }}>
+            {q.width}×{q.height}{q.fps !== null ? ` · ${q.fps} fps` : ''}
+          </span>
+        )}
+        {q.lossPct !== null && q.lossPct > 0 && (
+          <span className={chip} title="Paket kaybı" style={{ color: lossColor(q.lossPct) }}>%{q.lossPct} kayip</span>
+        )}
+      </div>
+    );
+  };
 
   return (
     <div className="min-h-screen flex flex-col selection:bg-steppe-gold selection:text-steppe-stone">
@@ -1215,13 +1277,30 @@ export default function App() {
               </div>
 
               {rtcState !== 'idle' && (
-                <div className={`flex items-center gap-3 px-4 py-2 border ${rtcState === 'connected' ? 'border-green-500/30' : rtcState === 'connecting' ? 'border-yellow-500/30' : 'border-red-500/30'}`}
+                <div className={`px-4 py-2 border ${rtcState === 'connected' ? 'border-green-500/30' : rtcState === 'connecting' ? 'border-yellow-500/30' : 'border-red-500/30'}`}
                   style={{ background: rtcState === 'connected' ? 'rgba(34,197,94,0.05)' : rtcState === 'connecting' ? 'rgba(234,179,8,0.05)' : 'rgba(239,68,68,0.05)' }}>
-                  <div className={`w-2 h-2 rounded-full animate-pulse ${rtcState === 'connected' ? 'bg-green-400' : rtcState === 'connecting' ? 'bg-yellow-400' : 'bg-red-400'}`} />
-                  <span className="text-[10px] uppercase tracking-widest text-steppe-muted">
-                    {rtcState === 'connected' ? `P2P Bagli - ${targetId}` : rtcState === 'connecting' ? 'Baglaniyor...' : 'Baglaniti Kesildi'}
-                  </span>
-                  {rtcState === 'connected' && <button onClick={handleDisconnect} className="ml-auto text-[9px] text-red-400 hover:text-red-300 uppercase tracking-widest">Kes</button>}
+                  <div className="flex items-center gap-3">
+                    <div className={`w-2 h-2 rounded-full animate-pulse ${rtcState === 'connected' ? 'bg-green-400' : rtcState === 'connecting' ? 'bg-yellow-400' : 'bg-red-400'}`} />
+                    <span className="text-[10px] uppercase tracking-widest text-steppe-muted">
+                      {rtcState === 'connected' ? `P2P Bagli - ${targetId}` : rtcState === 'connecting' ? 'Baglaniyor...' : 'Baglaniti Kesildi'}
+                    </span>
+                    {rtcState === 'connected' && <button onClick={handleDisconnect} className="ml-auto text-[9px] text-red-400 hover:text-red-300 uppercase tracking-widest">Kes</button>}
+                  </div>
+                  {rtcState === 'connected' && quality && (
+                    <div className="mt-2 pt-2 border-t" style={{ borderColor: 'var(--border-primary)' }}>
+                      <QualityChips />
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* TURN yoksa kısıtlı ağlarda bağlantı hiç kurulamaz — sebebi
+                  görünür olmalı, yoksa kullanıcı sadece "zaman aşımı" görür. */}
+              {!turnAvailable && rtcState !== 'idle' && (
+                <div className="px-4 py-2 border border-yellow-500/40 text-[9px] leading-relaxed text-yellow-300"
+                  style={{ background: 'rgba(234,179,8,0.08)' }}>
+                  Relay (TURN) sunucusu yapilandirilmamis. Kisitli aglarda (kurumsal guvenlik
+                  duvari, mobil operator) baglanti kurulamayabilir.
                 </div>
               )}
 
@@ -1245,6 +1324,7 @@ export default function App() {
                     <div className="absolute top-3 left-3 flex items-center gap-2 px-2 py-1 rounded" style={{ background: 'rgba(0,0,0,0.7)' }}>
                       <div className="w-2 h-2 rounded-full bg-green-400 animate-pulse" />
                       <span className="text-[9px] text-green-400 uppercase tracking-widest">Bagli - {targetId}</span>
+                      <QualityChips compact />
                     </div>
                     <div className="absolute top-3 right-3 flex gap-2">
                       {EMBED.mode !== 'view' && (
@@ -1273,6 +1353,7 @@ export default function App() {
                       <span className={`text-[9px] uppercase tracking-widest ${rtcState === 'connected' ? 'text-green-400' : 'text-yellow-400'}`}>
                         {rtcState === 'connected' ? 'Ekran Paylasiliyor - Bagli' : 'Ekran Paylasiliyor - Baglaniliyor...'}
                       </span>
+                      <QualityChips compact />
                     </div>
                     <div className="absolute top-3 right-3 flex gap-2">
                       {rtcState === 'connected' && (

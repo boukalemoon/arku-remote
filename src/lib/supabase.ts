@@ -10,6 +10,9 @@ const SUPABASE_ANON_KEY = (import.meta.env.VITE_SUPABASE_ANON_KEY as string) || 
 // Edge function çağrılarında gateway `apikey` header'ı için (public anon key).
 export const ARKU_ANON_KEY = SUPABASE_ANON_KEY;
 
+// Edge function adreslerini tek yerden türetmek için (bkz. lib/ice.ts).
+export const ARKU_FUNCTIONS_URL = `${SUPABASE_URL.replace(/\/+$/, '')}/functions/v1`;
+
 export const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
   auth: {
     persistSession: true,
