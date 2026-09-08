@@ -15,6 +15,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   //   pointer=false -> tek pencere paylaşıldı, yalnızca klavye iletilir.
   requestRemoteControl: () => ipcRenderer.invoke('remote-control:request'),
   revokeRemoteControl: () => ipcRenderer.send('remote-control:revoke'),
+  // Cihaz oznitelikleri (denetim izi). MAC destekleyici veridir, capa degil.
+  deviceIdentity: () => ipcRenderer.invoke('device:identity'),
   // Oturum kaydi. Klasor yolu ana surecte saklanir; renderer yol belirleyemez.
   getRecordingFolder: () => ipcRenderer.invoke('recording:get-folder'),
   pickRecordingFolder: () => ipcRenderer.invoke('recording:pick-folder'),

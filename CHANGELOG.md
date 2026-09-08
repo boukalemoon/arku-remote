@@ -8,6 +8,35 @@ Sürümleme: [Semantic Versioning](https://semver.org/lang/tr/)
 
 ---
 
+## [1.3.0] — 2026-09-09
+
+### Eklendi
+
+- **Denetim izi.** Oturum başlangıcı/bitişi, uzaktan kontrol izni, kayıt
+  rızası ve kayıt başlangıcı/bitişi **değiştirilemez bir zincire** yazılır.
+  Her kayıt bir öncekinin özetini (hash) taşır; bir kayıt silinse veya
+  değiştirilse zincir kırılır ve doğrulama bunu gösterir.
+  - Kayıtlar **güncellenemez ve silinemez** — yetki kaldırıldı, ayrıca
+    veritabanı düzeyinde reddediliyor.
+  - Özet **sunucuda** hesaplanır; istemci sahte zincir üretemez.
+  - Kaydı üreten kullanıcı sunucuda belirlenir; kimse başkası adına
+    denetim kaydı yazamaz.
+  - Ayarlar → Denetim İzi altından kayıtlar görülebilir ve **zincirin
+    sağlamlığı doğrulanabilir**.
+- **Cihaz öznitelikleri** (makine adı, işletim sistemi, kullanıcı adı, MAC)
+  oturum ve rıza kayıtlarına ekleniyor.
+  > MAC adresi tek başına zayıf bir delildir: değiştirilebilir ve modern
+  > sistemlerde Wi-Fi için rastgeleleştirilir. Ayrıca kişisel veridir ve
+  > aydınlatma metninde yer almalıdır. Burada çapa değil, destekleyici
+  > özniteliktir; kaydın asıl çürütülemezliği hash zincirinden gelir.
+
+### Not
+
+Denetim kaydına ekran görüntüsü, dosya içeriği, pano metni veya tuş
+vuruşları **yazılmaz** — yalnızca olayın kendisi ve teknik öznitelikler.
+
+---
+
 ## [1.2.0] — 2026-09-09
 
 > Yayınlanmamış 1.1.0'ın tamamını içerir; 1.1.0 etiketi hiç yayına çıkmadı.

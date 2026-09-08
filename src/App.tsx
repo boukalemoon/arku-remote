@@ -16,6 +16,8 @@ import { WebRTCManager } from './lib/webrtc';
 import type { ConnectionState, InputEventMsg, RtcQuality, ControlMsg, RemoteScreen, FileOffer } from './lib/webrtc';
 import { EMBED, postSessionEvent, resetSessionEvents } from './lib/embed';
 import { resetIceCache } from './lib/ice';
+import { recordAudit, listAudit, verifyAuditChain } from './lib/audit';
+import type { AuditRow, AuditVerifyResult } from './lib/audit';
 
 type Theme = 'otuken' | 'umay' | 'gok' | 'gece';
 type Tab = 'dashboard' | 'connections' | 'contacts' | 'organization' | 'settings';
@@ -213,6 +215,10 @@ export default function App() {
   const [recPrompt, setRecPrompt] = React.useState(false);
   const [recFolder, setRecFolder] = React.useState('');
   const [recElapsed, setRecElapsed] = React.useState(0);
+  // Denetim izi goruntuleyici (Ayarlar).
+  const [auditRows, setAuditRows] = React.useState<AuditRow[] | null>(null);
+  const [auditVerify, setAuditVerify] = React.useState<AuditVerifyResult | null>(null);
+  const [auditBusy, setAuditBusy] = React.useState(false);
   // onControl bagimliliklari dar bir closure icinde calisiyor; kayit durumunu
   // ref uzerinden okumak bayat deger riskini kaldirir.
   const recStateRef = React.useRef(recState);
@@ -1404,6 +1410,11 @@ export default function App() {
       setRecElapsed(0);
       setRecState('recording');
       addLocalLog('Oturum kaydi basladi.', 'warn');
+      recordAudit('recording_start', {
+        actorIdentity: connectionId,
+        peerIdentity: webrtcRef.current?.getPeerId(),
+        detail: { consentVersion: RECORDING_CONSENT_VERSION, mimeType: mimeType || 'varsayilan' },
+      });
       return true;
     } catch (err) {
       addLocalLog(`Kayit baslatilamadi: ${String(err)}`, 'error');
@@ -1429,6 +1440,15 @@ export default function App() {
     recStartedAtRef.current = 0;
     setRecElapsed(0);
     if (!parts.length) { addLocalLog('Kayit bos, dosya yazilmadi.', 'warn'); return; }
+
+    // Denetim: kaydin ustverisi. Dosyanin KENDISI sunucuya gitmez; buradaki
+    // boyut ve sure, kaydin varligini ve kapsamini belgeler.
+    recordAudit('recording_stop', {
+      actorIdentity: connectionId,
+      peerIdentity: webrtcRef.current?.getPeerId(),
+      detail: { saniye, bayt: parts.reduce((t, b) => t + b.size, 0),
+                consentVersion: RECORDING_CONSENT_VERSION },
+    });
 
     const blob = new Blob(parts, { type: 'video/webm' });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1472,12 +1492,45 @@ export default function App() {
     setRecPrompt(false);
     webrtcRef.current?.sendControl({ k: 'rec-accept', consentVersion: RECORDING_CONSENT_VERSION });
     addLocalLog('Oturum kaydina onay verildi.', 'warn');
+    // Denetim: rizanin KENDISI ve hangi metne dayandigi.
+    recordAudit('recording_consent', {
+      actorIdentity: connectionId,
+      peerIdentity: webrtcRef.current?.getPeerId(),
+      includeDevice: true,
+      detail: { consentVersion: RECORDING_CONSENT_VERSION, karar: 'onaylandi' },
+    });
   };
 
   const rejectRecording = () => {
     setRecPrompt(false);
     webrtcRef.current?.sendControl({ k: 'rec-reject' });
     addLocalLog('Oturum kaydi reddedildi.', 'warn');
+    recordAudit('recording_consent', {
+      actorIdentity: connectionId,
+      peerIdentity: webrtcRef.current?.getPeerId(),
+      detail: { consentVersion: RECORDING_CONSENT_VERSION, karar: 'reddedildi' },
+    });
+  };
+
+  const loadAudit = async () => {
+    setAuditBusy(true);
+    try {
+      const [rows, v] = await Promise.all([listAudit(50), verifyAuditChain()]);
+      setAuditRows(rows);
+      setAuditVerify(v);
+    } finally { setAuditBusy(false); }
+  };
+
+  const AUDIT_LABEL: Record<string, string> = {
+    session_start: 'Oturum basladi',
+    session_end: 'Oturum bitti',
+    control_granted: 'Uzaktan kontrol izni verildi',
+    control_revoked: 'Uzaktan kontrol izni kaldirildi',
+    recording_consent: 'Kayit rizasi',
+    recording_start: 'Kayit basladi',
+    recording_stop: 'Kayit bitti',
+    file_sent: 'Dosya gonderildi',
+    file_received: 'Dosya alindi',
   };
 
   const chooseRecordingFolder = async () => {
@@ -1501,6 +1554,10 @@ export default function App() {
     if (remoteControlAllowed) {
       disableRemoteControl();
       addLocalLog('Uzaktan kontrol izni kapatildi.', 'warn');
+      recordAudit('control_revoked', {
+        actorIdentity: connectionId,
+        peerIdentity: webrtc?.getPeerId(),
+      });
       return;
     }
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1536,6 +1593,11 @@ export default function App() {
     }
     setRemoteControlAllowed(true);
     addLocalLog('Uzaktan kontrole izin verildi.', 'warn');
+    recordAudit('control_granted', {
+      actorIdentity: connectionId,
+      peerIdentity: webrtc?.getPeerId(),
+      detail: { pointer: controlNotice === '' },
+    });
   };
 
   const buildManager = (): WebRTCManager => {
@@ -1704,10 +1766,22 @@ export default function App() {
       if (state === 'connected') {
         setIsConnecting(false);
         setTurnAvailable(m.getIce()?.hasTurn !== false);
+        // Denetim: oturum basladi. Cihaz oznitelikleri yalnizca burada eklenir.
+        recordAudit('session_start', {
+          actorIdentity: connectionId,
+          peerIdentity: m.getPeerId(),
+          includeDevice: true,
+          detail: { rol: m.getRole(), relay: m.getIce()?.hasTurn ?? null },
+        });
         postSessionEvent('connected', targetId, EMBED.mode);
         if (connTimeoutRef.current) { clearTimeout(connTimeoutRef.current); connTimeoutRef.current = null; }
       }
       if (state === 'disconnected') {
+        recordAudit('session_end', {
+          actorIdentity: connectionId,
+          peerIdentity: m.getPeerId(),
+          detail: { rol: m.getRole() },
+        });
         // Kayit varsa ONCE kapat: aksi halde toplanan parcalar diske yazilmadan
         // durum temizlenir ve kayit kaybolur. Karsi tarafa bildirmiyoruz;
         // baglanti zaten dustu.
@@ -2742,6 +2816,62 @@ export default function App() {
                 )}
               </div>
             </section>
+            <section className="gokturk-border surface-card p-8">
+              <h3 className="text-[10px] uppercase tracking-widest text-steppe-muted mb-2 flex items-center gap-2">
+                <Shield size={12} className="text-steppe-gold" /> Denetim Izi
+              </h3>
+              <p className="text-[9px] text-steppe-muted leading-relaxed mb-5">
+                Oturum, izin ve kayit olaylari degistirilemez bir zincire yazilir.
+                Her kayit bir oncekinin ozetini tasir; bir kayit silinse veya
+                degistirilse zincir kirilir ve dogrulama bunu gosterir.
+                Kayitlar guncellenemez ve silinemez.
+              </p>
+
+              <div className="flex items-center gap-2 mb-4">
+                <button onClick={loadAudit} disabled={auditBusy}
+                  className="text-[9px] uppercase tracking-widest text-steppe-muted hover:text-steppe-gold border border-steppe-border hover:border-steppe-gold px-3 py-1.5 transition-colors disabled:opacity-40">
+                  {auditBusy ? 'Yukleniyor...' : 'Kayitlari Getir ve Dogrula'}
+                </button>
+                {auditVerify && (
+                  <span className="text-[9px] uppercase tracking-widest px-2 py-1 border"
+                    style={{
+                      borderColor: auditVerify.ok ? 'rgba(74,222,128,0.5)' : 'rgba(248,113,113,0.6)',
+                      color: auditVerify.ok ? '#4ade80' : '#f87171',
+                    }}>
+                    {auditVerify.ok
+                      ? `Zincir saglam · ${auditVerify.kontrol_edilen} kayit`
+                      : `BOZUK · seq ${auditVerify.ilk_bozuk_seq}`}
+                  </span>
+                )}
+              </div>
+              {auditVerify && !auditVerify.ok && (
+                <p className="text-[10px] text-red-300 mb-4">{auditVerify.mesaj}</p>
+              )}
+
+              {auditRows && (
+                auditRows.length === 0 ? (
+                  <p className="text-[10px] text-steppe-muted">Henuz denetim kaydi yok.</p>
+                ) : (
+                  <div className="max-h-64 overflow-y-auto border border-steppe-border" style={{ background: 'var(--log-bg)' }}>
+                    {auditRows.map(r => (
+                      <div key={r.seq} className="flex items-baseline gap-3 px-3 py-2 border-b last:border-b-0 text-[10px]"
+                        style={{ borderColor: 'var(--border-primary)' }}>
+                        <span className="font-mono text-steppe-muted opacity-50 shrink-0">#{r.seq}</span>
+                        <span className="text-steppe-paper shrink-0">{AUDIT_LABEL[r.event] ?? r.event}</span>
+                        <span className="text-steppe-muted truncate">{r.peer_identity ?? ''}</span>
+                        <span className="ml-auto text-steppe-muted opacity-60 shrink-0">
+                          {new Date(r.created_at).toLocaleString('tr-TR')}
+                        </span>
+                        <span className="font-mono text-steppe-muted opacity-40 shrink-0" title={r.hash}>
+                          {r.hash.slice(0, 8)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )
+              )}
+            </section>
+
             {QRTIM_ENABLED && (
             <section className="gokturk-border surface-card p-8">
               <h3 className="text-[10px] uppercase tracking-widest text-steppe-muted mb-6 flex items-center gap-2"><QrCode size={12} className="text-steppe-gold" /> QRtim Entegrasyonu</h3>

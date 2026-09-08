@@ -4,6 +4,7 @@ const {
 } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 
 // Ana süreçte yakalanmamış bir hata, Electron'un "A JavaScript error occurred in
 // the main process" penceresini açar ve uygulamayı kullanılamaz hâle getirir.
@@ -490,6 +491,34 @@ ipcMain.on('clipboard:write', (e, payload) => {
   if (!text || text.length > MAX_CLIPBOARD_CHARS) return;
   if (payload.fromRemote && !controlGrants.has(e.sender.id)) return;
   try { clipboard.writeText(text); } catch { /* yok say */ }
+});
+
+// -- Cihaz oznitelikleri (denetim izi icin) -----------------------------------
+// UYARI: MAC adresi ZAYIF delildir — saniyeler icinde degistirilebilir ve
+// Windows 10+ / mobil cihazlarda Wi-Fi icin rastgelelestirme varsayilan
+// aciktir. Ayrica bir kisiye baglanabildigi anda KISISEL VERIDIR; toplanmasi
+// ayri bir isleme faaliyetidir ve aydinlatma metninde yer almalidir.
+// Bu yuzden burada capa degil, DESTEKLEYICI oznitelik olarak duruyor;
+// kaydin asil curutulemezligi hash zincirinden gelir.
+ipcMain.handle('device:identity', () => {
+  try {
+    const nets = os.networkInterfaces();
+    const macs = [];
+    for (const ad of Object.keys(nets)) {
+      for (const ni of nets[ad] || []) {
+        if (!ni.internal && ni.mac && ni.mac !== '00:00:00:00:00:00') macs.push(ni.mac);
+      }
+    }
+    let username = '';
+    try { username = os.userInfo().username; } catch { /* bazi ortamlarda okunamaz */ }
+    return {
+      hostname: os.hostname(),
+      platform: process.platform,
+      release: os.release(),
+      username,
+      macs: Array.from(new Set(macs)).slice(0, 4),
+    };
+  } catch { return {}; }
 });
 
 // -- Oturum kaydi: hedef klasor ve diske yazma --------------------------------
