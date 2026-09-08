@@ -13,7 +13,7 @@ import {
 import type { Organization, OrgMember, ContactCategory, SavedContact, OrgRole, PresenceRow } from './lib/enterprise';
 import type { User as SupabaseUser } from '@supabase/supabase-js';
 import { WebRTCManager } from './lib/webrtc';
-import type { ConnectionState, InputEventMsg, RtcQuality, ControlMsg } from './lib/webrtc';
+import type { ConnectionState, InputEventMsg, RtcQuality, ControlMsg, RemoteScreen } from './lib/webrtc';
 import { EMBED, postSessionEvent, resetSessionEvents } from './lib/embed';
 import { resetIceCache } from './lib/ice';
 
@@ -210,6 +210,9 @@ export default function App() {
   const heldKeysRef = React.useRef(new Set<string>());
   // Girdi enjeksiyonunun uzak makinede gerçekten çalışıp çalışmadığı.
   const [controlNotice, setControlNotice] = React.useState<string>('');
+  // Coklu monitor: karsi tarafin ekran listesi ve su an paylasilan ekran.
+  const [remoteScreens, setRemoteScreens] = React.useState<RemoteScreen[]>([]);
+  const [currentRemoteScreen, setCurrentRemoteScreen] = React.useState('');
   // Polling fallback refs for when Supabase Realtime WebSocket is unavailable
   const incomingPollSinceRef = React.useRef(new Date().toISOString());
   const processedOfferIdsRef = React.useRef(new Set<string>());
@@ -340,6 +343,14 @@ export default function App() {
   React.useEffect(() => {
     if (inputEnabled && remoteStream) videoContainerRef.current?.focus();
   }, [inputEnabled, remoteStream]);
+
+  // Ekran listesi yalnızca kontrol izni varken verilir; kontrol açılınca iste,
+  // kapanınca listeyi düşür (karşı taraf artık cevap vermeyecek).
+  React.useEffect(() => {
+    if (!remoteStream || rtcState !== 'connected') { setRemoteScreens([]); return; }
+    if (!inputEnabled) { setRemoteScreens([]); return; }
+    webrtcRef.current?.sendControl({ k: 'screens-req' });
+  }, [inputEnabled, remoteStream, rtcState]);
 
   // Odak/görünürlük kaybında basılı tuşları uzak tarafta bırak.
   // Operatör Alt+Tab yaptığında keyup olayı bu pencereye HİÇ gelmez; bu
@@ -1224,6 +1235,63 @@ export default function App() {
           const ok = await writeLocalClipboard(text, false);
           addLocalLog(ok ? `Uzak pano alindi (${text.length} karakter).` : 'Pano yazilamadi.', ok ? 'sys' : 'warn');
         }
+        return;
+      }
+
+      // ── Coklu monitor ──
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const api = (window as any).electronAPI;
+
+      if (msg.k === 'screens-req') {
+        // Yalnizca paylasan taraf listesini verir, yalnizca kontrol izniyle.
+        if (role !== 'receiver' || !remoteControlAllowedRef.current || !api?.listScreens) return;
+        const res = await api.listScreens();
+        m.sendControl({ k: 'screens', list: res?.list ?? [], current: res?.current ?? '' });
+        return;
+      }
+
+      if (msg.k === 'screens') {
+        // Operator tarafi: listeyi arayuze al.
+        setRemoteScreens(Array.isArray(msg.list) ? msg.list : []);
+        setCurrentRemoteScreen(typeof msg.current === 'string' ? msg.current : '');
+        return;
+      }
+
+      if (msg.k === 'screen-select') {
+        if (role !== 'receiver' || !remoteControlAllowedRef.current || !api?.selectScreen) return;
+        const ok = await api.selectScreen(msg.id);
+        if (!ok) { addLocalLog('Ekran degistirilemedi.', 'warn'); return; }
+        try {
+          // Gecise yeniden pazarlik gerekmez: replaceTrack SDP'ye dokunmaz.
+          // getUserMedia'nin chromeMediaSource yolu kullanici hareketi istemez.
+          const next = await navigator.mediaDevices.getUserMedia({
+            audio: false,
+            video: {
+              mandatory: {
+                chromeMediaSource: 'desktop',
+                chromeMediaSourceId: msg.id,
+                maxFrameRate: captureFrameRate,
+              },
+            },
+          } as unknown as MediaStreamConstraints);
+          const track = next.getVideoTracks()[0];
+          if (!track) throw new Error('Video track alinamadi');
+          await m.replaceVideoTrack(track);
+          // Eski akisi durdur, onizlemeyi guncelle.
+          const prev = localVideoRef.current?.srcObject as MediaStream | null;
+          prev?.getTracks().forEach(t => { t.onended = null; t.stop(); });
+          if (localVideoRef.current) localVideoRef.current.srcObject = next;
+          // Paylasim durdurulursa oturum kapansin (ilk akistaki davranisin ayni).
+          track.onended = async () => {
+            addLocalLog('Ekran paylasimi durduruldu — baglanti kesiliyor.', 'warn');
+            try { await m.disconnect(); } catch { /* yok say */ }
+          };
+          addLocalLog('Karsi taraf paylasilan ekrani degistirdi.', 'warn');
+          const res2 = api.listScreens ? await api.listScreens() : null;
+          m.sendControl({ k: 'screens', list: res2?.list ?? [], current: res2?.current ?? msg.id });
+        } catch (err) {
+          addLocalLog(`Ekran degistirilemedi: ${String(err)}`, 'error');
+        }
       }
     };
     m.onStateChange = (state) => {
@@ -1243,6 +1311,7 @@ export default function App() {
         setIsConnecting(false);
         setRemoteStream(null);
         setQuality(null);
+        setRemoteScreens([]);
         setInputEnabled(false);
         disableRemoteControl();
         postSessionEvent('ended', targetId, EMBED.mode);
@@ -1726,6 +1795,27 @@ export default function App() {
                         style={{ background: inputEnabled ? 'var(--accent-primary)' : 'rgba(0,0,0,0.7)', color: inputEnabled ? '#000' : 'var(--text-muted)' }}
                         title="Klavye/fare kontrolünü aç-kapat"
                       >{inputEnabled ? 'Kontrol: AÇIK' : 'Kontrol'}</button>
+                      )}
+                      {/* Coklu monitor: yalnizca kontrol aciksa ve karsi tarafta
+                          birden fazla ekran varsa gosterilir. */}
+                      {remoteScreens.length > 1 && (
+                        <select
+                          value={currentRemoteScreen}
+                          onChange={e => {
+                            const id = e.target.value;
+                            if (!id || !webrtc) return;
+                            setCurrentRemoteScreen(id);
+                            webrtc.sendControl({ k: 'screen-select', id });
+                            addLocalLog('Ekran degisikligi istendi...', 'info');
+                          }}
+                          title="Karsi tarafta paylasilan ekrani degistir"
+                          className="px-1 py-1 text-[9px] uppercase tracking-widest rounded border-0 outline-none"
+                          style={{ background: 'rgba(0,0,0,0.7)', color: 'var(--text-muted)' }}
+                        >
+                          {remoteScreens.map(sc => (
+                            <option key={sc.id} value={sc.id} style={{ background: '#111010' }}>{sc.name}</option>
+                          ))}
+                        </select>
                       )}
                       {EMBED.mode !== 'view' && (
                         <>

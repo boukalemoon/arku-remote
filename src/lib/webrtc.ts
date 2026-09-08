@@ -26,9 +26,14 @@ export type InputEventMsg =
  * `k` alanıyla ayrılır. Böylece v1.0.16 istemcileri yeni mesajları
  * "bozuk girdi" sayıp sessizce atar, girdi akışı da bozulmaz.
  */
+export type RemoteScreen = { id: string; name: string };
+
 export type ControlMsg =
   | { k: 'clip-req' }                 // "panonu bana gönder"
-  | { k: 'clip-set'; text: string };  // "bunu panona yaz"
+  | { k: 'clip-set'; text: string }   // "bunu panona yaz"
+  | { k: 'screens-req' }              // "hangi ekranların var?"
+  | { k: 'screens'; list: RemoteScreen[]; current?: string }
+  | { k: 'screen-select'; id: string }; // "şu ekrana geç"
 
 interface IncomingSignal {
   id?: string;
@@ -822,6 +827,21 @@ export class WebRTCManager {
     } catch (err) {
       this.log(`Kontrol mesaji gonderilemedi: ${String(err)}`, 'warn');
     }
+  }
+
+  /**
+   * Paylaşılan video track'ini yeniden pazarlık YAPMADAN değiştirir.
+   * Çoklu monitör geçişinde kullanılır: replaceTrack SDP'ye dokunmaz,
+   * dolayısıyla bağlantı kopmaz ve karşı taraf anında yeni ekranı görür.
+   */
+  async replaceVideoTrack(track: MediaStreamTrack): Promise<void> {
+    const sender = this.pc?.getSenders().find((s) => s.track?.kind === 'video');
+    if (!sender) throw new Error('Video göndericisi bulunamadı.');
+    track.contentHint = 'detail';
+    await sender.replaceTrack(track);
+    // Yeni track varsayilan kodlayici ayarlariyla gelir; tekrar ayarla.
+    await this.tuneVideoSender();
+    this.log('Paylaşılan ekran değiştirildi.', 'sys');
   }
 
   sendInput(event: InputEventMsg): void {

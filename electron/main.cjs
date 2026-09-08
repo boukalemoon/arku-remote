@@ -293,16 +293,19 @@ function requesterOf(request) {
 
 /** Seçilen kaynağı bir Electron display'ine bağlar (pencere ise display yok). */
 function rememberCaptureTarget(wcId, source) {
-  const isScreen = String(source.id || '').startsWith('screen:');
+  const sourceId = String(source.id || '');
+  const isScreen = sourceId.startsWith('screen:');
   if (!isScreen) {
     // Pencere paylaşımında pencerenin ekran üzerindeki dikdörtgeni bilinemez,
     // dolayısıyla fare koordinatı güvenilir şekilde eşlenemez.
-    captureTargets.set(wcId, { kind: 'window', display: null });
+    captureTargets.set(wcId, { kind: 'window', display: null, sourceId });
     return;
   }
   const displays = screen.getAllDisplays();
   const match = displays.find((d) => String(d.id) === String(source.display_id));
-  captureTargets.set(wcId, { kind: 'screen', display: match || screen.getPrimaryDisplay() });
+  captureTargets.set(wcId, {
+    kind: 'screen', display: match || screen.getPrimaryDisplay(), sourceId,
+  });
 }
 
 function setupDisplayMediaHandler() {
@@ -442,6 +445,46 @@ ipcMain.on('clipboard:write', (e, payload) => {
   if (!text || text.length > MAX_CLIPBOARD_CHARS) return;
   if (payload.fromRemote && !controlGrants.has(e.sender.id)) return;
   try { clipboard.writeText(text); } catch { /* yok say */ }
+});
+
+// ── Coklu monitor: paylasilan ekrani oturum ortasinda degistirme ─────────────
+// KONTROL IZNI SART. Hangi ekranin paylasildigini degistirmek, kullanicinin
+// secici penceresinde verdigi rizayi degistirmektir: "yalnizca 2. ekranimi
+// paylasiyorum" diyen biri, izinsiz sekilde 1. ekranini paylasir hale gelmemeli.
+// Klavye/fare izni zaten "makinemde istedigini yapabilirsin" demek oldugu icin
+// ayni kapiya baglandi; ayrica renderer her degisimde kullaniciya gunluk duser.
+ipcMain.handle('screens:list', async (e) => {
+  if (!controlGrants.has(e.sender.id)) return { list: [], current: '' };
+  try {
+    const sources = await desktopCapturer.getSources({
+      types: ['screen'], thumbnailSize: { width: 0, height: 0 },
+    });
+    // `current`: su an hangi kaynagin paylasildigi. Ilk paylasimda kaynagi
+    // secici penceresi (ana surec) sectigi icin renderer bunu bilemez;
+    // acilistan itibaren dogru secimi gosterebilmek icin buradan bildiriliyor.
+    const target = captureTargets.get(e.sender.id);
+    return {
+      list: sources.map((x) => ({ id: x.id, name: x.name })),
+      current: (target && target.sourceId) || '',
+    };
+  } catch { return { list: [], current: '' }; }
+});
+
+// Secimi kaydeder ki girdi koordinatlari YENI ekrana gore eslensin.
+// Kaynak nesnesine renderer'dan gelen haliyle guvenilmez; id ana surecte
+// yeniden listelenip dogrulanir.
+ipcMain.handle('screens:select', async (e, sourceId) => {
+  if (!controlGrants.has(e.sender.id)) return false;
+  if (typeof sourceId !== 'string' || !sourceId.startsWith('screen:')) return false;
+  try {
+    const sources = await desktopCapturer.getSources({
+      types: ['screen'], thumbnailSize: { width: 0, height: 0 },
+    });
+    const match = sources.find((x) => x.id === sourceId);
+    if (!match) return false;
+    rememberCaptureTarget(e.sender.id, match);
+    return true;
+  } catch { return false; }
 });
 
 ipcMain.on('remote-control:revoke', (e) => {

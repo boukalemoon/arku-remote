@@ -15,6 +15,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   //   pointer=false -> tek pencere paylaşıldı, yalnızca klavye iletilir.
   requestRemoteControl: () => ipcRenderer.invoke('remote-control:request'),
   revokeRemoteControl: () => ipcRenderer.send('remote-control:revoke'),
+  // Coklu monitor: paylasilan ekrani oturum ortasinda degistirme.
+  // Ikisi de ana surecte kontrol iznine baglidir.
+  listScreens: () => ipcRenderer.invoke('screens:list'),
+  selectScreen: (sourceId) => ipcRenderer.invoke('screens:select', sourceId),
   // Pano paylaşımı. forRemote/fromRemote = "işlemi karşı taraf istedi";
   // bu durumda ana süreç kontrol iznini arar (klavye/fare ile aynı kapı).
   readClipboard: (opts) => ipcRenderer.invoke('clipboard:read', opts),
