@@ -3,6 +3,7 @@ const {
   webContents, systemPreferences, clipboard,
 } = require('electron');
 const path = require('path');
+const fs = require('fs');
 
 // Ana süreçte yakalanmamış bir hata, Electron'un "A JavaScript error occurred in
 // the main process" penceresini açar ve uygulamayı kullanılamaz hâle getirir.
@@ -445,6 +446,30 @@ ipcMain.on('clipboard:write', (e, payload) => {
   if (!text || text.length > MAX_CLIPBOARD_CHARS) return;
   if (payload.fromRemote && !controlGrants.has(e.sender.id)) return;
   try { clipboard.writeText(text); } catch { /* yok say */ }
+});
+
+// -- Alinan dosyayi diske yaz --------------------------------------------------
+// GUVENLIK: dosya adini KARSI TARAF belirler. path.basename ile yol
+// ayiricilari temizlenmezse "../../Startup/x.exe" gibi bir ad varsayilan
+// kaydetme yolunu kullanicinin beklemedigi bir yere tasiyabilir.
+// Yazma yeri her durumda kullanicinin sectigi yerdir (kaydetme penceresi).
+ipcMain.handle('file:save', async (e, payload) => {
+  const rawName = payload && typeof payload.name === 'string' ? payload.name : 'dosya';
+  const data = payload && payload.data;
+  if (!data) return { ok: false, error: 'Veri yok' };
+  const safeName = path.basename(rawName) || 'dosya';
+  const win = BrowserWindow.fromWebContents(e.sender);
+  const { canceled, filePath } = await dialog.showSaveDialog(win, {
+    title: 'Alinan dosyayi kaydet',
+    defaultPath: safeName,
+  });
+  if (canceled || !filePath) return { ok: false, cancelled: true };
+  try {
+    await fs.promises.writeFile(filePath, Buffer.from(data));
+    return { ok: true, path: filePath };
+  } catch (err) {
+    return { ok: false, error: String((err && err.message) || err) };
+  }
 });
 
 // ── Coklu monitor: paylasilan ekrani oturum ortasinda degistirme ─────────────

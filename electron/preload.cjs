@@ -15,6 +15,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   //   pointer=false -> tek pencere paylaşıldı, yalnızca klavye iletilir.
   requestRemoteControl: () => ipcRenderer.invoke('remote-control:request'),
   revokeRemoteControl: () => ipcRenderer.send('remote-control:revoke'),
+  // Alinan dosyayi diske kaydet (kaydetme penceresi ana surecte acilir).
+  saveFile: (payload) => ipcRenderer.invoke('file:save', payload),
   // Coklu monitor: paylasilan ekrani oturum ortasinda degistirme.
   // Ikisi de ana surecte kontrol iznine baglidir.
   listScreens: () => ipcRenderer.invoke('screens:list'),

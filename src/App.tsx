@@ -13,7 +13,7 @@ import {
 import type { Organization, OrgMember, ContactCategory, SavedContact, OrgRole, PresenceRow } from './lib/enterprise';
 import type { User as SupabaseUser } from '@supabase/supabase-js';
 import { WebRTCManager } from './lib/webrtc';
-import type { ConnectionState, InputEventMsg, RtcQuality, ControlMsg, RemoteScreen } from './lib/webrtc';
+import type { ConnectionState, InputEventMsg, RtcQuality, ControlMsg, RemoteScreen, FileOffer } from './lib/webrtc';
 import { EMBED, postSessionEvent, resetSessionEvents } from './lib/embed';
 import { resetIceCache } from './lib/ice';
 
@@ -213,6 +213,10 @@ export default function App() {
   // Coklu monitor: karsi tarafin ekran listesi ve su an paylasilan ekran.
   const [remoteScreens, setRemoteScreens] = React.useState<RemoteScreen[]>([]);
   const [currentRemoteScreen, setCurrentRemoteScreen] = React.useState('');
+  // Dosya transferi: gelen teklif ve devam eden aktarimin ilerlemesi.
+  const [incomingFile, setIncomingFile] = React.useState<FileOffer | null>(null);
+  const [fileProgress, setFileProgress] = React.useState<{ id: string; done: number; total: number; dir: 'in' | 'out' } | null>(null);
+  const fileInputRef = React.useRef<HTMLInputElement>(null);
   // Polling fallback refs for when Supabase Realtime WebSocket is unavailable
   const incomingPollSinceRef = React.useRef(new Date().toISOString());
   const processedOfferIdsRef = React.useRef(new Set<string>());
@@ -1155,6 +1159,62 @@ export default function App() {
     addLocalLog('Uzak pano istendi...', 'info');
   };
 
+  // -- Dosya transferi --------------------------------------------------------
+  const formatBytes = (n: number): string =>
+    n >= 1048576 ? (n / 1048576).toFixed(1) + ' MB'
+    : n >= 1024 ? Math.round(n / 1024) + ' KB'
+    : n + ' B';
+
+  /** Alinan dosyayi diske yazar. Masaustunde kaydetme penceresi, webde indirme. */
+  const saveReceivedFile = async (name: string, blob: Blob) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const api = (window as any).electronAPI;
+    if (api?.saveFile) {
+      const buf = await blob.arrayBuffer();
+      const res = await api.saveFile({ name, data: new Uint8Array(buf) });
+      addLocalLog(
+        res?.ok ? `Dosya kaydedildi: ${res.path}`
+        : res?.cancelled ? 'Kaydetme iptal edildi.'
+        : `Dosya kaydedilemedi: ${res?.error ?? 'bilinmeyen hata'}`,
+        res?.ok ? 'sys' : 'warn');
+      return;
+    }
+    // Web surumu: gecici indirme baglantisi.
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = name;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+    addLocalLog(`Dosya indirildi: ${name}`, 'sys');
+  };
+
+  const pickAndSendFile = () => { fileInputRef.current?.click(); };
+
+  const handleFileChosen = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = ''; // ayni dosya tekrar secilebilsin
+    if (!file || !webrtc || rtcState !== 'connected') return;
+    const id = webrtc.offerFile(file);
+    if (!id) return;
+    setFileProgress({ id, done: 0, total: file.size, dir: 'out' });
+    addLocalLog(`Dosya teklif edildi: ${file.name} (${formatBytes(file.size)})`, 'info');
+  };
+
+  const acceptIncomingFile = () => {
+    if (!incomingFile || !webrtc) return;
+    webrtc.acceptIncomingFile(incomingFile);
+    setFileProgress({ id: incomingFile.id, done: 0, total: incomingFile.size, dir: 'in' });
+    addLocalLog(`Dosya aliniyor: ${incomingFile.name}`, 'sys');
+    setIncomingFile(null);
+  };
+
+  const rejectIncomingFile = () => {
+    if (!incomingFile || !webrtc) return;
+    webrtc.rejectIncomingFile(incomingFile.id);
+    addLocalLog('Dosya reddedildi.', 'warn');
+    setIncomingFile(null);
+  };
+
   const disableRemoteControl = () => {
     setRemoteControlAllowed(false);
     setControlNotice('');
@@ -1209,6 +1269,34 @@ export default function App() {
     const myId = currentUser?.id || connectionId;
     const m = new WebRTCManager(myId);
     m.onQuality = setQuality;
+    m.onFile = async (ev) => {
+      if (ev.t === 'offer') { setIncomingFile(ev.offer); return; }
+      if (ev.t === 'accepted') { addLocalLog('Karsi taraf dosyayi kabul etti, gonderiliyor...', 'sys'); return; }
+      if (ev.t === 'rejected') {
+        setFileProgress(null);
+        addLocalLog('Karsi taraf dosyayi reddetti.', 'warn');
+        return;
+      }
+      if (ev.t === 'progress') {
+        setFileProgress({ id: ev.id, done: ev.done, total: ev.total, dir: ev.dir });
+        return;
+      }
+      if (ev.t === 'cancelled') {
+        setFileProgress(null);
+        setIncomingFile(null);
+        addLocalLog(
+          ev.reason === 'size' ? 'Dosya beyan edilenden buyuk, transfer kesildi.'
+          : ev.reason === 'incomplete' ? 'Dosya eksik geldi, kaydedilmedi.'
+          : 'Dosya transferi iptal edildi.',
+          'warn');
+        return;
+      }
+      if (ev.t === 'complete') {
+        setFileProgress(null);
+        await saveReceivedFile(ev.name, ev.blob);
+      }
+    };
+
     m.onControl = async (msg: ControlMsg) => {
       const role = m.getRole();
       if (msg.k === 'clip-req') {
@@ -1752,6 +1840,42 @@ export default function App() {
                       <QualityChips />
                     </div>
                   )}
+                  {/* Dosya transferi - her iki taraf da gonderebilir; alan taraf
+                      her zaman onay verir. */}
+                  {rtcState === 'connected' && (
+                    <div className="mt-2 pt-2 border-t flex items-center gap-3" style={{ borderColor: 'var(--border-primary)' }}>
+                      <input ref={fileInputRef} type="file" className="hidden" onChange={handleFileChosen} />
+                      {fileProgress ? (
+                        <>
+                          <span className="text-[9px] uppercase tracking-widest text-steppe-muted whitespace-nowrap">
+                            {fileProgress.dir === 'out' ? 'Gonderiliyor' : 'Aliniyor'}
+                          </span>
+                          <div className="flex-1 h-1.5 rounded overflow-hidden" style={{ background: 'var(--border-primary)' }}>
+                            <div
+                              className="h-full transition-[width] duration-200"
+                              style={{
+                                width: `${fileProgress.total ? Math.round((fileProgress.done / fileProgress.total) * 100) : 0}%`,
+                                background: 'var(--accent-primary)',
+                              }}
+                            />
+                          </div>
+                          <span className="text-[9px] text-steppe-muted whitespace-nowrap font-mono">
+                            {formatBytes(fileProgress.done)} / {formatBytes(fileProgress.total)}
+                          </span>
+                          <button
+                            onClick={() => { webrtc?.cancelFile(fileProgress.id); setFileProgress(null); }}
+                            className="text-[9px] uppercase tracking-widest text-red-400 hover:text-red-300"
+                          >Iptal</button>
+                        </>
+                      ) : (
+                        <button
+                          onClick={pickAndSendFile}
+                          className="text-[9px] uppercase tracking-widest text-steppe-muted hover:text-steppe-gold border border-steppe-border hover:border-steppe-gold px-2 py-1 transition-colors"
+                          title="Karsi tarafa dosya gonder (karsi taraf onaylar)"
+                        >Dosya Gonder</button>
+                      )}
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -2249,6 +2373,27 @@ export default function App() {
       </main>
 
       {/* Gelen Cagri Modali */}
+      {/* Gelen dosya onayi. Dosya ASLA sorulmadan yazilmaz; kaydetme yerini de
+          kullanici secer (masaustunde kaydetme penceresi acilir). */}
+      <AnimatePresence>
+        {incomingFile && (
+          <div className="fixed inset-0 z-[210] flex items-center justify-center p-6 bg-black/80 backdrop-blur-sm">
+            <motion.div initial={{ opacity: 0, scale: 0.9 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.9 }} className="w-full max-w-sm gokturk-border p-8 text-center" style={{ background: 'var(--bg-primary)' }}>
+              <p className="text-[10px] uppercase tracking-widest text-steppe-muted mb-3">Gelen Dosya</p>
+              <p className="text-sm text-steppe-gold break-all mb-1">{incomingFile.name}</p>
+              <p className="text-[11px] text-steppe-muted mb-6">{formatBytes(incomingFile.size)}</p>
+              <p className="text-[10px] text-yellow-400 leading-relaxed mb-6">
+                Yalnizca guvendiginiz kisilerden dosya kabul edin. Kaydedecegi yeri siz secersiniz.
+              </p>
+              <div className="flex gap-3">
+                <button onClick={rejectIncomingFile} className="btn-ghost flex-1 py-2">Reddet</button>
+                <button onClick={acceptIncomingFile} className="btn-primary flex-1 py-2">Kabul Et</button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
       <AnimatePresence>
         {incomingCall && (
           <div className="fixed inset-0 z-[200] flex items-center justify-center p-6 bg-black/80 backdrop-blur-sm">

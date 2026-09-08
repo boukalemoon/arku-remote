@@ -33,7 +33,39 @@ export type ControlMsg =
   | { k: 'clip-set'; text: string }   // "bunu panona yaz"
   | { k: 'screens-req' }              // "hangi ekranların var?"
   | { k: 'screens'; list: RemoteScreen[]; current?: string }
-  | { k: 'screen-select'; id: string }; // "şu ekrana geç"
+  | { k: 'screen-select'; id: string } // "şu ekrana geç"
+  // Dosya transferi. İkili veri ayrı gönderilir (ArrayBuffer); bu mesajlar
+  // yalnızca el sıkışma ve sonlandırma içindir.
+  | { k: 'file-offer'; id: string; name: string; size: number }
+  | { k: 'file-accept'; id: string }
+  | { k: 'file-reject'; id: string }
+  | { k: 'file-end'; id: string }
+  | { k: 'file-cancel'; id: string; reason?: string };
+
+/** Karşı tarafın göndermek istediği dosyanın künyesi. */
+export interface FileOffer { id: string; name: string; size: number }
+
+/** Dosya transferi yaşam döngüsü olayları (arayüz bunları dinler). */
+export type FileEvent =
+  | { t: 'offer'; offer: FileOffer }
+  | { t: 'accepted'; id: string }
+  | { t: 'rejected'; id: string }
+  | { t: 'progress'; id: string; done: number; total: number; dir: 'in' | 'out' }
+  | { t: 'complete'; id: string; name: string; blob: Blob }
+  | { t: 'cancelled'; id: string; reason?: string };
+
+/**
+ * Dosya transferi sınırları.
+ *
+ * CHUNK: SCTP mesaj sınırının güvenli altında kalan klasik değer. Daha
+ * büyüğü bazı tarayıcılarda kanalı kapatır.
+ * BUFFER: geri basınç eşiği — bufferedAmount bunu aşarsa gönderim
+ * duraklar. Olmadan büyük dosya belleği şişirip kanalı düşürür.
+ * MAX_SIZE: alıcı tarafta dosya bellekte birleştirildiği için üst sınır.
+ */
+const FILE_CHUNK_SIZE = 16 * 1024;
+const FILE_BUFFER_THRESHOLD = 1 * 1024 * 1024;
+const MAX_FILE_BYTES = 200 * 1024 * 1024;
 
 interface IncomingSignal {
   id?: string;
@@ -112,6 +144,10 @@ export class WebRTCManager {
   /** connections satirinin id'si — oturum bitince suresi yazilir. */
   private connectionRowId: string | null = null;
   private connectedAt: number | null = null;
+  /** Giden transfer (tek seferde bir tane). */
+  private outgoingFile: { id: string; file: File; cancelled: boolean } | null = null;
+  /** Gelen transfer — ikili parçalar buna aittir (tek seferde bir tane). */
+  private incomingFile: { id: string; name: string; size: number; parts: ArrayBuffer[]; received: number } | null = null;
   /** Bit hızı/kayıp farkını hesaplamak için bir önceki ölçüm. */
   private lastStatsSample: { at: number; bytes: number; lost: number; packets: number } | null = null;
 
@@ -124,6 +160,8 @@ export class WebRTCManager {
   onQuality?: (q: RtcQuality | null) => void;
   /** Girdi disi kontrol mesajlari (pano vb.). */
   onControl?: (msg: ControlMsg) => void;
+  /** Dosya transferi olaylari. */
+  onFile?: (ev: FileEvent) => void;
 
   constructor(myId: string) {
     this.myId = myId;
@@ -208,15 +246,25 @@ export class WebRTCManager {
 
   private setupDataChannel(dc: RTCDataChannel) {
     this.dataChannel = dc;
+    // Dosya parcalari ikili gelir; varsayilan 'blob' senkron okumayi zorlastirir.
+    dc.binaryType = 'arraybuffer';
+    dc.bufferedAmountLowThreshold = FILE_BUFFER_THRESHOLD;
     dc.onopen = () => this.log('Veri kanalı açıldı.', 'sys');
     dc.onclose = () => this.log('Veri kanalı kapandı.', 'sys');
     dc.onerror = () => this.log('Veri kanalı hatası.', 'warn');
     dc.onmessage = (e) => {
+      // Ikili veri = aktif gelen dosyanin parcasi. Ayni anda tek transfer
+      // oldugu icin parcaya ayrica kimlik yazmaya gerek yok.
+      if (e.data instanceof ArrayBuffer) { this.onFileChunk(e.data); return; }
       try {
         const msg = JSON.parse(e.data as string) as Record<string, unknown>;
         // `k` tasiyan mesajlar kontrol mesajidir; digerleri eski girdi bicimi.
         if (msg && typeof msg.k === 'string') {
-          this.onControl?.(msg as unknown as ControlMsg);
+          const ctl = msg as unknown as ControlMsg;
+          // Dosya mesajlari manager icinde islenir; arayuze yalnizca
+          // onFile olaylari olarak yansir.
+          if (this.handleFileControl(ctl)) return;
+          this.onControl?.(ctl);
           return;
         }
         this.onInputEvent?.(msg as unknown as InputEventMsg);
@@ -819,6 +867,140 @@ export class WebRTCManager {
     this.cleanupTimer = setInterval(() => this.cleanSignals(), 30000);
   }
 
+  // -- Dosya transferi ---------------------------------------------------------
+
+  /** Gelen ikili parcayi biriktirir ve ilerlemeyi bildirir. */
+  private onFileChunk(buf: ArrayBuffer): void {
+    const inc = this.incomingFile;
+    if (!inc) return; // kabul edilmemis transferden gelen veri - yok say
+    inc.parts.push(buf);
+    inc.received += buf.byteLength;
+    // Beyan edilenden fazlasini gondermeye calisan esi kes.
+    if (inc.received > inc.size) {
+      this.log('Dosya beyan edilenden buyuk - transfer iptal edildi.', 'error');
+      this.sendControl({ k: 'file-cancel', id: inc.id, reason: 'size' });
+      this.onFile?.({ t: 'cancelled', id: inc.id, reason: 'size' });
+      this.incomingFile = null;
+      return;
+    }
+    this.onFile?.({ t: 'progress', id: inc.id, done: inc.received, total: inc.size, dir: 'in' });
+  }
+
+  /** Karsi tarafa dosya gondermeyi teklif eder. Kabul edilirse gonderim baslar. */
+  offerFile(file: File): string | null {
+    if (this.dataChannel?.readyState !== 'open') {
+      this.log('Veri kanali acik degil, dosya gonderilemez.', 'warn');
+      return null;
+    }
+    if (this.outgoingFile) {
+      this.log('Zaten devam eden bir gonderim var.', 'warn');
+      return null;
+    }
+    if (file.size > MAX_FILE_BYTES) {
+      this.log('Dosya cok buyuk (ust sinir ' + Math.round(MAX_FILE_BYTES / 1048576) + ' MB).', 'error');
+      return null;
+    }
+    const id = 'f' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    this.outgoingFile = { id, file, cancelled: false };
+    this.sendControl({ k: 'file-offer', id, name: file.name, size: file.size });
+    return id;
+  }
+
+  /** Gelen teklifi kabul eder (arayuz kullaniciya sorduktan SONRA cagirir). */
+  acceptIncomingFile(offer: FileOffer): void {
+    if (offer.size > MAX_FILE_BYTES) { this.rejectIncomingFile(offer.id); return; }
+    this.incomingFile = { id: offer.id, name: offer.name, size: offer.size, parts: [], received: 0 };
+    this.sendControl({ k: 'file-accept', id: offer.id });
+  }
+
+  rejectIncomingFile(id: string): void {
+    this.incomingFile = null;
+    this.sendControl({ k: 'file-reject', id });
+  }
+
+  /** Devam eden gonderimi/alimi iptal eder. */
+  cancelFile(id: string): void {
+    if (this.outgoingFile?.id === id) this.outgoingFile.cancelled = true;
+    if (this.incomingFile?.id === id) this.incomingFile = null;
+    this.sendControl({ k: 'file-cancel', id });
+  }
+
+  /** Kanal bosalana kadar bekler - geri basinc olmadan buyuk dosya kanali dusurur. */
+  private waitForDrain(dc: RTCDataChannel): Promise<void> {
+    if (dc.bufferedAmount < FILE_BUFFER_THRESHOLD) return Promise.resolve();
+    return new Promise((resolve) => {
+      const onLow = () => { dc.removeEventListener('bufferedamountlow', onLow); resolve(); };
+      dc.addEventListener('bufferedamountlow', onLow);
+    });
+  }
+
+  /** Kabul alindiktan sonra dosyayi parca parca gonderir. */
+  private async pumpOutgoingFile(): Promise<void> {
+    const out = this.outgoingFile;
+    const dc = this.dataChannel;
+    if (!out || !dc) return;
+    let offset = 0;
+    try {
+      while (offset < out.file.size) {
+        if (out.cancelled || dc.readyState !== 'open') break;
+        await this.waitForDrain(dc);
+        if (out.cancelled || dc.readyState !== 'open') break;
+        const buf = await out.file.slice(offset, offset + FILE_CHUNK_SIZE).arrayBuffer();
+        dc.send(buf);
+        offset += buf.byteLength;
+        this.onFile?.({ t: 'progress', id: out.id, done: offset, total: out.file.size, dir: 'out' });
+      }
+      if (!out.cancelled && dc.readyState === 'open' && offset >= out.file.size) {
+        this.sendControl({ k: 'file-end', id: out.id });
+        this.log('Dosya gonderildi: ' + out.file.name, 'sys');
+      }
+    } catch (err) {
+      this.log('Dosya gonderilemedi: ' + String(err), 'error');
+      this.onFile?.({ t: 'cancelled', id: out.id, reason: 'error' });
+    } finally {
+      if (this.outgoingFile?.id === out.id) this.outgoingFile = null;
+    }
+  }
+
+  /** Dosya kontrol mesajlarini isler. true donerse mesaj tuketildi. */
+  private handleFileControl(msg: ControlMsg): boolean {
+    if (msg.k === 'file-offer') {
+      // Kabul kararini KULLANICI verir; arayuz acceptIncomingFile/reject cagirir.
+      this.onFile?.({ t: 'offer', offer: { id: msg.id, name: msg.name, size: msg.size } });
+      return true;
+    }
+    if (msg.k === 'file-accept') {
+      if (this.outgoingFile?.id !== msg.id) return true;
+      this.onFile?.({ t: 'accepted', id: msg.id });
+      void this.pumpOutgoingFile();
+      return true;
+    }
+    if (msg.k === 'file-reject') {
+      if (this.outgoingFile?.id === msg.id) this.outgoingFile = null;
+      this.onFile?.({ t: 'rejected', id: msg.id });
+      return true;
+    }
+    if (msg.k === 'file-end') {
+      const inc = this.incomingFile;
+      if (!inc || inc.id !== msg.id) return true;
+      this.incomingFile = null;
+      // Eksik geldiyse tamamlanmis sayma.
+      if (inc.received < inc.size) {
+        this.onFile?.({ t: 'cancelled', id: inc.id, reason: 'incomplete' });
+        return true;
+      }
+      this.onFile?.({ t: 'complete', id: inc.id, name: inc.name, blob: new Blob(inc.parts) });
+      return true;
+    }
+    if (msg.k === 'file-cancel') {
+      if (this.outgoingFile?.id === msg.id) this.outgoingFile.cancelled = true;
+      if (this.incomingFile?.id === msg.id) this.incomingFile = null;
+      this.onFile?.({ t: 'cancelled', id: msg.id, reason: msg.reason });
+      return true;
+    }
+    return false;
+  }
+
   /** Girdi disi kontrol mesaji gonderir (pano vb.). */
   sendControl(msg: ControlMsg): void {
     if (this.dataChannel?.readyState !== 'open') return;
@@ -883,6 +1065,10 @@ export class WebRTCManager {
   private close() {
     this.stopPolling();
     this.stopStats();
+    // Devam eden transferler baglantiyla birlikte duser.
+    if (this.outgoingFile) this.outgoingFile.cancelled = true;
+    this.outgoingFile = null;
+    this.incomingFile = null;
     // Oturum suresi ve bitis zamani geceye yazilir (beklenmez).
     this.finishConnectionRecord();
     this.dataChannel?.close();
