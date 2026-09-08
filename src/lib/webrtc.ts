@@ -12,7 +12,11 @@ export type InputEventMsg =
   | { type: 'click'; button: number; x: number; y: number }
   | { type: 'wheel'; dx: number; dy: number; x: number; y: number }
   | { type: 'keydown'; key: string; code: string }
-  | { type: 'keyup'; key: string; code: string };
+  | { type: 'keyup'; key: string; code: string }
+  // Kontrol eden taraf odağı kaybettiğinde gönderilir: basılı kalan tüm
+  // tuş ve düğmeler uzak makinede bırakılır. Bu olmadan pencere değiştiren
+  // operatör uzak bilgisayarda Ctrl'ü sonsuza kadar basılı bırakıyordu.
+  | { type: 'release-all' };
 
 interface IncomingSignal {
   id?: string;
@@ -49,6 +53,14 @@ export interface RtcQuality {
 type StatsRow = Record<string, unknown> & { id?: string; type?: string };
 
 const num = (v: unknown): number | null => (typeof v === 'number' && isFinite(v) ? v : null);
+
+/**
+ * Ekran paylaşımı için üst bit hızı sınırı (bit/sn).
+ * 4 Mbps, 1080p masaüstü içeriğini metin okunur kalacak şekilde taşır;
+ * daha yükseği relay (TURN) maliyetini gereksiz artırır. Kodlayıcı bu tavana
+ * ancak ekranda hareket varken yaklaşır, durağan ekranda çok daha az kullanır.
+ */
+const MAX_VIDEO_BITRATE = 4_000_000;
 
 export class WebRTCManager {
   private pc: RTCPeerConnection | null = null;
@@ -280,6 +292,38 @@ export class WebRTCManager {
     } catch (err) {
       this.log(`ICE restart başarısız: ${String(err)}`, 'error');
       this.onStateChange?.('disconnected');
+    }
+  }
+
+  /**
+   * Video göndericisini uzak masaüstü için ayarlar.
+   *
+   * Varsayılanlar hareketli video içindir ve ekran paylaşımında yanlış sonuç
+   * verir: kodlayıcı önce ÇÖZÜNÜRLÜĞÜ düşürür, metin bulanıklaşır. Doğrusu
+   * tersidir — çözünürlüğü koru, gerekirse kare hızını düşür.
+   *
+   * setParameters bazı tarayıcı/sürücü kombinasyonlarında desteklenmez;
+   * başarısızlık bağlantıyı etkilemez, yalnızca günlüğe yazılır.
+   */
+  private async tuneVideoSender(): Promise<void> {
+    const sender = this.pc?.getSenders().find((s) => s.track?.kind === 'video');
+    if (!sender) return;
+    try {
+      const params = sender.getParameters();
+      if (!params.encodings || params.encodings.length === 0) {
+        // Bazı tarayıcılar encodings'i setLocalDescription'dan önce boş verir.
+        params.encodings = [{}];
+      }
+      params.encodings[0].maxBitrate = MAX_VIDEO_BITRATE;
+      // Kaynak track'in kare hızını üst sınır olarak ver (kullanıcı ayarı).
+      const fps = sender.track?.getSettings().frameRate;
+      if (typeof fps === 'number' && fps > 0) params.encodings[0].maxFramerate = Math.round(fps);
+      // degradationPreference bazı TS lib sürümlerinde tanımlı değil.
+      (params as { degradationPreference?: string }).degradationPreference = 'maintain-resolution';
+      await sender.setParameters(params);
+      this.log(`Video kodlayıcı ayarlandı: ${Math.round(MAX_VIDEO_BITRATE / 1000)} kbps, çözünürlük korumalı.`, 'sys');
+    } catch (err) {
+      this.log(`Video kodlayıcı ayarlanamadı (varsayılanlarla devam): ${String(err)}`, 'warn');
     }
   }
 
@@ -658,7 +702,13 @@ export class WebRTCManager {
     await this.prepareIce();
 
     const pc = this.buildPC();
+    // Ekran içeriği "hareketli video" DEĞİLDİR. contentHint olmadan WebRTC
+    // bant genişliği düştüğünde çözünürlüğü kısar ve uzak masaüstündeki metin
+    // okunamaz hâle gelir. 'detail' kodlayıcıya keskinliği koru, gerekirse
+    // kare hızından ver der.
+    screenStream.getVideoTracks().forEach((t) => { t.contentHint = 'detail'; });
     screenStream.getTracks().forEach(track => pc.addTrack(track, screenStream));
+    await this.tuneVideoSender();
 
     await this.subscribe();
 

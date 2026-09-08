@@ -11,6 +11,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
   checkForUpdates: () => ipcRenderer.invoke('check-for-updates'),
   // Uzaktan kontrol izni: onayı ana süreç kendi penceresinde sorar, kararı
   // kendisi saklar. Web içeriği izni tek başına veremez.
+  // Dönüş: { granted, pointer, reason?, error? }
+  //   pointer=false -> tek pencere paylaşıldı, yalnızca klavye iletilir.
   requestRemoteControl: () => ipcRenderer.invoke('remote-control:request'),
   revokeRemoteControl: () => ipcRenderer.send('remote-control:revoke'),
+  // Girdi enjeksiyonu bu makinede çalışabilir mi (nut-js yüklü mü, macOS
+  // erişilebilirlik izni var mı). Arayüz sessiz başarısızlık yerine sebebi gösterir.
+  remoteControlStatus: () => ipcRenderer.invoke('remote-control:status'),
 });

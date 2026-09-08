@@ -131,6 +131,11 @@ export default function App() {
   const [orgMembers, setOrgMembers] = React.useState<OrgMember[]>([]);
   const caps = planCapabilities(entitlements.plan);
   const lastMouseMoveRef = React.useRef(0);
+  // Şu an basılı tuttuğumuz tuşlar (KeyboardEvent.code). Odak kaybedilirse
+  // keyup asla gelmez; bunları uzak tarafta bırakmak için izliyoruz.
+  const heldKeysRef = React.useRef(new Set<string>());
+  // Girdi enjeksiyonunun uzak makinede gerçekten çalışıp çalışmadığı.
+  const [controlNotice, setControlNotice] = React.useState<string>('');
   // Polling fallback refs for when Supabase Realtime WebSocket is unavailable
   const incomingPollSinceRef = React.useRef(new Date().toISOString());
   const processedOfferIdsRef = React.useRef(new Set<string>());
@@ -144,38 +149,89 @@ export default function App() {
   const ts = () => new Date().toLocaleTimeString('tr-TR');
   const addLocalLog = (msg: string, type: LogType = 'info') => setLogs(p => [{ time: ts(), msg, type }, ...p].slice(0, 50));
 
+  const canSendInput = () =>
+    inputEnabled && EMBED.mode !== 'view' && !!webrtc && rtcState === 'connected' && !!remoteStream;
+
+  /**
+   * Olay, video üstündeki kendi düğmelerimizden mi geliyor?
+   * "Kontrol", "Tam Ekran" ve "Kes" düğmeleri kapsayıcının İÇİNDE durduğu için
+   * onlara tıklamak uzak tarafa da tıklama gönderiyordu (sağ üst köşeye).
+   */
+  const isOverlayControl = (e: React.MouseEvent) =>
+    !!(e.target as HTMLElement | null)?.closest?.('button');
+
+  /**
+   * İmleç konumunu videonun GERÇEK çizim alanına göre normalize eder.
+   *
+   * Video `object-contain` ile 16:9 bir kutuda duruyor ama uzak ekran 16:10
+   * (çoğu dizüstü), 4:3 veya rastgele en-boy oranlı bir pencere olabilir; o
+   * zaman siyah bantlar (letterbox) oluşur. Eskiden koordinat KAPSAYICI kutuya
+   * göre hesaplanıyordu, dolayısıyla oranlar farklı olduğu her an tüm
+   * tıklamalar kayıyordu.
+   *
+   * Bandın üstüne gelen tıklamalar kenara sıkıştırılmak yerine hiç
+   * gönderilmez — orada uzak ekranda karşılığı olan bir nokta yoktur.
+   */
+  const normalizeToVideo = (clientX: number, clientY: number): { x: number; y: number } | null => {
+    const v = remoteVideoRef.current;
+    if (!v || !v.videoWidth || !v.videoHeight) return null;
+    const r = v.getBoundingClientRect();
+    if (!r.width || !r.height) return null;
+    const scale = Math.min(r.width / v.videoWidth, r.height / v.videoHeight);
+    const dw = v.videoWidth * scale;
+    const dh = v.videoHeight * scale;
+    const x = (clientX - r.left - (r.width - dw) / 2) / dw;
+    const y = (clientY - r.top - (r.height - dh) / 2) / dh;
+    if (x < 0 || x > 1 || y < 0 || y > 1) return null;
+    return { x, y };
+  };
+
   const handleVideoMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (!inputEnabled || EMBED.mode === 'view' || !webrtc || rtcState !== 'connected' || !remoteStream) return;
+    if (!canSendInput()) return;
+    if (isOverlayControl(e)) return;
     const now = Date.now();
     if (now - lastMouseMoveRef.current < 33) return; // ~30 fps throttle
+    const p = normalizeToVideo(e.clientX, e.clientY);
+    if (!p) return;
     lastMouseMoveRef.current = now;
-    const rect = e.currentTarget.getBoundingClientRect();
-    webrtc.sendInput({ type: 'mousemove', x: (e.clientX - rect.left) / rect.width, y: (e.clientY - rect.top) / rect.height });
+    webrtc!.sendInput({ type: 'mousemove', x: p.x, y: p.y });
   };
   const handleVideoMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (!inputEnabled || EMBED.mode === 'view' || !webrtc || rtcState !== 'connected' || !remoteStream) return;
+    if (!canSendInput()) return;
+    if (isOverlayControl(e)) return;
+    // preventDefault tıklayarak odaklanmayı da iptal eder; klavye
+    // yönlendirmesinin çalışması için odağı ELLE veriyoruz. Eskiden odak
+    // hangi öğede kaldıysa klavye oraya gidiyordu — çoğu zaman hiçbir yere.
     e.preventDefault();
-    const rect = e.currentTarget.getBoundingClientRect();
-    webrtc.sendInput({ type: 'mousedown', button: e.button, x: (e.clientX - rect.left) / rect.width, y: (e.clientY - rect.top) / rect.height });
+    videoContainerRef.current?.focus();
+    const p = normalizeToVideo(e.clientX, e.clientY);
+    if (!p) return;
+    webrtc!.sendInput({ type: 'mousedown', button: e.button, x: p.x, y: p.y });
   };
   const handleVideoMouseUp = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (!inputEnabled || EMBED.mode === 'view' || !webrtc || rtcState !== 'connected' || !remoteStream) return;
-    const rect = e.currentTarget.getBoundingClientRect();
-    webrtc.sendInput({ type: 'mouseup', button: e.button, x: (e.clientX - rect.left) / rect.width, y: (e.clientY - rect.top) / rect.height });
+    if (!canSendInput()) return;
+    if (isOverlayControl(e)) return;
+    const p = normalizeToVideo(e.clientX, e.clientY);
+    if (!p) return;
+    webrtc!.sendInput({ type: 'mouseup', button: e.button, x: p.x, y: p.y });
   };
   const handleVideoWheel = (e: React.WheelEvent<HTMLDivElement>) => {
-    if (!inputEnabled || EMBED.mode === 'view' || !webrtc || rtcState !== 'connected' || !remoteStream) return;
-    const rect = e.currentTarget.getBoundingClientRect();
-    webrtc.sendInput({ type: 'wheel', dx: e.deltaX, dy: e.deltaY, x: (e.clientX - rect.left) / rect.width, y: (e.clientY - rect.top) / rect.height });
+    if (!canSendInput()) return;
+    if (isOverlayControl(e)) return;
+    const p = normalizeToVideo(e.clientX, e.clientY);
+    if (!p) return;
+    webrtc!.sendInput({ type: 'wheel', dx: e.deltaX, dy: e.deltaY, x: p.x, y: p.y });
   };
   const handleVideoKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
-    if (!inputEnabled || EMBED.mode === 'view' || !webrtc || rtcState !== 'connected' || !remoteStream) return;
+    if (!canSendInput()) return;
     e.preventDefault();
-    webrtc.sendInput({ type: 'keydown', key: e.key, code: e.code });
+    heldKeysRef.current.add(e.code);
+    webrtc!.sendInput({ type: 'keydown', key: e.key, code: e.code });
   };
   const handleVideoKeyUp = (e: React.KeyboardEvent<HTMLDivElement>) => {
-    if (!inputEnabled || EMBED.mode === 'view' || !webrtc || rtcState !== 'connected' || !remoteStream) return;
-    webrtc.sendInput({ type: 'keyup', key: e.key, code: e.code });
+    if (!canSendInput()) return;
+    heldKeysRef.current.delete(e.code);
+    webrtc!.sendInput({ type: 'keyup', key: e.key, code: e.code });
   };
   const addLog = async (msg: string, type: LogType = 'info') => {
     addLocalLog(msg, type);
@@ -202,6 +258,46 @@ export default function App() {
       remoteVideoRef.current.play().catch(() => {});
     }
   }, [remoteStream]);
+
+  // Kontrol açıldığı anda video alanına odaklan — kullanıcı ayrıca tıklamak
+  // zorunda kalmasın. (Tıklama yolu da mousedown içinde ayrıca ele alınıyor.)
+  React.useEffect(() => {
+    if (inputEnabled && remoteStream) videoContainerRef.current?.focus();
+  }, [inputEnabled, remoteStream]);
+
+  // Odak/görünürlük kaybında basılı tuşları uzak tarafta bırak.
+  // Operatör Alt+Tab yaptığında keyup olayı bu pencereye HİÇ gelmez; bu
+  // olmadan uzak makinede Alt (veya Ctrl/Shift) basılı kalıyordu.
+  React.useEffect(() => {
+    const releaseAll = () => {
+      const held = heldKeysRef.current;
+      const mgr = webrtcRef.current;
+      if (!mgr) { held.clear(); return; }
+      for (const code of held) mgr.sendInput({ type: 'keyup', key: '', code });
+      held.clear();
+      // Uzak taraf ayrıca kendi izlediği her şeyi bıraksın (fare düğmeleri dahil).
+      mgr.sendInput({ type: 'release-all' });
+    };
+    const onVisibility = () => { if (document.hidden) releaseAll(); };
+    window.addEventListener('blur', releaseAll);
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      window.removeEventListener('blur', releaseAll);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, []);
+
+  // Kontrol kapatıldığında da basılı tuşlar kalmamalı.
+  React.useEffect(() => {
+    if (inputEnabled) return;
+    const held = heldKeysRef.current;
+    const mgr = webrtcRef.current;
+    if (mgr && held.size > 0) {
+      for (const code of held) mgr.sendInput({ type: 'keyup', key: '', code });
+      mgr.sendInput({ type: 'release-all' });
+    }
+    held.clear();
+  }, [inputEnabled]);
 
   // Kendi giden bağlantı denememizi yerel olarak sonlandır (çağrı çakışmasında
   // geri çekilirken kullanılır). Yalnızca ref'lere dokunur, bayat closure riski yok.
@@ -852,6 +948,7 @@ export default function App() {
   // asıl kapı orası; buradaki bayrak yalnızca arayüz durumudur.
   const disableRemoteControl = () => {
     setRemoteControlAllowed(false);
+    setControlNotice('');
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (window as any).electronAPI?.revokeRemoteControl?.();
   };
@@ -867,9 +964,33 @@ export default function App() {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const api = (window as any).electronAPI;
     if (api?.requestRemoteControl) {
-      let granted = false;
-      try { granted = await api.requestRemoteControl(); } catch { granted = false; }
-      if (!granted) { addLocalLog('Uzaktan kontrol izni verilmedi.', 'warn'); return; }
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let res: any = null;
+      try { res = await api.requestRemoteControl(); } catch { res = null; }
+      // Eski preload yalnızca boolean döndürüyordu; yeni sürüm
+      // { granted, pointer, reason, error } veriyor. İkisi de desteklenir.
+      const granted = res === true || res?.granted === true;
+      if (!granted) {
+        // Eskiden burada tek bir "izin verilmedi" satırı vardı ve nut-js hiç
+        // yüklenmediyse kullanıcı sebebini ASLA öğrenemiyordu.
+        const reason = res?.reason;
+        addLocalLog(
+          reason === 'unavailable'
+            ? `Uzaktan kontrol bu kurulumda kullanilamiyor${res?.error ? `: ${res.error}` : '.'}`
+            : reason === 'accessibility'
+              ? 'macOS Erisilebilirlik izni yok — Sistem Ayarlari > Gizlilik ve Guvenlik > Erisilebilirlik.'
+              : 'Uzaktan kontrol izni verilmedi.',
+          reason === 'denied' || !reason ? 'warn' : 'error',
+        );
+        return;
+      }
+      // Tek pencere paylaşıldıysa fare koordinatı güvenilir eşlenemez;
+      // ana süreç fareyi reddeder, klavye çalışmaya devam eder.
+      const pointerOff = res !== true && res?.pointer === false;
+      setControlNotice(pointerOff ? 'Yalnizca klavye' : '');
+      if (pointerOff) {
+        addLocalLog('Tek pencere paylasildi: fare kontrolu kapali, klavye calisiyor. Fare icin tum ekrani paylasin.', 'warn');
+      }
     }
     setRemoteControlAllowed(true);
     addLocalLog('Uzaktan kontrole izin verildi.', 'warn');
@@ -1009,7 +1130,12 @@ export default function App() {
     // (button click). Closing the modal first breaks the gesture chain in Chrome.
     let screen: MediaStream | null = null;
     try {
-      screen = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: captureFrameRate }, audio: false });
+      screen = await navigator.mediaDevices.getDisplayMedia({
+        // cursor:'always' — operatör imleci görebilmeli. Standart dışı ama
+        // Chromium bunu destekliyor; desteklemeyen tarayıcı sessizce yok sayar.
+        video: { frameRate: captureFrameRate, cursor: 'always' } as MediaTrackConstraints,
+        audio: false,
+      });
     } catch { addLog('Ekran paylasimi secilmedi veya reddedildi.', 'error'); return; }
     setIncomingCall(null);
     if (localVideoRef.current) localVideoRef.current.srcObject = screen;
@@ -1372,6 +1498,9 @@ export default function App() {
                       <div className="absolute bottom-3 left-3 flex items-center gap-2 px-2 py-1 rounded" style={{ background: 'rgba(0,0,0,0.7)' }}>
                         <div className="w-2 h-2 rounded-full bg-steppe-gold animate-pulse" />
                         <span className="text-[9px] text-steppe-gold uppercase tracking-widest">Karsi taraf kontrol edebilir</span>
+                        {controlNotice && (
+                          <span className="text-[9px] uppercase tracking-widest pl-2 ml-1 border-l border-steppe-border text-yellow-400">{controlNotice}</span>
+                        )}
                       </div>
                     )}
                   </div>

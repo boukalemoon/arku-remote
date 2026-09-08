@@ -1,4 +1,7 @@
-const { app, BrowserWindow, session, desktopCapturer, shell, ipcMain, screen, dialog } = require('electron');
+const {
+  app, BrowserWindow, session, desktopCapturer, shell, ipcMain, screen, dialog,
+  webContents, systemPreferences,
+} = require('electron');
 const path = require('path');
 
 // Ana süreçte yakalanmamış bir hata, Electron'un "A JavaScript error occurred in
@@ -169,7 +172,12 @@ if (isDev) {
   // edilmiştir ve `win.webContents` okumak "Object has been destroyed" fırlatır —
   // v1.0.14'te ana süreci çökerten hata buydu.
   const wcId = win.webContents.id;
-  const dropGrant = () => controlGrants.delete(wcId);
+  const dropGrant = () => {
+    controlGrants.delete(wcId);
+    captureTargets.delete(wcId);
+    // Basılı kalmış tuşları bırak — pencere kapanırken/gezinirken keyup gelmez.
+    queueRelease(wcId);
+  };
   win.webContents.on('did-start-navigation', dropGrant);
   win.on('closed', dropGrant);
 
@@ -265,13 +273,49 @@ function pickDisplaySource(parent, audioRequested) {
   });
 }
 
+// ── Paylaşılan kaynağın hangi ekran olduğu ───────────────────────────────────
+// Uzaktan gelen fare koordinatları 0..1 aralığında normalize edilmiştir; onları
+// mutlak ekran konumuna çevirmek için HANGİ ekranın paylaşıldığını bilmek
+// gerekir. Eskiden her zaman birincil ekran varsayılıyordu.
+const captureTargets = new Map(); // paylaşan renderer webContents.id -> { kind, display }
+
+/** getDisplayMedia isteğini yapan renderer'ı bulur. */
+function requesterOf(request) {
+  try {
+    if (request && request.frame) {
+      const wc = webContents.fromFrame(request.frame);
+      if (wc) return wc;
+    }
+  } catch { /* eski Electron / kare yok — aşağıya düş */ }
+  const win = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0];
+  return win && !win.isDestroyed() ? win.webContents : null;
+}
+
+/** Seçilen kaynağı bir Electron display'ine bağlar (pencere ise display yok). */
+function rememberCaptureTarget(wcId, source) {
+  const isScreen = String(source.id || '').startsWith('screen:');
+  if (!isScreen) {
+    // Pencere paylaşımında pencerenin ekran üzerindeki dikdörtgeni bilinemez,
+    // dolayısıyla fare koordinatı güvenilir şekilde eşlenemez.
+    captureTargets.set(wcId, { kind: 'window', display: null });
+    return;
+  }
+  const displays = screen.getAllDisplays();
+  const match = displays.find((d) => String(d.id) === String(source.display_id));
+  captureTargets.set(wcId, { kind: 'screen', display: match || screen.getPrimaryDisplay() });
+}
+
 function setupDisplayMediaHandler() {
   session.defaultSession.setDisplayMediaRequestHandler(
     (request, callback) => {
+      const requester = requesterOf(request);
       const parent = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0];
       pickDisplaySource(parent, !!request.audioRequested).then((choice) => {
         // Seçim yapılmadıysa isteği reddet: boş nesne "kaynak yok" demektir.
         if (!choice) { callback({}); return; }
+        if (requester && !requester.isDestroyed()) {
+          rememberCaptureTarget(requester.id, choice.source);
+        }
         callback({
           video: choice.source,
           ...(request.audioRequested && choice.withAudio ? { audio: 'loopback' } : {}),
@@ -290,9 +334,71 @@ function setupDisplayMediaHandler() {
 // bir onay penceresiyle veriliyor ve ana süreçte tutuluyor.
 const controlGrants = new Set(); // izin verilmiş renderer webContents.id'leri
 
+/**
+ * Girdi enjeksiyonu bu makinede gerçekten çalışabilir mi?
+ *
+ * Eskiden nut-js yüklenemediğinde her şey SESSİZCE yutuluyordu: kullanıcı
+ * "Kontrol İzni: AÇIK" görüyor, karşı taraf "Kontrol Aktif" görüyor ama hiçbir
+ * şey olmuyordu. macOS'ta Erişilebilirlik izni hiç istenmediği için kontrol
+ * orada hiç çalışmıyordu ve sebebi hiçbir yerde görünmüyordu.
+ */
+function remoteControlStatus() {
+  const mod = loadNut();
+  const status = {
+    available: !!mod,
+    error: nutError,
+    platform: process.platform,
+    accessibility: true, // yalnızca macOS'ta anlamlı
+  };
+  if (process.platform === 'darwin') {
+    try { status.accessibility = systemPreferences.isTrustedAccessibilityClient(false); }
+    catch { status.accessibility = true; }
+  }
+  return status;
+}
+
+ipcMain.handle('remote-control:status', () => remoteControlStatus());
+
 ipcMain.handle('remote-control:request', async (e) => {
-  if (controlGrants.has(e.sender.id)) return true;
+  const target = captureTargets.get(e.sender.id);
+  // Pencere paylaşımında pencerenin ekran koordinatları bilinemez; fareyi
+  // yanlış yere göndermektense kapatıp durumu açıkça bildiriyoruz.
+  const pointer = !target || target.kind !== 'window';
   const win = BrowserWindow.fromWebContents(e.sender);
+
+  if (controlGrants.has(e.sender.id)) return { granted: true, pointer };
+
+  const status = remoteControlStatus();
+  if (!status.available) {
+    await dialog.showMessageBox(win, {
+      type: 'error',
+      title: 'Uzaktan kontrol kullanılamıyor',
+      message: 'Girdi bileşeni bu kurulumda yüklenemedi.',
+      detail: (status.error ? `Hata: ${status.error}\n\n` : '')
+        + 'Ekran paylaşımı çalışmaya devam eder, yalnızca karşı tarafın '
+        + 'klavye/fare kullanması mümkün olmaz. Uygulamayı yeniden kurmak '
+        + 'genellikle bu sorunu çözer.',
+      buttons: ['Tamam'],
+      noLink: true,
+    });
+    return { granted: false, pointer: false, reason: 'unavailable', error: status.error };
+  }
+
+  if (process.platform === 'darwin' && !status.accessibility) {
+    // Sistem iznini iste (macOS bir kez sorar, sonra Sistem Ayarları'na yönlendirir).
+    try { systemPreferences.isTrustedAccessibilityClient(true); } catch { /* yok say */ }
+    await dialog.showMessageBox(win, {
+      type: 'warning',
+      title: 'Erişilebilirlik izni gerekli',
+      message: 'macOS, klavye ve fare kontrolü için Erişilebilirlik izni ister.',
+      detail: 'Sistem Ayarları → Gizlilik ve Güvenlik → Erişilebilirlik altında '
+        + 'Arku Remote\'u işaretleyin, sonra uygulamayı yeniden başlatıp tekrar deneyin.',
+      buttons: ['Tamam'],
+      noLink: true,
+    });
+    return { granted: false, pointer: false, reason: 'accessibility' };
+  }
+
   const { response } = await dialog.showMessageBox(win, {
     type: 'warning',
     title: 'Uzaktan kontrole izin ver',
@@ -300,18 +406,25 @@ ipcMain.handle('remote-control:request', async (e) => {
     detail:
       'İzin verirseniz bağlandığınız kişi fareyi ve klavyeyi sizin adınıza kullanabilir. '
       + 'Yalnızca tanıdığınız ve güvendiğiniz kişilere izin verin. '
-      + 'İzni istediğiniz an kapatabilirsiniz.',
+      + 'İzni istediğiniz an kapatabilirsiniz.'
+      + (pointer ? '' : '\n\nNOT: Tek bir pencere paylaştığınız için yalnızca klavye '
+        + 'iletilecek. Fare kontrolü için tüm ekranı paylaşmanız gerekir.'),
     buttons: ['İzin Ver', 'Vazgeç'],
     defaultId: 1,
     cancelId: 1,
     noLink: true,
   });
-  if (response !== 0) return false;
+  if (response !== 0) return { granted: false, pointer: false, reason: 'denied' };
   controlGrants.add(e.sender.id);
-  return true;
+  return { granted: true, pointer };
 });
 
-ipcMain.on('remote-control:revoke', (e) => { controlGrants.delete(e.sender.id); });
+ipcMain.on('remote-control:revoke', (e) => {
+  controlGrants.delete(e.sender.id);
+  // İzin kapanırken basılı kalmış tuş/düğme bırakılmalı; aksi halde uzak
+  // makinede Ctrl veya sol tuş sonsuza kadar basılı kalır.
+  queueRelease(e.sender.id);
+});
 
 // Renderer'daki "Yeni Oturum" butonu
 ipcMain.on('new-window', () => createWindow());
@@ -366,6 +479,7 @@ app.on('window-all-closed', () => {
 // kalır (uygulama yine açılır, yalnızca görüntüleme çalışır).
 let nut = null;
 let nutTried = false;
+let nutError = null;
 function loadNut() {
   if (nutTried) return nut;
   nutTried = true;
@@ -374,12 +488,20 @@ function loadNut() {
     mod.mouse.config.autoDelayMs = 0;
     mod.keyboard.config.autoDelayMs = 0;
     nut = mod;
-  } catch { nut = null; }
+  } catch (err) {
+    nut = null;
+    // Hatayı sakla: arayüz "kontrol açık ama hiçbir şey olmuyor" yerine
+    // gerçek sebebi gösterebilsin.
+    nutError = String((err && err.message) || err);
+    console.error('[arku] nut-js yuklenemedi:', nutError);
+  }
   return nut;
 }
 
 // Tarayıcı KeyboardEvent.code -> nut-js Key üye adı. `code` fiziksel tuştur,
 // klavye düzeninden bağımsızdır; bu yüzden `key` yerine tercih edilir.
+// Adlar @nut-tree-fork/shared'daki Key enum'ıyla birebir doğrulanmıştır;
+// var olmayan bir ad yazmak tuşu sessizce çalışmaz hâle getirir.
 const NUT_KEY_BY_CODE = {
   Space: 'Space', Enter: 'Return', NumpadEnter: 'Enter', Tab: 'Tab', Escape: 'Escape',
   Backspace: 'Backspace', Delete: 'Delete', Insert: 'Insert',
@@ -392,7 +514,50 @@ const NUT_KEY_BY_CODE = {
   CapsLock: 'CapsLock', Minus: 'Minus', Equal: 'Equal', Backquote: 'Grave',
   BracketLeft: 'LeftBracket', BracketRight: 'RightBracket', Backslash: 'Backslash',
   Semicolon: 'Semicolon', Quote: 'Quote', Comma: 'Comma', Period: 'Period', Slash: 'Slash',
+  // Sayısal tuş takımı operatörleri ve kilitler — eskiden hiç iletilmiyordu.
+  NumpadDivide: 'Divide', NumpadMultiply: 'Multiply', NumpadSubtract: 'Subtract',
+  NumpadAdd: 'Add', NumpadDecimal: 'Decimal', NumpadEqual: 'NumPadEqual',
+  NumLock: 'NumLock', ScrollLock: 'ScrollLock', Pause: 'Pause',
+  PrintScreen: 'Print', ContextMenu: 'Menu',
+  // NOT: IntlBackslash (ISO klavyelerde sol Shift yanındaki < > tuşu) nut-js'te
+  // karşılıksızdır. Backslash'e eşlemek YANLIŞ karakter yazar — eşlenmiyor.
 };
+
+// Olayları sırayla işle: mousedown/mouseup ve tuş bas/bırak sırası korunur.
+// queueRelease() de bu zinciri kullandığı için bildirimi ondan ÖNCE duruyor.
+let inputChain = Promise.resolve();
+
+// Uzak tarafta basılı kalan tuş/düğmeleri izle. Kontrol izni kapandığında,
+// pencere kapandığında veya bağlantı düştüğünde keyup hiç gelmez; bunlar
+// bırakılmazsa uzak makinede Ctrl/Shift sonsuza kadar basılı kalır.
+const heldKeys = new Map();    // wcId -> Set<Key>
+const heldButtons = new Map(); // wcId -> Set<Button>
+
+function trackHold(map, wcId, value, pressed) {
+  let set = map.get(wcId);
+  if (pressed) {
+    if (!set) { set = new Set(); map.set(wcId, set); }
+    set.add(value);
+  } else if (set) {
+    set.delete(value);
+    if (set.size === 0) map.delete(wcId);
+  }
+}
+
+/** Bir renderer adına basılı kalmış her şeyi bırak (sıraya alınarak). */
+function queueRelease(wcId) {
+  const keys = heldKeys.get(wcId);
+  const buttons = heldButtons.get(wcId);
+  heldKeys.delete(wcId);
+  heldButtons.delete(wcId);
+  if (!keys && !buttons) return;
+  const mod = nut; // yalnızca zaten yüklüyse — burada yüklemeye çalışma
+  if (!mod) return;
+  inputChain = inputChain.then(async () => {
+    for (const b of buttons || []) { try { await mod.mouse.releaseButton(b); } catch { /* yok say */ } }
+    for (const k of keys || []) { try { await mod.keyboard.releaseKey(k); } catch { /* yok say */ } }
+  }).catch(() => {});
+}
 
 function resolveKey(K, code) {
   if (!code || typeof code !== 'string') return null;
@@ -406,25 +571,68 @@ function resolveKey(K, code) {
 
 const clamp01 = (n) => (typeof n === 'number' && isFinite(n) ? Math.min(1, Math.max(0, n)) : 0);
 
-async function applyInput(mod, event) {
+/**
+ * DIP (ölçeklenmiş) koordinatı fiziksel ekran pikseline çevirir.
+ *
+ * Windows'ta Electron'un display.bounds değeri DIP'tir; nut-js ise SetCursorPos
+ * ile FİZİKSEL piksel kullanır. %150 ölçekli bir ekranda ikisini eşitlemek
+ * tıklamaları hedefin üçte ikisine düşürür — ve %125/%150 Windows
+ * dizüstülerinde fabrika ayarıdır. Karışık DPI'da `bounds.x * scaleFactor`
+ * da yanlıştır; doğru dönüşüm yalnızca Electron'un kendi API'sindedir.
+ */
+function dipToPhysical(pt) {
+  if (process.platform === 'win32' && typeof screen.dipToScreenPoint === 'function') {
+    try { return screen.dipToScreenPoint(pt); } catch { /* aşağıdaki yola düş */ }
+  }
+  // macOS: CGWarpMouseCursorPosition zaten nokta (DIP) alır — ölçekleme yok.
+  // Linux/X11: XTest piksel alır, tipik kurulumda ölçek 1:1.
+  return { x: Math.round(pt.x), y: Math.round(pt.y) };
+}
+
+/**
+ * Normalize (0..1) koordinatı, PAYLAŞILAN EKRANIN mutlak konumuna çevirir.
+ * Eskiden her zaman birincil ekran varsayılıyordu; ikinci monitör
+ * paylaşıldığında imleç yanlış ekrana düşüyordu.
+ */
+function normalizedToScreen(target, nx, ny) {
+  const display = (target && target.display) || screen.getPrimaryDisplay();
+  const b = display.bounds; // DIP
+  return dipToPhysical({
+    x: b.x + clamp01(nx) * b.width,
+    y: b.y + clamp01(ny) * b.height,
+  });
+}
+
+async function applyInput(mod, event, wcId, target) {
   const { Point, Button, Key, mouse, keyboard } = mod;
-  const { width, height } = screen.getPrimaryDisplay().size;
-  const px = Math.round(clamp01(event.x) * width);
-  const py = Math.round(clamp01(event.y) * height);
+  const isPointer = event.type === 'mousemove' || event.type === 'mousedown'
+    || event.type === 'mouseup' || event.type === 'wheel';
+
+  // Pencere paylaşımında pencerenin ekran dikdörtgeni bilinemez; fareyi
+  // rastgele bir yere göndermek yerine yok sayıyoruz (klavye çalışmaya devam eder).
+  if (isPointer && target && target.kind === 'window') return;
+
+  const p = normalizedToScreen(target, event.x, event.y);
   const toBtn = (b) => (b === 2 ? Button.RIGHT : b === 1 ? Button.MIDDLE : Button.LEFT);
 
   switch (event.type) {
     case 'mousemove':
-      await mouse.setPosition(new Point(px, py));
+      await mouse.setPosition(new Point(p.x, p.y));
       break;
-    case 'mousedown':
-      await mouse.setPosition(new Point(px, py));
-      await mouse.pressButton(toBtn(event.button));
+    case 'mousedown': {
+      const btn = toBtn(event.button);
+      await mouse.setPosition(new Point(p.x, p.y));
+      await mouse.pressButton(btn);
+      trackHold(heldButtons, wcId, btn, true);
       break;
-    case 'mouseup':
-      await mouse.setPosition(new Point(px, py));
-      await mouse.releaseButton(toBtn(event.button));
+    }
+    case 'mouseup': {
+      const btn = toBtn(event.button);
+      await mouse.setPosition(new Point(p.x, p.y));
+      await mouse.releaseButton(btn);
+      trackHold(heldButtons, wcId, btn, false);
       break;
+    }
     case 'wheel': {
       const dy = Math.round((event.dy || 0) / 100);
       const dx = Math.round((event.dx || 0) / 100);
@@ -434,26 +642,53 @@ async function applyInput(mod, event) {
     }
     case 'keydown': {
       const k = resolveKey(Key, event.code);
-      if (k !== null && k !== undefined) await keyboard.pressKey(k);
+      if (k !== null && k !== undefined) {
+        await keyboard.pressKey(k);
+        trackHold(heldKeys, wcId, k, true);
+      }
       break;
     }
     case 'keyup': {
       const k = resolveKey(Key, event.code);
-      if (k !== null && k !== undefined) await keyboard.releaseKey(k);
+      if (k !== null && k !== undefined) {
+        await keyboard.releaseKey(k);
+        trackHold(heldKeys, wcId, k, false);
+      }
       break;
     }
+    case 'release-all':
+      // Kontrol eden taraf odağı kaybetti: basılı olan her şeyi bırak.
+      break; // asıl iş queueRelease'de; buraya düşerse yapılacak bir şey yok
     default:
       break; // bilinmeyen olay türü — yok say
   }
 }
 
-// Olayları sırayla işle: mousedown/mouseup ve tuş bas/bırak sırası korunur.
-let inputChain = Promise.resolve();
+// Girdi seli koruması: kötü niyetli veya bozuk bir eş, veri kanalını
+// mousemove ile doldurup inputChain'i sınırsız büyütebilir ve makineyi
+// kullanılamaz hâle getirebilirdi. Bekleyen iş belli bir sınırı aşarsa
+// yeni olaylar düşürülür (kullanıcı girdisi asla bu hıza ulaşmaz).
+let pendingInputs = 0;
+const MAX_PENDING_INPUTS = 120;
+
 ipcMain.on('input-event', (e, event) => {
   // Ana süreç tarafı yetki kontrolü: yerel kullanıcı onay penceresinde açıkça
   // izin vermediyse hiçbir girdi işletilmez. Renderer'daki bayrak artık tek kapı değil.
   if (!controlGrants.has(e.sender.id)) return;
+  if (!event || typeof event.type !== 'string') return;
+
+  // Odak kaybında gelen toplu bırakma isteği zincire ayrıca eklenir.
+  if (event.type === 'release-all') { queueRelease(e.sender.id); return; }
+
   const mod = loadNut();
-  if (!mod || !event || typeof event.type !== 'string') return;
-  inputChain = inputChain.then(() => applyInput(mod, event)).catch(() => {});
+  if (!mod) return;
+  if (pendingInputs >= MAX_PENDING_INPUTS) return;
+
+  const wcId = e.sender.id;
+  const target = captureTargets.get(wcId);
+  pendingInputs++;
+  inputChain = inputChain
+    .then(() => applyInput(mod, event, wcId, target))
+    .catch(() => {})
+    .finally(() => { pendingInputs--; });
 });
