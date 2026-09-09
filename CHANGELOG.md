@@ -8,6 +8,30 @@ Sürümleme: [Semantic Versioning](https://semver.org/lang/tr/)
 
 ---
 
+## [1.4.0] — 2026-09-09
+
+### Güvenlik
+
+- **Sinyalleşmeye hız sınırı.** Anonim giriş açık olduğu için sınırsız kimlik
+  üretilip herhangi bir kimliğe sınırsız bağlantı denemesi yazılabiliyordu.
+  Artık dakikada 400 sinyal ve 25 farklı hedef sınırı var. Devam eden bir
+  oturum bu sınıra takılmaz; **kimlik taraması** ise durdurulur.
+- **Analitikte IP adresi artık saklanmıyor.** IP, bir kişiye bağlanabildiği
+  anda kişisel veridir. Yerine günlük dönen, gizli tuzlu bir özet yazılıyor:
+  geri çevrilemez, ertesi gün eşleşmez, tekil ziyaretçi sayımı yine çalışır.
+  Tuz tanımlı değilse hiçbir IP türevi saklanmaz.
+- **Analitiğe hız sınırı.** `Origin`/`Referer` başlıkları taklit edilebildiği
+  için sahte olay seli mümkündü (veri kirliliği + fatura). Ziyaretçi başına
+  dakikada 60 olay sınırı eklendi.
+- **Web dağıtımına içerik güvenlik politikası.** `default-src 'self'`,
+  `object-src 'none'`, `base-uri 'none'` ve daraltılmış `connect-src`;
+  ayrıca `X-Content-Type-Options` ve `Referrer-Policy`.
+  > Masaüstü uygulamasına bilinçli olarak eklenmedi: `file://` origin'inde
+  > CSP davranışı öngörülemez ve yanlış politika beyaz ekrana yol açar.
+  > Orada koruma, ana süreçteki gezinme muhafızıdır (v1.1.0).
+
+---
+
 ## [1.3.0] — 2026-09-09
 
 ### Eklendi

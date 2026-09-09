@@ -18,12 +18,44 @@ export const config = {
   matcher: '/:path*',
 };
 
+// İçerik güvenlik politikası — YALNIZCA web dağıtımı için.
+//
+// Masaüstü (Electron) uygulaması sayfayı `file://` ile yükler ve bu
+// middleware orada ÇALIŞMAZ. Bu bilinçli: `file://` origin'inde CSP'nin
+// 'self' davranışı tarayıcı sürümüne göre değişir ve yanlış bir politika
+// paketlenmiş uygulamada beyaz ekrana yol açabilir. Masaüstü tarafında
+// asıl koruma, ana süreçteki gezinme muhafızıdır (electron/main.cjs):
+// pencere kendi içeriği dışına çıkamaz, dolayısıyla köprüye erişebilecek
+// yabancı bir sayfa yüklenemez.
+//
+// connect-src: Supabase REST + Realtime (wss). WebRTC bağlantıları CSP
+// kapsamında değildir; STUN/TURN adreslerini burada saymaya gerek yok.
+const CSP_DIRECTIVES = [
+  "default-src 'self'",
+  "script-src 'self'",
+  // Satır içi stil: React'in style prop'u CSSOM üzerinden çalıştığı için
+  // CSP'ye takılmaz, ancak derlenmiş CSS bazı durumlarda satır içi stil
+  // enjekte eder. Betik tarafı sıkı kaldığı için risk düşüktür.
+  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' data: blob:",
+  "media-src 'self' blob:",
+  "connect-src 'self' https://*.supabase.co wss://*.supabase.co",
+  "font-src 'self' data:",
+  "object-src 'none'",
+  "base-uri 'none'",
+  "form-action 'self'",
+];
+
 export default function middleware(): Response {
   const configured = (process.env.ARKU_FRAME_ANCESTORS || '').trim();
   const frameAncestors = configured ? `'self' ${configured}` : "'self'";
   return next({
     headers: {
-      'Content-Security-Policy': `frame-ancestors ${frameAncestors}`,
+      'Content-Security-Policy': [...CSP_DIRECTIVES, `frame-ancestors ${frameAncestors}`].join('; '),
+      // Ek sertleştirmeler: tarayıcının içerik türü tahminini kapat,
+      // dış sitelere referrer sızdırma.
+      'X-Content-Type-Options': 'nosniff',
+      'Referrer-Policy': 'strict-origin-when-cross-origin',
     },
   });
 }

@@ -12,6 +12,7 @@
 
 'use strict';
 
+const crypto = require('node:crypto');
 const { initializeApp, getApps, cert } = require('firebase-admin/app');
 const { getFirestore } = require('firebase-admin/firestore');
 
@@ -61,6 +62,29 @@ function parseUA(ua) {
   return { device, browser, os };
 }
 
+/**
+ * IP anonimleştirme.
+ *
+ * NEDEN: IP adresi, bir kişiye bağlanabildiği anda KİŞİSEL VERİDİR (KVKK).
+ * Ziyaretçi analitiği için ham IP saklamaya gerek yok; tek ihtiyaç "aynı
+ * ziyaretçi mi" sorusudur. Bunu günlük dönen, gizli tuzlu bir özet çözer:
+ * geri çevrilemez, ertesi gün eşleşmez, sayım yine doğru çalışır.
+ *
+ * TUZ ŞART: IPv4 uzayı 4 milyar adrestir; tuzsuz bir özet kaba kuvvetle
+ * çözülür. ANALYTICS_IP_SALT tanımlı değilse HİÇBİR IP türevi saklanmaz —
+ * gizliliği koruyan güvenli varsayılan budur.
+ */
+const IP_SALT = process.env.ANALYTICS_IP_SALT || '';
+
+function ipHash(ip) {
+  if (!IP_SALT || !ip) return '';
+  const gun = new Date().toISOString().slice(0, 10);
+  return crypto.createHash('sha256')
+    .update(IP_SALT + '|' + gun + '|' + ip)
+    .digest('hex')
+    .slice(0, 16);
+}
+
 function geoOf(req) {
   const h = req.headers;
   const dec = (s) => { try { return decodeURIComponent(String(s || '')); } catch { return String(s || ''); } };
@@ -69,8 +93,41 @@ function geoOf(req) {
   return {
     country: String(h['x-vercel-ip-country'] || '').slice(0, 4),
     city: dec(h['x-vercel-ip-city']).slice(0, 60),
-    ip: ipRaw.slice(0, 45),
+    // Ham IP DÖNMEZ; yalnızca bellekte hız sınırı için kullanılır.
+    ipRaw,
+    ipHash: ipHash(ipRaw),
   };
+}
+
+/**
+ * Basit kayan pencere hız sınırı (örnek başına bellekte).
+ *
+ * SINIR: Vercel'de her örnek kendi belleğini tutar, dolayısıyla bu mutlak
+ * bir tavan değildir. Yine de asıl senaryoyu — tek kaynaktan gelen hızlı
+ * sel — kırar, çünkü art arda gelen istekler aynı sıcak örneğe düşer.
+ * Kesin tavan gerekirse Firestore/Redis sayacına geçilmelidir; o da her
+ * olay için ekstra yazma maliyeti demektir.
+ */
+const RATE = new Map();
+const RATE_LIMIT = 60;          // pencere başına olay
+const RATE_WINDOW_MS = 60000;   // 1 dakika
+const RATE_MAX_KEYS = 5000;     // bellek tavanı
+
+function rateLimited(key) {
+  if (!key) return false;
+  const now = Date.now();
+  // Bellek şişmesin: pencere dolmuş kayıtları temizle.
+  if (RATE.size > RATE_MAX_KEYS) {
+    for (const [k, v] of RATE) if (v.reset <= now) RATE.delete(k);
+    if (RATE.size > RATE_MAX_KEYS) RATE.clear();
+  }
+  const rec = RATE.get(key);
+  if (!rec || rec.reset <= now) {
+    RATE.set(key, { count: 1, reset: now + RATE_WINDOW_MS });
+    return false;
+  }
+  rec.count += 1;
+  return rec.count > RATE_LIMIT;
 }
 
 function isFromSite(req) {
@@ -101,6 +158,12 @@ module.exports = async (req, res) => {
     const ua = String(req.headers['user-agent'] || '');
     if (!isFromSite(req) || BOT_UA.test(ua)) return res.status(204).end();
 
+    // Hız sınırı: Origin/Referer başlıkları taklit edilebilir, dolayısıyla
+    // isFromSite tek başına sahte olay selini durdurmaz. Bu sınır sınırsız
+    // Firestore yazımını (maliyet + veri kirliliği) engeller.
+    const g0 = geoOf(req);
+    if (rateLimited(g0.ipRaw)) return res.status(429).end();
+
     let body = req.body;
     if (typeof body === 'string') {
       try { body = JSON.parse(body); } catch { return res.status(400).end(); }
@@ -115,7 +178,7 @@ module.exports = async (req, res) => {
 
     const now = new Date();
     const p = parseUA(ua);
-    const g = geoOf(req);
+    const g = g0;
 
     await db().collection(COLLECTION).add({
       type,
@@ -129,7 +192,10 @@ module.exports = async (req, res) => {
       os:      p.os,
       country: g.country,
       city:    g.city,
-      ip:      g.ip,
+      // Ham IP SAKLANMAZ (KVKK). Günlük dönen tuzlu özet: geri çevrilemez,
+      // ertesi gün eşleşmez, tekil ziyaretçi sayımı yine çalışır.
+      // ANALYTICS_IP_SALT tanımlı değilse bu alan boş kalır.
+      ip_hash: g.ipHash,
       ts:   Date.now(),
       day:  now.toISOString().slice(0, 10),
     });
