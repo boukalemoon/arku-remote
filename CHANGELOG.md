@@ -10,6 +10,18 @@ Sürümleme: [Semantic Versioning](https://semver.org/lang/tr/)
 
 ## [1.4.0] — 2026-09-09
 
+### Sunucu tarafı (yayın sonrası, 2026-09-10)
+
+Aşağıdaki değişiklikler yalnızca veritabanındadır; uygulama sürümünü
+etkilemez, yeniden kurulum gerektirmez.
+
+- Trigger fonksiyonları REST API yüzeyinden kaldırıldı. `arku_audit_chain`,
+  `arku_signals_rate_limit`, `rls_auto_enable` ve diğer trigger fonksiyonları
+  `/rest/v1/rpc/...` üzerinden çağrılabiliyordu. Doğrudan çağrılmaları zaten
+  hata verir ama `SECURITY DEFINER` fonksiyonların genel API yüzeyinde
+  durması gereksiz risktir.
+- Üç fonksiyonda `search_path` sabitlendi.
+
 ### Güvenlik
 
 - **Sinyalleşmeye hız sınırı.** Anonim giriş açık olduğu için sınırsız kimlik
