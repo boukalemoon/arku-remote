@@ -1,36 +1,33 @@
-version: '3.8'
+# Arku Remote — TURN relay sunucusu (coturn).
+#
+# network_mode: host ZORUNLUDUR.
+# Sebep: coturn her relay oturumu için min-port..max-port aralığından UDP portu
+# ayırır. Bridge ağında bu aralığı yayınlamak Docker'ı port başına bir proxy
+# süreci açmaya zorlar (140 port = 140 süreç, dakikalarca süren başlangıç) ve
+# coturn peer'lara yanlış kaynak adresi bildirir. Host ağı bu ikisini de çözer.
+#
+# Bu yüzden `ports:` bölümü YOKTUR — portlar doğrudan host üzerindedir.
+# Güvenlik duvarında açılacaklar: 3478/udp, 3478/tcp, 5349/tcp, 49160-49300/udp
+#
+# Kullanım:
+#   1. turnserver.conf içindeki ### satırlarını doldurun
+#   2. docker compose up -d
+#   3. docker compose logs -f coturn
 
 services:
   coturn:
     image: coturn/coturn:latest
     container_name: arku-turn
-    ports:
-      # STUN/TURN
-      - "3478:3478/udp"
-      - "3478:3478/tcp"
-      # STUN/TURN TLS
-      - "5349:5349/udp"
-      - "5349:5349/tcp"
-      # Admin port
-      - "5766:5766/tcp"
+    network_mode: host
     volumes:
       - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
-      - coturn-logs:/var/log/coturn
-    networks:
-      - arku-network
-    restart: always
-    environment:
-      - TURNSERVER_ENABLED=1
-    healthcheck:
-      test: ["CMD", "netstat", "-an"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-
-networks:
-  arku-network:
-    driver: bridge
-
-volumes:
-  coturn-logs:
-    driver: local
+      # TLS sertifikaları (turnserver.conf içindeki cert/pkey yolları buradan gelir).
+      # Let's Encrypt kullanmıyorsanız bu satırı kaldırın.
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+    command: ["-c", "/etc/coturn/turnserver.conf"]
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

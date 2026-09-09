@@ -86,6 +86,24 @@ Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
   if (req.method !== "POST") return json({ error: "Yalnızca POST desteklenir" }, 405);
 
+  // ── ASKIYA ALINDI (2026-09-08) ─────────────────────────────────────────────
+  // Arayüzdeki düğmeyi gizlemek yeterli DEĞİLDİR: bu uç nokta anon key ile
+  // doğrudan çağrılabilir. Kapı sunucuda.
+  //
+  // S1: QRtım'in döndürdüğü e-posta doğrulanmadan kabul ediliyor, o e-posta
+  // için hesap açılıp oturum üretiliyordu. QRtım'de e-posta doğrulaması
+  // zorunlu değilse saldırgan kurban@firma.com ile QRtım hesabı açıp AYNI
+  // e-postaya ait Arku hesabını devralabilirdi.
+  //
+  // YENİDEN AÇMAK İÇİN İKİSİ BİRDEN gerekli:
+  //   1) QRtım'in arku-link yanıtı `email_verified` döndürmeli ve burada
+  //      şart koşulmalı,
+  //   2) Supabase secret: QRTIM_SSO_ENABLED=true
+  if (Deno.env.get("QRTIM_SSO_ENABLED") !== "true") {
+    return json({ error: "QRtım entegrasyonu geçici olarak devre dışı." }, 503);
+  }
+
+
   try {
     const { qrtim_token } = await req.json().catch(() => ({ qrtim_token: null }));
     if (!qrtim_token || typeof qrtim_token !== "string") {

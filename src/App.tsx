@@ -8,12 +8,16 @@ import {
   listOrgMembers, addOrgMember, updateOrgMember, removeOrgMember,
   listCategories, createCategory, deleteCategory,
   listSavedContacts, createSavedContact, deleteSavedContact, touchSavedContact,
+  fetchPresence, sendHeartbeat, bindOrgInvites,
 } from './lib/enterprise';
-import type { Organization, OrgMember, ContactCategory, SavedContact, OrgRole } from './lib/enterprise';
+import type { Organization, OrgMember, ContactCategory, SavedContact, OrgRole, PresenceRow } from './lib/enterprise';
 import type { User as SupabaseUser } from '@supabase/supabase-js';
 import { WebRTCManager } from './lib/webrtc';
-import type { ConnectionState, InputEventMsg } from './lib/webrtc';
+import type { ConnectionState, InputEventMsg, RtcQuality, ControlMsg, RemoteScreen, FileOffer } from './lib/webrtc';
 import { EMBED, postSessionEvent, resetSessionEvents } from './lib/embed';
+import { resetIceCache } from './lib/ice';
+import { recordAudit, listAudit, verifyAuditChain } from './lib/audit';
+import type { AuditRow, AuditVerifyResult } from './lib/audit';
 
 type Theme = 'otuken' | 'umay' | 'gok' | 'gece';
 type Tab = 'dashboard' | 'connections' | 'contacts' | 'organization' | 'settings';
@@ -23,6 +27,25 @@ interface LogEntryLocal { time: string; msg: string; type: LogType; }
 // Cevabı bu kimlikle imzalamamız gerekir, yoksa arayan yanıtı tanıyamaz.
 interface IncomingCall { fromId: string; toId?: string; offerPayload: Record<string, unknown>; sessionId?: string; signalId?: string; }
 interface QrtimUser { qrtim_id: string; email: string; name: string; username: string; photo_url: string | null; title: string | null; company: string | null; plan: string; }
+
+/**
+ * QRtim SSO ASKIYA ALINDI (2026-09-08).
+ *
+ * IKI SEBEP:
+ *  1) URUN: QRtim dijital kimlik yapisina gecirilmek uzere bastan tasarlaniyor.
+ *     Entegrasyon, yeni kimlik modeli netlestikten sonra yeniden kurulacak.
+ *  2) GUVENLIK (S1): qrtim-auth, QRtim'in dondurdugu e-postayi dogrulanmis
+ *     kabul edip o e-posta icin oturum uretiyordu. QRtim tarafinda e-posta
+ *     dogrulamasi zorunlu degilse, saldirgan kurban@firma.com ile QRtim
+ *     hesabi acip AYNI e-postaya ait Arku hesabini devralabilirdi.
+ *     Cozum QRtim tarafinda `email_verified` iddiasini eklemek; o gelene
+ *     kadar yol kapali.
+ *
+ * Kod SILINMEDI: bayrak true yapilinca akis geri gelir. Sunucu tarafinda da
+ * ayri bir kill switch var (qrtim-auth / QRTIM_SSO_ENABLED) — arayuzu acmak
+ * tek basina yetmez, ikisi birden acilmalidir.
+ */
+const QRTIM_ENABLED = false;
 
 const QRTIM_BASE_URL = import.meta.env.VITE_QRTIM_URL ?? 'https://qartim.com';
 // QRtım entegrasyonu artık Arku edge fonksiyonları üzerinden yürür:
@@ -38,9 +61,81 @@ const generateDeviceFingerprint = (): string => {
   return Math.abs(raw.split('').reduce((a, c) => ((a << 5) - a + c.charCodeAt(0)) | 0, 0)).toString(36).toUpperCase();
 };
 const generateSessionToken = (): string => Array.from(crypto.getRandomValues(new Uint8Array(16))).map(b => b.toString(16).padStart(2, '0')).join('');
+
+/**
+ * Oturum parolası alfabesi — telefonda okunacak bir değer olduğu için
+ * karıştırılabilen karakterler (0/O, 1/I/L) çıkarılmıştır.
+ * 32 karakter, 256 % 32 === 0 olduğu için modulo sapması yok.
+ */
+/**
+ * Oturum kaydi riza metni ve SURUMU.
+ *
+ * Surum, kaydin hangi metne dayanarak alindiginin sonradan ispatlanabilmesi
+ * icin hem karsi tarafa gonderilir hem de kayit ustverisine yazilir.
+ * Metin degistiginde SURUM DE DEGISMELIDIR.
+ */
+const RECORDING_CONSENT_VERSION = '2026-09-09.1';
+const RECORDING_CONSENT_TEXT =
+  'Bu oturumun ekran goruntusu video olarak kaydedilecektir. Kayit, baglanan '
+  + 'tarafin bilgisayarindaki bir klasore yazilir; Arku sunucularina '
+  + 'gonderilmez. Kayit suresince her iki ekranda da "KAYIT" gostergesi yanar. '
+  + 'Onayi istediginiz an geri cekebilir, kaydi durdurabilirsiniz.';
+
+const PW_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+
+/**
+ * Her oturum için yeni üretilen 6 karakterlik parola (~1,07 milyar olasılık).
+ *
+ * NEDEN: Eskiden kimliği bilen HERKES karşı tarafı çaldırabiliyordu ve
+ * kimlikler 9 haneli olduğu için taranabilirdi. Parola, "kimliği bilmek"
+ * ile "bağlanma yetkisi" arasındaki farkı kurar — TeamViewer'ın temel
+ * güvenlik modeli budur.
+ */
+const generateSessionPassword = (): string =>
+  Array.from(crypto.getRandomValues(new Uint8Array(6)))
+    .map(b => PW_ALPHABET[b % PW_ALPHABET.length]).join('');
 const formatId = (raw: string): string => { const c = raw.replace(/\D/g, '').padStart(9, '0').slice(0, 9); return `${c.slice(0,3)}-${c.slice(3,6)}-${c.slice(6,9)}`; };
+/**
+ * ESKİ kimlik üretimi — yalnızca yedek yol olarak duruyor.
+ *
+ * 32-bit djb2 hash, sonra 9 haneye KIRPMA ("2147483647" -> "214748364").
+ * Doğum günü sınırı ~33.000 kullanıcıda %50. users.connection_id unique
+ * olduğu için çakışma yanlış kişiye bağlanmaya yol açmaz; onun yerine
+ * upsert sessizce başarısız olur ve kullanıcı ULAŞILAMAZ hâle gelir.
+ * arku_ensure_connection_id RPC'si uygulandıktan sonra bu yol kullanılmaz.
+ */
 const generateProfileId = (uid: string): string => formatId(Math.abs(uid.split('').reduce((a, c) => ((a << 5) - a + c.charCodeAt(0)) | 0, 0)).toString());
-const getOrCreateGuestId = (): string => { const k = 'arku_guest_id'; let id = localStorage.getItem(k); if (!id) { id = formatId(Math.abs(generateDeviceFingerprint().split('').reduce((a, c) => ((a << 5) - a + c.charCodeAt(0)) | 0, 0)).toString()); localStorage.setItem(k, id); } return id; };
+
+/**
+ * Kimliği sunucudan ister (benzersizliği veritabanı garanti eder).
+ * Migration henüz uygulanmamışsa eski istemci üretimine düşer, böylece
+ * migration ile uygulama sürümünün yayın sırası önemsizdir.
+ */
+const resolveMyConnectionId = async (uid: string): Promise<{ id: string; fromServer: boolean }> => {
+  try {
+    const { data, error } = await supabase.rpc('arku_ensure_connection_id');
+    if (!error && typeof data === 'string' && data.trim()) return { id: data.trim(), fromServer: true };
+  } catch { /* fonksiyon yok / ağ hatası — yedek yola düş */ }
+  return { id: generateProfileId(uid), fromServer: false };
+};
+/**
+ * Oturumsuz misafir kimliği.
+ *
+ * Eskiden cihaz PARMAK İZİNDEN türetiliyordu (userAgent + dil + çözünürlük +
+ * timezone + çekirdek sayısı). Aynı imajla kurulmuş kurumsal bir filoda tüm
+ * makineler aynı parmak izini üretir, dolayısıyla AYNI misafir kimliğini
+ * alırdı — çağrılar yanlış makinede çalardı. Artık rastgele.
+ */
+const getOrCreateGuestId = (): string => {
+  const k = 'arku_guest_id';
+  let id = localStorage.getItem(k);
+  if (!id) {
+    const n = (crypto.getRandomValues(new Uint32Array(1))[0] % 900000000) + 100000000;
+    id = formatId(String(n));
+    localStorage.setItem(k, id);
+  }
+  return id;
+};
 
 const THEMES: { id: Theme; label: string; color: string; light?: boolean }[] = [
   { id: 'otuken', label: 'Otüken', color: '#c5a059' },
@@ -88,7 +183,60 @@ export default function App() {
   const [passwordChangeDone, setPasswordChangeDone] = React.useState(false);
   const [profileUpdateDone, setProfileUpdateDone] = React.useState(false);
   const [connectionId, setConnectionId] = React.useState(() => getOrCreateGuestId());
+  /**
+   * Kimlik SUNUCU tarafindan taniniyor mu?
+   *
+   * Oturum acilamazsa arayuz yine bir kimlik gosteriyordu ama o kimlik
+   * yalnizca localStorage'da vardi. signals RLS'i `arku_owns_identity(to_id)`
+   * istedigi ve politikalar `to authenticated` oldugu icin o kullaniciya
+   * gelen HICBIR sinyal okunamiyordu: karsi taraf ariyor, hicbir sey olmuyor,
+   * iki taraf da sebebini ogrenemiyordu. Artik kimlik hazir degilse arayuz
+   * bunu acikca soyluyor.
+   */
+  const [identityReady, setIdentityReady] = React.useState(false);
+  const [identityError, setIdentityError] = React.useState('');
   const [targetId, setTargetId] = React.useState('');
+  // Arayanin girdigi oturum parolasi (karsi tarafin ekraninda yazan).
+  const [targetPassword, setTargetPassword] = React.useState('');
+  /**
+   * Bagli oldugumuz tarafin EKRANDA gosterilecek etiketi.
+   *
+   * Eskiden alici, gelen cagriyi kabul edince `targetId`yi (yani KENDI
+   * hedef kimlik GIRDI ALANINI) arayanin UUID'siyle dolduruyordu. Sonuc:
+   * baglanti bitince kutuda 9 haneli kimlik yerine uzun bir UUID kaliyor,
+   * kullanici onu gercek kimlik saniyordu. Girdi alani yalnizca giden
+   * cagrilar icindir; gosterim ayri tutuluyor.
+   */
+  const [peerLabel, setPeerLabel] = React.useState('');
+  // ── Oturum kaydi ──
+  // 'off' | 'requesting' (izleyen onay bekliyor) | 'recording'
+  const [recState, setRecState] = React.useState<'off' | 'requesting' | 'recording'>('off');
+  /** Ekrani paylasan tarafta: karsi taraf kayit izni istedi. */
+  const [recPrompt, setRecPrompt] = React.useState(false);
+  const [recFolder, setRecFolder] = React.useState('');
+  const [recElapsed, setRecElapsed] = React.useState(0);
+  // Denetim izi goruntuleyici (Ayarlar).
+  const [auditRows, setAuditRows] = React.useState<AuditRow[] | null>(null);
+  const [auditVerify, setAuditVerify] = React.useState<AuditVerifyResult | null>(null);
+  const [auditBusy, setAuditBusy] = React.useState(false);
+  // onControl bagimliliklari dar bir closure icinde calisiyor; kayit durumunu
+  // ref uzerinden okumak bayat deger riskini kaldirir.
+  const recStateRef = React.useRef(recState);
+  React.useEffect(() => { recStateRef.current = recState; }, [recState]);
+  const mediaRecorderRef = React.useRef<MediaRecorder | null>(null);
+  const recChunksRef = React.useRef<Blob[]>([]);
+  const recStartedAtRef = React.useRef(0);
+  // Bu cihazin gecerli oturum parolasi. Her oturum bitiminde yenilenir.
+  const [sessionPassword, setSessionPassword] = React.useState(() => generateSessionPassword());
+  const [requirePassword, setRequirePassword] = React.useState(() => {
+    try { return localStorage.getItem('arku_require_password') !== '0'; } catch { return true; }
+  });
+  // processIncomingOffer, bagimliliklari dar olan bir effect icinden cagriliyor;
+  // parola durumunu ref uzerinden okumak bayat closure'i onler.
+  const sessionPasswordRef = React.useRef(sessionPassword);
+  const requirePasswordRef = React.useRef(requirePassword);
+  // Kaba kuvvet frenleme: from_id basina yanlis deneme sayisi.
+  const badPasswordTriesRef = React.useRef(new Map<string, number>());
   const [connectionHistory, setConnectionHistory] = React.useState<ConnectionEntry[]>([]);
   const [copied, setCopied] = React.useState(false);
   const [sessionToken, setSessionToken] = React.useState('');
@@ -97,6 +245,12 @@ export default function App() {
   const [rtcState, setRtcState] = React.useState<ConnectionState>('idle');
   const [isConnecting, setIsConnecting] = React.useState(false);
   const [remoteStream, setRemoteStream] = React.useState<MediaStream | null>(null);
+  // Canlı bağlantı kalitesi (yol, gecikme, bit hızı, kayıp). Destek ekibinin
+  // "yavaş/bulanık" şikayetlerini teşhis edebilmesi için görünür kılınır.
+  const [quality, setQuality] = React.useState<RtcQuality | null>(null);
+  // Bu oturumda TURN (relay) kullanılabiliyor mu — yoksa kısıtlı ağlarda
+  // bağlantı hiç kurulamaz ve kullanıcı sebebini bilmelidir.
+  const [turnAvailable, setTurnAvailable] = React.useState(true);
   const [incomingCall, setIncomingCall] = React.useState<IncomingCall | null>(null);
   const connTimeoutRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
   const rtcStateRef = React.useRef<ConnectionState>('idle');
@@ -122,8 +276,24 @@ export default function App() {
   const [organizations, setOrganizations] = React.useState<Organization[]>([]);
   const [activeOrgId, setActiveOrgId] = React.useState<string | null>(null);
   const [orgMembers, setOrgMembers] = React.useState<OrgMember[]>([]);
+  // Kayitli musterilerin cevrimici durumu (kimlik -> durum).
+  const [presence, setPresence] = React.useState<Map<string, PresenceRow>>(new Map());
   const caps = planCapabilities(entitlements.plan);
   const lastMouseMoveRef = React.useRef(0);
+  // Şu an basılı tuttuğumuz tuşlar (KeyboardEvent.code). Odak kaybedilirse
+  // keyup asla gelmez; bunları uzak tarafta bırakmak için izliyoruz.
+  const heldKeysRef = React.useRef(new Set<string>());
+  // Girdi enjeksiyonunun uzak makinede gerçekten çalışıp çalışmadığı.
+  const [controlNotice, setControlNotice] = React.useState<string>('');
+  // Coklu monitor: karsi tarafin ekran listesi ve su an paylasilan ekran.
+  const [remoteScreens, setRemoteScreens] = React.useState<RemoteScreen[]>([]);
+  const [currentRemoteScreen, setCurrentRemoteScreen] = React.useState('');
+  // Baglanti dogrulama kodu (SAS) — iki ekranda ayni olmali.
+  const [verifyCode, setVerifyCode] = React.useState<string | null>(null);
+  // Dosya transferi: gelen teklif ve devam eden aktarimin ilerlemesi.
+  const [incomingFile, setIncomingFile] = React.useState<FileOffer | null>(null);
+  const [fileProgress, setFileProgress] = React.useState<{ id: string; done: number; total: number; dir: 'in' | 'out' } | null>(null);
+  const fileInputRef = React.useRef<HTMLInputElement>(null);
   // Polling fallback refs for when Supabase Realtime WebSocket is unavailable
   const incomingPollSinceRef = React.useRef(new Date().toISOString());
   const processedOfferIdsRef = React.useRef(new Set<string>());
@@ -134,41 +304,96 @@ export default function App() {
   // kullanmalı; `currentUser` anonim (misafir) oturumda da doludur.
   const isRegistered = !!currentUser && !currentUser.is_anonymous;
 
+  /** UUID biciminde bir kimligi ekranda kisaltir; 9 haneli kimlik oldugu gibi kalir. */
+  const shortPeerId = (id: string): string =>
+    /^[0-9a-f]{8}-[0-9a-f]{4}-/i.test(id) ? `${id.slice(0, 8)}...` : id;
+
   const ts = () => new Date().toLocaleTimeString('tr-TR');
   const addLocalLog = (msg: string, type: LogType = 'info') => setLogs(p => [{ time: ts(), msg, type }, ...p].slice(0, 50));
 
+  const canSendInput = () =>
+    inputEnabled && EMBED.mode !== 'view' && !!webrtc && rtcState === 'connected' && !!remoteStream;
+
+  /**
+   * Olay, video üstündeki kendi düğmelerimizden mi geliyor?
+   * "Kontrol", "Tam Ekran" ve "Kes" düğmeleri kapsayıcının İÇİNDE durduğu için
+   * onlara tıklamak uzak tarafa da tıklama gönderiyordu (sağ üst köşeye).
+   */
+  const isOverlayControl = (e: React.MouseEvent) =>
+    !!(e.target as HTMLElement | null)?.closest?.('button');
+
+  /**
+   * İmleç konumunu videonun GERÇEK çizim alanına göre normalize eder.
+   *
+   * Video `object-contain` ile 16:9 bir kutuda duruyor ama uzak ekran 16:10
+   * (çoğu dizüstü), 4:3 veya rastgele en-boy oranlı bir pencere olabilir; o
+   * zaman siyah bantlar (letterbox) oluşur. Eskiden koordinat KAPSAYICI kutuya
+   * göre hesaplanıyordu, dolayısıyla oranlar farklı olduğu her an tüm
+   * tıklamalar kayıyordu.
+   *
+   * Bandın üstüne gelen tıklamalar kenara sıkıştırılmak yerine hiç
+   * gönderilmez — orada uzak ekranda karşılığı olan bir nokta yoktur.
+   */
+  const normalizeToVideo = (clientX: number, clientY: number): { x: number; y: number } | null => {
+    const v = remoteVideoRef.current;
+    if (!v || !v.videoWidth || !v.videoHeight) return null;
+    const r = v.getBoundingClientRect();
+    if (!r.width || !r.height) return null;
+    const scale = Math.min(r.width / v.videoWidth, r.height / v.videoHeight);
+    const dw = v.videoWidth * scale;
+    const dh = v.videoHeight * scale;
+    const x = (clientX - r.left - (r.width - dw) / 2) / dw;
+    const y = (clientY - r.top - (r.height - dh) / 2) / dh;
+    if (x < 0 || x > 1 || y < 0 || y > 1) return null;
+    return { x, y };
+  };
+
   const handleVideoMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (!inputEnabled || EMBED.mode === 'view' || !webrtc || rtcState !== 'connected' || !remoteStream) return;
+    if (!canSendInput()) return;
+    if (isOverlayControl(e)) return;
     const now = Date.now();
     if (now - lastMouseMoveRef.current < 33) return; // ~30 fps throttle
+    const p = normalizeToVideo(e.clientX, e.clientY);
+    if (!p) return;
     lastMouseMoveRef.current = now;
-    const rect = e.currentTarget.getBoundingClientRect();
-    webrtc.sendInput({ type: 'mousemove', x: (e.clientX - rect.left) / rect.width, y: (e.clientY - rect.top) / rect.height });
+    webrtc!.sendInput({ type: 'mousemove', x: p.x, y: p.y });
   };
   const handleVideoMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (!inputEnabled || EMBED.mode === 'view' || !webrtc || rtcState !== 'connected' || !remoteStream) return;
+    if (!canSendInput()) return;
+    if (isOverlayControl(e)) return;
+    // preventDefault tıklayarak odaklanmayı da iptal eder; klavye
+    // yönlendirmesinin çalışması için odağı ELLE veriyoruz. Eskiden odak
+    // hangi öğede kaldıysa klavye oraya gidiyordu — çoğu zaman hiçbir yere.
     e.preventDefault();
-    const rect = e.currentTarget.getBoundingClientRect();
-    webrtc.sendInput({ type: 'mousedown', button: e.button, x: (e.clientX - rect.left) / rect.width, y: (e.clientY - rect.top) / rect.height });
+    videoContainerRef.current?.focus();
+    const p = normalizeToVideo(e.clientX, e.clientY);
+    if (!p) return;
+    webrtc!.sendInput({ type: 'mousedown', button: e.button, x: p.x, y: p.y });
   };
   const handleVideoMouseUp = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (!inputEnabled || EMBED.mode === 'view' || !webrtc || rtcState !== 'connected' || !remoteStream) return;
-    const rect = e.currentTarget.getBoundingClientRect();
-    webrtc.sendInput({ type: 'mouseup', button: e.button, x: (e.clientX - rect.left) / rect.width, y: (e.clientY - rect.top) / rect.height });
+    if (!canSendInput()) return;
+    if (isOverlayControl(e)) return;
+    const p = normalizeToVideo(e.clientX, e.clientY);
+    if (!p) return;
+    webrtc!.sendInput({ type: 'mouseup', button: e.button, x: p.x, y: p.y });
   };
   const handleVideoWheel = (e: React.WheelEvent<HTMLDivElement>) => {
-    if (!inputEnabled || EMBED.mode === 'view' || !webrtc || rtcState !== 'connected' || !remoteStream) return;
-    const rect = e.currentTarget.getBoundingClientRect();
-    webrtc.sendInput({ type: 'wheel', dx: e.deltaX, dy: e.deltaY, x: (e.clientX - rect.left) / rect.width, y: (e.clientY - rect.top) / rect.height });
+    if (!canSendInput()) return;
+    if (isOverlayControl(e)) return;
+    const p = normalizeToVideo(e.clientX, e.clientY);
+    if (!p) return;
+    webrtc!.sendInput({ type: 'wheel', dx: e.deltaX, dy: e.deltaY, x: p.x, y: p.y });
   };
   const handleVideoKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
-    if (!inputEnabled || EMBED.mode === 'view' || !webrtc || rtcState !== 'connected' || !remoteStream) return;
+    if (!canSendInput()) return;
     e.preventDefault();
-    webrtc.sendInput({ type: 'keydown', key: e.key, code: e.code });
+    heldKeysRef.current.add(e.code);
+    webrtc!.sendInput({ type: 'keydown', key: e.key, code: e.code });
   };
   const handleVideoKeyUp = (e: React.KeyboardEvent<HTMLDivElement>) => {
-    if (!inputEnabled || EMBED.mode === 'view' || !webrtc || rtcState !== 'connected' || !remoteStream) return;
-    webrtc.sendInput({ type: 'keyup', key: e.key, code: e.code });
+    if (!canSendInput()) return;
+    heldKeysRef.current.delete(e.code);
+    webrtc!.sendInput({ type: 'keyup', key: e.key, code: e.code });
   };
   const addLog = async (msg: string, type: LogType = 'info') => {
     addLocalLog(msg, type);
@@ -180,6 +405,8 @@ export default function App() {
   React.useEffect(() => { rtcStateRef.current = rtcState; }, [rtcState]);
   React.useEffect(() => { webrtcRef.current = webrtc; }, [webrtc]);
   React.useEffect(() => { remoteControlAllowedRef.current = remoteControlAllowed; }, [remoteControlAllowed]);
+  React.useEffect(() => { sessionPasswordRef.current = sessionPassword; }, [sessionPassword]);
+  React.useEffect(() => { requirePasswordRef.current = requirePassword; }, [requirePassword]);
   React.useEffect(() => { document.documentElement.setAttribute('data-theme', theme); }, [theme]);
   React.useEffect(() => { if (showAuth && authMode === 'mfa') setTimeout(() => mfaRefs.current[0]?.focus(), 100); }, [showAuth, authMode]);
   React.useEffect(() => {
@@ -195,6 +422,54 @@ export default function App() {
       remoteVideoRef.current.play().catch(() => {});
     }
   }, [remoteStream]);
+
+  // Kontrol açıldığı anda video alanına odaklan — kullanıcı ayrıca tıklamak
+  // zorunda kalmasın. (Tıklama yolu da mousedown içinde ayrıca ele alınıyor.)
+  React.useEffect(() => {
+    if (inputEnabled && remoteStream) videoContainerRef.current?.focus();
+  }, [inputEnabled, remoteStream]);
+
+  // Ekran listesi yalnızca kontrol izni varken verilir; kontrol açılınca iste,
+  // kapanınca listeyi düşür (karşı taraf artık cevap vermeyecek).
+  React.useEffect(() => {
+    if (!remoteStream || rtcState !== 'connected') { setRemoteScreens([]); return; }
+    if (!inputEnabled) { setRemoteScreens([]); return; }
+    webrtcRef.current?.sendControl({ k: 'screens-req' });
+  }, [inputEnabled, remoteStream, rtcState]);
+
+  // Odak/görünürlük kaybında basılı tuşları uzak tarafta bırak.
+  // Operatör Alt+Tab yaptığında keyup olayı bu pencereye HİÇ gelmez; bu
+  // olmadan uzak makinede Alt (veya Ctrl/Shift) basılı kalıyordu.
+  React.useEffect(() => {
+    const releaseAll = () => {
+      const held = heldKeysRef.current;
+      const mgr = webrtcRef.current;
+      if (!mgr) { held.clear(); return; }
+      for (const code of held) mgr.sendInput({ type: 'keyup', key: '', code });
+      held.clear();
+      // Uzak taraf ayrıca kendi izlediği her şeyi bıraksın (fare düğmeleri dahil).
+      mgr.sendInput({ type: 'release-all' });
+    };
+    const onVisibility = () => { if (document.hidden) releaseAll(); };
+    window.addEventListener('blur', releaseAll);
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      window.removeEventListener('blur', releaseAll);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, []);
+
+  // Kontrol kapatıldığında da basılı tuşlar kalmamalı.
+  React.useEffect(() => {
+    if (inputEnabled) return;
+    const held = heldKeysRef.current;
+    const mgr = webrtcRef.current;
+    if (mgr && held.size > 0) {
+      for (const code of held) mgr.sendInput({ type: 'keyup', key: '', code });
+      mgr.sendInput({ type: 'release-all' });
+    }
+    held.clear();
+  }, [inputEnabled]);
 
   // Kendi giden bağlantı denememizi yerel olarak sonlandır (çağrı çakışmasında
   // geri çekilirken kullanılır). Yalnızca ref'lere dokunur, bayat closure riski yok.
@@ -230,11 +505,11 @@ export default function App() {
 
   // Meşgul/red bildirimini, arayanın bizi çağırdığı kimlikle imzala; aksi halde
   // arayan bu sinyali "başkasından" sanıp yok sayar.
-  const sendBusySignal = async (toId: string, addressedAs?: string) => {
+  const sendBusySignal = async (toId: string, addressedAs?: string, reason = 'busy') => {
     try {
       await supabase.from('signals').insert({
         from_id: addressedAs || currentUser?.id || connectionId,
-        to_id: toId, type: 'hangup', payload: { reason: 'busy' },
+        to_id: toId, type: 'hangup', payload: { reason },
       });
     } catch { /* bildirim gönderilemedi — arayan zaman aşımına düşer */ }
   };
@@ -253,6 +528,24 @@ export default function App() {
 
     const decision = decideIncomingOffer(sig.from_id);
     if (decision === 'ignore') return;
+
+    // Parola kontrolu, cagri ekranda GOSTERILMEDEN ve kendi giden cagrimiz
+    // geri cekilmeden ONCE yapilir: yanlis parola ile arayan ne rahatsizlik
+    // verebilir ne de cagri cakismasi uydurup bizi geri cekilmeye zorlayabilir.
+    // Kimligi bilmek artik tek basina yetmiyor.
+    if (requirePasswordRef.current) {
+      const given = String((sig.payload as { pw?: unknown } | null)?.pw ?? '').trim().toUpperCase();
+      if (given !== sessionPasswordRef.current) {
+        const tries = (badPasswordTriesRef.current.get(sig.from_id) ?? 0) + 1;
+        badPasswordTriesRef.current.set(sig.from_id, tries);
+        addLocalLog(`${sig.from_id} yanlis parola ile baglanmak istedi (${tries}. deneme).`, 'warn');
+        // Ilk denemelerde sebebi bildir ki mesru kullanici parolayi duzeltsin;
+        // sonrasinda sessizce yut — kaba kuvvet icin geri bildirim vermeyelim.
+        if (tries <= 3) await sendBusySignal(sig.from_id, sig.to_id, 'badpass');
+        return;
+      }
+      badPasswordTriesRef.current.delete(sig.from_id);
+    }
     if (decision === 'busy') {
       addLocalLog(`${sig.from_id} baglanmak istedi, mesgul oldugunuz bildirildi.`, 'warn');
       await sendBusySignal(sig.from_id, sig.to_id);
@@ -289,14 +582,20 @@ export default function App() {
             addLocalLog(
               reason === 'busy' ? 'Karsi taraf mesgul, su an baska bir oturumda.'
               : reason === 'rejected' ? 'Baglanti istegi reddedildi.'
+              : reason === 'badpass' ? 'Oturum parolasi hatali. Karsi tarafin ekranindaki parolayi kontrol edin.'
               : 'Karsi taraf baglantıyi kesti.',
               'warn',
             );
+            // Bekleyen 30 sn zaman aşımını iptal et. Aksi halde reddedilen veya
+            // yanlış parolayla düşen bir çağrıdan 30 sn SONRA "yanit vermedi
+            // (zaman asimi)" satırı düşüyor ve gerçek sebebin üstünü örtüyordu.
+            if (connTimeoutRef.current) { clearTimeout(connTimeoutRef.current); connTimeoutRef.current = null; }
             // Disconnect the active WebRTCManager (uses ref to avoid stale closure)
             webrtcRef.current?.disconnect().catch(() => {});
             setWebrtc(null);
             setRtcState('idle');
             setRemoteStream(null);
+            setQuality(null);
             setIsConnecting(false);
             setInputEnabled(false);
             if (localVideoRef.current?.srcObject) {
@@ -368,15 +667,28 @@ export default function App() {
       if (user) {
         // Anonim kullanıcının doğrulanacak bir e-postası yoktur.
         setIsEmailVerified(anon || !!user.email_confirmed_at);
-        const pid = generateProfileId(user.id);
-        setConnectionId(pid);
         setSessionToken(generateSessionToken());
         const fp = generateDeviceFingerprint();
         setDeviceFingerprint(fp);
+        // Kimlik artık SUNUCUDA üretiliyor: benzersizliği veritabanı garanti
+        // eder ve mevcut kimlik asla değişmez. Eski istemci üretimi 32-bit
+        // hash'ti; çakışan kullanıcının upsert'ü sessizce başarısız oluyor ve
+        // o kullanıcı kimliksiz — yani ulaşılamaz — kalıyordu.
+        const { id: pid, fromServer } = await resolveMyConnectionId(user.id);
+        setConnectionId(pid);
+        // Kimlik sunucuda kayitli: artik bu kimlige sinyal gelebilir.
+        setIdentityReady(true);
+        setIdentityError('');
         // Kimlik bağlama: bu satır, display kimliğini (123-456-789) auth.uid()'e
         // bağlar. signals RLS'ini kimliğe dayandırmanın ön koşulu budur —
         // misafirler dahil herkes için yazılır.
-        await supabase.from('users').upsert({ id: user.id, email: user.email ?? null, connection_id: pid, device_fingerprint: fp, last_seen: new Date().toISOString() }, { onConflict: 'id' });
+        const profileRow: Record<string, unknown> = {
+          id: user.id, email: user.email ?? null,
+          device_fingerprint: fp, last_seen: new Date().toISOString(),
+        };
+        // Sunucu atadıysa kimliği tekrar yazmayız (RPC zaten yazdı).
+        if (!fromServer) profileRow.connection_id = pid;
+        await supabase.from('users').upsert(profileRow, { onConflict: 'id' });
         if (anon) {
           // Misafir: profil/geçmiş/abonelik yüklenmez, kayıt tutulmaz.
           setUserProfile(null);
@@ -399,8 +711,16 @@ export default function App() {
         const { data: cxData } = await supabase.from('connections').select('*').eq('caller_id', user.id).order('created_at', { ascending: false }).limit(20);
         if (cxData) setConnectionHistory(cxData as ConnectionEntry[]);
         setEntitlements(await fetchEntitlements());
+        // Kurumsal davetleri hesaba bagla. Bu cagri olmadan admin'in ekledigi
+        // cihaz etiketleri hicbir zaman cozumlenmez ve kurumsal vanity kimlik
+        // (acme-01) calismaz — organization_members.user_id NULL kalirdi.
+        bindOrgInvites()
+          .then(n => { if (n > 0) addLocalLog(`${n} kurumsal davet hesabiniza baglandi.`, 'sys'); })
+          .catch(() => { /* RPC yoksa yok say */ });
       } else {
         setIsEmailVerified(true); setUserProfile(null); setSessionToken(''); setDeviceFingerprint(''); setConnectionId(getOrCreateGuestId());
+        // Oturum yok -> bu kimlige kimse ulasamaz.
+        setIdentityReady(false);
         setEntitlements(FREE_ENTITLEMENTS);
         setLogs([{ time: ts(), msg: `Arku Remote v${__APP_VERSION__} baslatildi...`, type: 'sys' }, { time: ts(), msg: 'Lutfen giris yapin.', type: 'warn' }]);
       }
@@ -415,27 +735,80 @@ export default function App() {
   // Supabase'de "Allow anonymous sign-ins" kapalıysa burası sessizce başarısız olur
   // ve uygulama bugünkü (oturumsuz misafir) davranışıyla çalışmaya devam eder.
   const anonBootstrapRef = React.useRef(false);
+
+  /**
+   * Oturum acmayi dener. Basarisizsa SEBEBI saklar ve gosterir.
+   *
+   * Eskiden hata `catch(() => {})` ile yutuluyor, yalnizca gunluge tek satir
+   * dusuyordu. Kullanici ekranda gecerli gorunen bir kimlik goruyor ama
+   * kimse ona ulasamiyordu.
+   */
+  const ensureSession = React.useCallback(async (): Promise<boolean> => {
+    const { data: { session } } = await supabase.auth.getSession();
+    if (session) {
+      // getSession YALNIZCA yereldeki kaydı okur — jeton iptal edilmiş ya da
+      // süresi dolmuş olabilir. Sunucuya sorup doğruluyoruz.
+      const { error: userErr } = await supabase.auth.getUser();
+      if (!userErr) return true;
+
+      // DİKKAT: getUser() hatası tek başına "oturum geçersiz" DEMEK DEĞİLDİR.
+      // Ağ kesintisi, 5xx, ya da tarayıcı kalkanlarının (Brave shields) isteği
+      // engellemesi de hata döndürür. İlk sürümde her hatada oturumu
+      // kapatıyordum: sağlam oturum yanıyor, yerine yenisi açılamayınca
+      // kullanıcı kimliksiz kalıyordu — üstelik o durumda kesme sinyali de
+      // yazılamadığı için karşı taraf bağlantının koptuğunu geç anlıyordu.
+      // Yalnızca sunucunun kimliği AÇIKÇA reddettiği durumda kapatıyoruz.
+      const status = (userErr as { status?: number }).status;
+      const kesinGecersiz = status === 401 || status === 403;
+      if (!kesinGecersiz) {
+        addLocalLog(`Oturum dogrulanamadi (gecici olabilir): ${userErr.message}`, 'warn');
+        return true; // mevcut oturumu KORU
+      }
+      addLocalLog('Kayitli oturum gecersiz, yenisi aciliyor.', 'warn');
+      try { await supabase.auth.signOut({ scope: 'local' }); } catch { /* yok say */ }
+    }
+    const { error } = await supabase.auth.signInAnonymously();
+    if (!error) { setIdentityError(''); return true; }
+    setIdentityError(error.message || 'Bilinmeyen hata');
+    addLocalLog(`Oturum acilamadi: ${error.message}`, 'error');
+    return false;
+  }, []);
+
   React.useEffect(() => {
     // QRtım SSO dönüşünde atlanır; o akış kendi oturumunu açar.
-    if (new URLSearchParams(window.location.search).get('qrtim_token')) return;
+    if (QRTIM_ENABLED && new URLSearchParams(window.location.search).get('qrtim_token')) return;
     if (anonBootstrapRef.current) return;
     anonBootstrapRef.current = true;
+    let cancelled = false;
     (async () => {
-      const { data: { session } } = await supabase.auth.getSession();
-      if (session) return;
-      const { error } = await supabase.auth.signInAnonymously();
-      if (error) {
-        anonBootstrapRef.current = false;
-        addLocalLog('Anonim oturum acilamadi, misafir modunda devam ediliyor.', 'warn');
+      // Gecici ag hatasi acilista siktir; birkac kez, artan bekleme ile dene.
+      for (let deneme = 1; deneme <= 3 && !cancelled; deneme++) {
+        if (await ensureSession()) return;
+        if (deneme < 3) await new Promise(r => setTimeout(r, deneme * 1500));
       }
+      if (!cancelled) anonBootstrapRef.current = false; // elle tekrar denenebilsin
     })();
-  }, []);
+    return () => { cancelled = true; };
+  }, [ensureSession]);
+
+  /** Arayuzdeki "Tekrar Dene" dugmesi. */
+  const retryIdentity = async () => {
+    setIdentityError('');
+    addLocalLog('Kimlik yeniden alinmaya calisiliyor...', 'info');
+    anonBootstrapRef.current = true;
+    if (!(await ensureSession())) anonBootstrapRef.current = false;
+  };
 
   // QRtım'den ?qrtim_token=... ile dönüşte tek noktadan işle:
   // oturum açıksa hesabı bağla, açık değilse QRtım ile giriş yap (SSO).
   React.useEffect(() => {
     const qrtimToken = new URLSearchParams(window.location.search).get('qrtim_token');
     if (!qrtimToken) return;
+    if (!QRTIM_ENABLED) {
+      // Askidayken gelen token islenmez; adres cubugundan da temizlenir.
+      window.history.replaceState({}, '', window.location.pathname);
+      return;
+    }
     (async () => {
       const { data: { session } } = await supabase.auth.getSession();
       // DİKKAT: anonim oturum her sekmede açık olduğu için "oturum var mı"
@@ -605,9 +978,12 @@ export default function App() {
     try { await supabase.auth.signOut({ scope: 'local' }); } catch { /* yok say */ }
     // QRtım yeniden-giriş döngüsünü kır: kalan callback/token izlerini temizle.
     try { sessionStorage.removeItem('partner_callback'); } catch { /* yok say */ }
+    // TURN kimlik bilgisi çağıranın kimliğine bağlıdır — sonraki kullanıcı
+    // öncekinin kimliğiyle relay kullanmasın.
+    resetIceCache();
     setCurrentUser(null); setUserProfile(null); setGuestChoice(false); setConnectionHistory([]);
     setQrtimUser(null);
-    setRemoteStream(null); setRtcState('idle'); setIsConnecting(false);
+    setRemoteStream(null); setQuality(null); setVerifyCode(null); setPeerLabel(''); setRtcState('idle'); setIsConnecting(false);
     setConnectionId(getOrCreateGuestId()); setDisplayName(''); setPhone(''); setSessionToken(''); setDeviceFingerprint('');
     setActiveTab('dashboard'); addLocalLog('Oturum kapatildi.', 'warn');
     // Çıkıştan sonra da ulaşılabilir kal (RLS oturum ister), ama kullanıcı
@@ -650,6 +1026,74 @@ export default function App() {
   React.useEffect(() => {
     if (activeOrgId) listOrgMembers(activeOrgId).then(setOrgMembers); else setOrgMembers([]);
   }, [activeOrgId]);
+
+  // Oturum bitince parolayı yenile — bir kez paylaşılan parola tekrar
+  // kullanılamasın. YALNIZCA gerçekten biten bir oturumdan sonra: aksi halde
+  // karşı taraf parolayı okuyup çevirene kadar parola değişebilirdi.
+  const prevRtcStateRef = React.useRef<ConnectionState>('idle');
+  React.useEffect(() => {
+    const prev = prevRtcStateRef.current;
+    prevRtcStateRef.current = rtcState;
+    if (rtcState === 'idle' && (prev === 'connected' || prev === 'disconnected')) {
+      setSessionPassword(generateSessionPassword());
+      badPasswordTriesRef.current.clear();
+      addLocalLog('Oturum parolasi yenilendi.', 'sys');
+    }
+  }, [rtcState]);
+
+  const regenerateSessionPassword = () => {
+    setSessionPassword(generateSessionPassword());
+    badPasswordTriesRef.current.clear();
+    addLocalLog('Oturum parolasi yenilendi.', 'sys');
+  };
+
+  const toggleRequirePassword = (v: boolean) => {
+    setRequirePassword(v);
+    try { localStorage.setItem('arku_require_password', v ? '1' : '0'); } catch { /* yok say */ }
+    addLocalLog(v ? 'Baglanti icin parola zorunlu.' : 'Parola zorunlulugu kapatildi.', v ? 'sys' : 'warn');
+  };
+
+  // Kayit suresi sayaci.
+  React.useEffect(() => {
+    if (recState !== 'recording') return;
+    const t = setInterval(() => {
+      setRecElapsed(recStartedAtRef.current ? Math.round((Date.now() - recStartedAtRef.current) / 1000) : 0);
+    }, 1000);
+    return () => clearInterval(t);
+  }, [recState]);
+
+  // Kayit klasorunu acilista oku (masaustu).
+  React.useEffect(() => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const api = (window as any).electronAPI;
+    if (!api?.getRecordingFolder) return;
+    api.getRecordingFolder().then((d: string) => { if (d) setRecFolder(d); }).catch(() => { /* yok say */ });
+  }, []);
+
+  // Kalp atışı: karşı taraf bizi ancak last_seen güncel kalırsa "çevrimiçi"
+  // görebilir. 60 sn aralık, sunucudaki 90 sn eşiğiyle uyumlu — bir atış
+  // kaçtığında cihaz çevrimdışı görünmez.
+  React.useEffect(() => {
+    if (!currentUser) return;
+    const uid = currentUser.id;
+    const beat = () => { sendHeartbeat(uid).catch(() => { /* geçici ağ hatası */ }); };
+    beat();
+    const timer = setInterval(beat, 60000);
+    // Sekme geri geldiğinde hemen bildir (uyku sonrası bekleme olmasın).
+    const onVisible = () => { if (!document.hidden) beat(); };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => { clearInterval(timer); document.removeEventListener('visibilitychange', onVisible); };
+  }, [currentUser?.id]);
+
+  // Kayıtlı müşterilerin çevrimiçi durumu — yalnızca Kayıtlı sekmesi açıkken.
+  React.useEffect(() => {
+    if (activeTab !== 'contacts' || savedContacts.length === 0) { return; }
+    const ids = savedContacts.map(c => c.connection_id);
+    const load = () => { fetchPresence(ids).then(setPresence).catch(() => { /* RPC yoksa boş kalır */ }); };
+    load();
+    const timer = setInterval(load, 30000);
+    return () => clearInterval(timer);
+  }, [activeTab, savedContacts]);
 
   // ── Kayıtlı müşteri form durumu + eylemleri ────────────────────────────────
   const [scConnId, setScConnId] = React.useState('');
@@ -785,12 +1229,14 @@ export default function App() {
   };
 
   const handleQrtimConnect = () => {
+    if (!QRTIM_ENABLED) return;
     if (!isRegistered) { setShowAuth(true); setAuthMode('login'); return; }
     window.location.href = `${QRTIM_BASE_URL}/login?callback=${encodeURIComponent(qrtimCallbackUrl())}&source=arku`;
   };
 
   // Giriş ekranından QRtım ile tek tıkla giriş (oturum gerekmez).
   const handleQrtimLogin = () => {
+    if (!QRTIM_ENABLED) return;
     window.location.href = `${QRTIM_BASE_URL}/login?callback=${encodeURIComponent(qrtimCallbackUrl())}&source=arku`;
   };
 
@@ -839,8 +1285,265 @@ export default function App() {
 
   // Uzaktan kontrol iznini kapat. Masaüstünde ana süreçteki yetkiyi de düşürür —
   // asıl kapı orası; buradaki bayrak yalnızca arayüz durumudur.
+  // ── Pano paylasimi ─────────────────────────────────────────────────────────
+  // forRemote/fromRemote = "islemi karsi taraf istedi". Ana surec bu durumda
+  // kontrol iznini arar; operatorun kendi dugmesine basmasi kapiya takilmaz.
+  const readLocalClipboard = async (forRemote: boolean): Promise<string | null> => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const api = (window as any).electronAPI;
+    if (api?.readClipboard) { try { return await api.readClipboard({ forRemote }); } catch { return null; } }
+    // Web surumu: tarayici izin ve odak ister, reddedilebilir.
+    try { return await navigator.clipboard.readText(); } catch { return null; }
+  };
+
+  const writeLocalClipboard = async (text: string, fromRemote: boolean): Promise<boolean> => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const api = (window as any).electronAPI;
+    if (api?.writeClipboard) { api.writeClipboard({ text, fromRemote }); return true; }
+    try { await navigator.clipboard.writeText(text); return true; } catch { return false; }
+  };
+
+  const sendClipboardToRemote = async () => {
+    if (!webrtc || rtcState !== 'connected') return;
+    const text = await readLocalClipboard(false);
+    if (!text) { addLocalLog('Yerel pano bos veya okunamadi.', 'warn'); return; }
+    webrtc.sendControl({ k: 'clip-set', text });
+    addLocalLog(`Pano karsi tarafa gonderildi (${text.length} karakter).`, 'sys');
+  };
+
+  const requestRemoteClipboard = () => {
+    if (!webrtc || rtcState !== 'connected') return;
+    webrtc.sendControl({ k: 'clip-req' });
+    addLocalLog('Uzak pano istendi...', 'info');
+  };
+
+  // -- Dosya transferi --------------------------------------------------------
+  const formatBytes = (n: number): string =>
+    n >= 1048576 ? (n / 1048576).toFixed(1) + ' MB'
+    : n >= 1024 ? Math.round(n / 1024) + ' KB'
+    : n + ' B';
+
+  /** Alinan dosyayi diske yazar. Masaustunde kaydetme penceresi, webde indirme. */
+  const saveReceivedFile = async (name: string, blob: Blob) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const api = (window as any).electronAPI;
+    if (api?.saveFile) {
+      const buf = await blob.arrayBuffer();
+      const res = await api.saveFile({ name, data: new Uint8Array(buf) });
+      addLocalLog(
+        res?.ok ? `Dosya kaydedildi: ${res.path}`
+        : res?.cancelled ? 'Kaydetme iptal edildi.'
+        : `Dosya kaydedilemedi: ${res?.error ?? 'bilinmeyen hata'}`,
+        res?.ok ? 'sys' : 'warn');
+      return;
+    }
+    // Web surumu: gecici indirme baglantisi.
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = name;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+    addLocalLog(`Dosya indirildi: ${name}`, 'sys');
+  };
+
+  const pickAndSendFile = () => { fileInputRef.current?.click(); };
+
+  const handleFileChosen = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = ''; // ayni dosya tekrar secilebilsin
+    if (!file || !webrtc || rtcState !== 'connected') return;
+    const id = webrtc.offerFile(file);
+    if (!id) return;
+    setFileProgress({ id, done: 0, total: file.size, dir: 'out' });
+    addLocalLog(`Dosya teklif edildi: ${file.name} (${formatBytes(file.size)})`, 'info');
+  };
+
+  const acceptIncomingFile = () => {
+    if (!incomingFile || !webrtc) return;
+    webrtc.acceptIncomingFile(incomingFile);
+    setFileProgress({ id: incomingFile.id, done: 0, total: incomingFile.size, dir: 'in' });
+    addLocalLog(`Dosya aliniyor: ${incomingFile.name}`, 'sys');
+    setIncomingFile(null);
+  };
+
+  const rejectIncomingFile = () => {
+    if (!incomingFile || !webrtc) return;
+    webrtc.rejectIncomingFile(incomingFile.id);
+    addLocalLog('Dosya reddedildi.', 'warn');
+    setIncomingFile(null);
+  };
+
+  // ── Oturum kaydi ───────────────────────────────────────────────────────────
+  // Kayit IZLEYEN tarafta alinir: gelen MediaStream zaten elimizde, ajanda
+  // ek yuk ve yukleme yok. Dosya Arku sunucularina HIC ugramaz.
+
+  /** Tarayicinin destekledigi ilk kayit bicimini secer. */
+  const pickRecorderMime = (): string => {
+    const adaylar = [
+      'video/webm;codecs=vp9',
+      'video/webm;codecs=vp8',
+      'video/webm',
+    ];
+    for (const m of adaylar) {
+      if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported?.(m)) return m;
+    }
+    return '';
+  };
+
+  /** Kaydi fiilen baslatir (onay ALINDIKTAN sonra cagrilir). */
+  const startRecording = (stream: MediaStream): boolean => {
+    if (typeof MediaRecorder === 'undefined') {
+      addLocalLog('Bu tarayici kayit desteklemiyor.', 'error');
+      return false;
+    }
+    try {
+      const mimeType = pickRecorderMime();
+      const mr = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      recChunksRef.current = [];
+      mr.ondataavailable = (e) => { if (e.data && e.data.size > 0) recChunksRef.current.push(e.data); };
+      mr.onerror = () => addLocalLog('Kayit sirasinda hata olustu.', 'error');
+      mr.onstop = () => { void finalizeRecording(); };
+      // 1 sn'lik parcalar: kayit ortasinda cokme olursa o ana kadarki veri durur.
+      mr.start(1000);
+      mediaRecorderRef.current = mr;
+      recStartedAtRef.current = Date.now();
+      setRecElapsed(0);
+      setRecState('recording');
+      addLocalLog('Oturum kaydi basladi.', 'warn');
+      recordAudit('recording_start', {
+        actorIdentity: connectionId,
+        peerIdentity: webrtcRef.current?.getPeerId(),
+        detail: { consentVersion: RECORDING_CONSENT_VERSION, mimeType: mimeType || 'varsayilan' },
+      });
+      return true;
+    } catch (err) {
+      addLocalLog(`Kayit baslatilamadi: ${String(err)}`, 'error');
+      return false;
+    }
+  };
+
+  /** Kaydi durdurur; dosya yazma onStop -> finalizeRecording icinde olur. */
+  const stopRecording = (bildir = true) => {
+    const mr = mediaRecorderRef.current;
+    if (mr && mr.state !== 'inactive') { try { mr.stop(); } catch { /* yok say */ } }
+    mediaRecorderRef.current = null;
+    setRecState('off');
+    if (bildir) webrtcRef.current?.sendControl({ k: 'rec-stopped' });
+  };
+
+  /** Toplanan parcalari birlestirip diske yazar. */
+  const finalizeRecording = async () => {
+    const parts = recChunksRef.current;
+    recChunksRef.current = [];
+    const saniye = recStartedAtRef.current
+      ? Math.round((Date.now() - recStartedAtRef.current) / 1000) : 0;
+    recStartedAtRef.current = 0;
+    setRecElapsed(0);
+    if (!parts.length) { addLocalLog('Kayit bos, dosya yazilmadi.', 'warn'); return; }
+
+    // Denetim: kaydin ustverisi. Dosyanin KENDISI sunucuya gitmez; buradaki
+    // boyut ve sure, kaydin varligini ve kapsamini belgeler.
+    recordAudit('recording_stop', {
+      actorIdentity: connectionId,
+      peerIdentity: webrtcRef.current?.getPeerId(),
+      detail: { saniye, bayt: parts.reduce((t, b) => t + b.size, 0),
+                consentVersion: RECORDING_CONSENT_VERSION },
+    });
+
+    const blob = new Blob(parts, { type: 'video/webm' });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const api = (window as any).electronAPI;
+    if (api?.saveRecording) {
+      const buf = await blob.arrayBuffer();
+      const res = await api.saveRecording({
+        data: new Uint8Array(buf),
+        peer: peerLabel || targetId,
+      });
+      if (res?.ok) {
+        if (res.folder) setRecFolder(res.folder);
+        addLocalLog(`Kayit kaydedildi (${saniye} sn): ${res.path}`, 'sys');
+      } else if (res?.cancelled) {
+        addLocalLog('Kayit klasoru secilmedi, dosya yazilmadi.', 'warn');
+      } else {
+        addLocalLog(`Kayit yazilamadi: ${res?.error ?? 'bilinmeyen hata'}`, 'error');
+      }
+      return;
+    }
+    // Web surumu: tarayici indirmesi.
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `arku-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.webm`;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+    addLocalLog(`Kayit indirildi (${saniye} sn).`, 'sys');
+  };
+
+  /** Izleyen taraf: kayit izni ister. */
+  const requestRecording = () => {
+    if (!webrtc || rtcState !== 'connected' || !remoteStream) return;
+    setRecState('requesting');
+    webrtc.sendControl({ k: 'rec-request', consentVersion: RECORDING_CONSENT_VERSION });
+    addLocalLog('Kayit icin karsi tarafin onayi bekleniyor...', 'info');
+  };
+
+  /** Paylasan taraf: onay verir. */
+  const acceptRecording = () => {
+    setRecPrompt(false);
+    webrtcRef.current?.sendControl({ k: 'rec-accept', consentVersion: RECORDING_CONSENT_VERSION });
+    addLocalLog('Oturum kaydina onay verildi.', 'warn');
+    // Denetim: rizanin KENDISI ve hangi metne dayandigi.
+    recordAudit('recording_consent', {
+      actorIdentity: connectionId,
+      peerIdentity: webrtcRef.current?.getPeerId(),
+      includeDevice: true,
+      detail: { consentVersion: RECORDING_CONSENT_VERSION, karar: 'onaylandi' },
+    });
+  };
+
+  const rejectRecording = () => {
+    setRecPrompt(false);
+    webrtcRef.current?.sendControl({ k: 'rec-reject' });
+    addLocalLog('Oturum kaydi reddedildi.', 'warn');
+    recordAudit('recording_consent', {
+      actorIdentity: connectionId,
+      peerIdentity: webrtcRef.current?.getPeerId(),
+      detail: { consentVersion: RECORDING_CONSENT_VERSION, karar: 'reddedildi' },
+    });
+  };
+
+  const loadAudit = async () => {
+    setAuditBusy(true);
+    try {
+      const [rows, v] = await Promise.all([listAudit(50), verifyAuditChain()]);
+      setAuditRows(rows);
+      setAuditVerify(v);
+    } finally { setAuditBusy(false); }
+  };
+
+  const AUDIT_LABEL: Record<string, string> = {
+    session_start: 'Oturum basladi',
+    session_end: 'Oturum bitti',
+    control_granted: 'Uzaktan kontrol izni verildi',
+    control_revoked: 'Uzaktan kontrol izni kaldirildi',
+    recording_consent: 'Kayit rizasi',
+    recording_start: 'Kayit basladi',
+    recording_stop: 'Kayit bitti',
+    file_sent: 'Dosya gonderildi',
+    file_received: 'Dosya alindi',
+  };
+
+  const chooseRecordingFolder = async () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const api = (window as any).electronAPI;
+    if (!api?.pickRecordingFolder) return;
+    const dir = await api.pickRecordingFolder();
+    if (dir) { setRecFolder(dir); addLocalLog(`Kayit klasoru: ${dir}`, 'sys'); }
+  };
+
   const disableRemoteControl = () => {
     setRemoteControlAllowed(false);
+    setControlNotice('');
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (window as any).electronAPI?.revokeRemoteControl?.();
   };
@@ -851,35 +1554,244 @@ export default function App() {
     if (remoteControlAllowed) {
       disableRemoteControl();
       addLocalLog('Uzaktan kontrol izni kapatildi.', 'warn');
+      recordAudit('control_revoked', {
+        actorIdentity: connectionId,
+        peerIdentity: webrtc?.getPeerId(),
+      });
       return;
     }
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const api = (window as any).electronAPI;
     if (api?.requestRemoteControl) {
-      let granted = false;
-      try { granted = await api.requestRemoteControl(); } catch { granted = false; }
-      if (!granted) { addLocalLog('Uzaktan kontrol izni verilmedi.', 'warn'); return; }
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let res: any = null;
+      try { res = await api.requestRemoteControl(); } catch { res = null; }
+      // Eski preload yalnızca boolean döndürüyordu; yeni sürüm
+      // { granted, pointer, reason, error } veriyor. İkisi de desteklenir.
+      const granted = res === true || res?.granted === true;
+      if (!granted) {
+        // Eskiden burada tek bir "izin verilmedi" satırı vardı ve nut-js hiç
+        // yüklenmediyse kullanıcı sebebini ASLA öğrenemiyordu.
+        const reason = res?.reason;
+        addLocalLog(
+          reason === 'unavailable'
+            ? `Uzaktan kontrol bu kurulumda kullanilamiyor${res?.error ? `: ${res.error}` : '.'}`
+            : reason === 'accessibility'
+              ? 'macOS Erisilebilirlik izni yok — Sistem Ayarlari > Gizlilik ve Guvenlik > Erisilebilirlik.'
+              : 'Uzaktan kontrol izni verilmedi.',
+          reason === 'denied' || !reason ? 'warn' : 'error',
+        );
+        return;
+      }
+      // Tek pencere paylaşıldıysa fare koordinatı güvenilir eşlenemez;
+      // ana süreç fareyi reddeder, klavye çalışmaya devam eder.
+      const pointerOff = res !== true && res?.pointer === false;
+      setControlNotice(pointerOff ? 'Yalnizca klavye' : '');
+      if (pointerOff) {
+        addLocalLog('Tek pencere paylasildi: fare kontrolu kapali, klavye calisiyor. Fare icin tum ekrani paylasin.', 'warn');
+      }
     }
     setRemoteControlAllowed(true);
     addLocalLog('Uzaktan kontrole izin verildi.', 'warn');
+    recordAudit('control_granted', {
+      actorIdentity: connectionId,
+      peerIdentity: webrtc?.getPeerId(),
+      detail: { pointer: controlNotice === '' },
+    });
   };
 
   const buildManager = (): WebRTCManager => {
     const myId = currentUser?.id || connectionId;
     const m = new WebRTCManager(myId);
+    m.onQuality = setQuality;
+    m.onVerification = setVerifyCode;
+    m.onFile = async (ev) => {
+      if (ev.t === 'offer') { setIncomingFile(ev.offer); return; }
+      if (ev.t === 'accepted') { addLocalLog('Karsi taraf dosyayi kabul etti, gonderiliyor...', 'sys'); return; }
+      if (ev.t === 'rejected') {
+        setFileProgress(null);
+        addLocalLog('Karsi taraf dosyayi reddetti.', 'warn');
+        return;
+      }
+      if (ev.t === 'progress') {
+        setFileProgress({ id: ev.id, done: ev.done, total: ev.total, dir: ev.dir });
+        return;
+      }
+      if (ev.t === 'cancelled') {
+        setFileProgress(null);
+        setIncomingFile(null);
+        addLocalLog(
+          ev.reason === 'size' ? 'Dosya beyan edilenden buyuk, transfer kesildi.'
+          : ev.reason === 'incomplete' ? 'Dosya eksik geldi, kaydedilmedi.'
+          : 'Dosya transferi iptal edildi.',
+          'warn');
+        return;
+      }
+      if (ev.t === 'complete') {
+        setFileProgress(null);
+        await saveReceivedFile(ev.name, ev.blob);
+      }
+    };
+
+    m.onControl = async (msg: ControlMsg) => {
+      const role = m.getRole();
+      if (msg.k === 'clip-req') {
+        // Yalnizca KONTROL EDILEN taraf panosunu verir ve yalnizca izin varsa.
+        // Panodaki bir parola, ekranda hic gorunmeden disari cikabilir —
+        // bu yuzden klavye/fare ile ayni kapidan geciyor.
+        if (role !== 'receiver' || !remoteControlAllowedRef.current) return;
+        const text = await readLocalClipboard(true);
+        if (!text) return;
+        m.sendControl({ k: 'clip-set', text });
+        addLocalLog('Panonuz karsi tarafa gonderildi.', 'warn');
+        return;
+      }
+      if (msg.k === 'clip-set') {
+        const text = typeof msg.text === 'string' ? msg.text : '';
+        if (!text) return;
+        if (role === 'receiver') {
+          // Karsi taraf PANOMUZA yaziyor — kontrol izni sart.
+          if (!remoteControlAllowedRef.current) return;
+          const ok = await writeLocalClipboard(text, true);
+          if (ok) addLocalLog('Karsi taraf panonuza metin yazdi.', 'warn');
+        } else {
+          // Operator: kendi istedigi uzak panonun yaniti.
+          const ok = await writeLocalClipboard(text, false);
+          addLocalLog(ok ? `Uzak pano alindi (${text.length} karakter).` : 'Pano yazilamadi.', ok ? 'sys' : 'warn');
+        }
+        return;
+      }
+
+      // ── Oturum kaydi ──
+      if (msg.k === 'rec-request') {
+        // Ekrani PAYLASAN taraf onaylar: kaydedilen onun ekrani.
+        if (role !== 'receiver') return;
+        setRecPrompt(true);
+        addLocalLog('Karsi taraf oturumu kaydetmek istiyor.', 'warn');
+        return;
+      }
+      if (msg.k === 'rec-accept') {
+        // Yalnizca BIZ istediysek kabul edilir. Aksi halde kotu niyetli bir es,
+        // istenmemis bir "onay" gonderip bizde kayit baslatabilirdi.
+        if (recStateRef.current !== 'requesting') return;
+        // Izleyen taraf: onay geldi, kaydi baslat.
+        const stream = remoteVideoRef.current?.srcObject as MediaStream | null;
+        if (!stream) { addLocalLog('Kayit baslatilamadi: goruntu akisi yok.', 'error'); setRecState('off'); return; }
+        if (startRecording(stream)) m.sendControl({ k: 'rec-started' });
+        else { setRecState('off'); m.sendControl({ k: 'rec-stopped' }); }
+        return;
+      }
+      if (msg.k === 'rec-reject') {
+        setRecState('off');
+        addLocalLog('Karsi taraf kaydi reddetti.', 'warn');
+        return;
+      }
+      if (msg.k === 'rec-started') {
+        // Paylasan taraf: gosterge yansin.
+        setRecState('recording');
+        addLocalLog('Oturum KAYDEDILIYOR.', 'warn');
+        return;
+      }
+      if (msg.k === 'rec-stopped') {
+        // Karsi taraf durdurdu. Biz kaydediyorsak dosyayi yaz.
+        if (mediaRecorderRef.current) stopRecording(false);
+        else setRecState('off');
+        addLocalLog('Oturum kaydi durduruldu.', 'warn');
+        return;
+      }
+
+      // ── Coklu monitor ──
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const api = (window as any).electronAPI;
+
+      if (msg.k === 'screens-req') {
+        // Yalnizca paylasan taraf listesini verir, yalnizca kontrol izniyle.
+        if (role !== 'receiver' || !remoteControlAllowedRef.current || !api?.listScreens) return;
+        const res = await api.listScreens();
+        m.sendControl({ k: 'screens', list: res?.list ?? [], current: res?.current ?? '' });
+        return;
+      }
+
+      if (msg.k === 'screens') {
+        // Operator tarafi: listeyi arayuze al.
+        setRemoteScreens(Array.isArray(msg.list) ? msg.list : []);
+        setCurrentRemoteScreen(typeof msg.current === 'string' ? msg.current : '');
+        return;
+      }
+
+      if (msg.k === 'screen-select') {
+        if (role !== 'receiver' || !remoteControlAllowedRef.current || !api?.selectScreen) return;
+        const ok = await api.selectScreen(msg.id);
+        if (!ok) { addLocalLog('Ekran degistirilemedi.', 'warn'); return; }
+        try {
+          // Gecise yeniden pazarlik gerekmez: replaceTrack SDP'ye dokunmaz.
+          // getUserMedia'nin chromeMediaSource yolu kullanici hareketi istemez.
+          const next = await navigator.mediaDevices.getUserMedia({
+            audio: false,
+            video: {
+              mandatory: {
+                chromeMediaSource: 'desktop',
+                chromeMediaSourceId: msg.id,
+                maxFrameRate: captureFrameRate,
+              },
+            },
+          } as unknown as MediaStreamConstraints);
+          const track = next.getVideoTracks()[0];
+          if (!track) throw new Error('Video track alinamadi');
+          await m.replaceVideoTrack(track);
+          // Eski akisi durdur, onizlemeyi guncelle.
+          const prev = localVideoRef.current?.srcObject as MediaStream | null;
+          prev?.getTracks().forEach(t => { t.onended = null; t.stop(); });
+          if (localVideoRef.current) localVideoRef.current.srcObject = next;
+          // Paylasim durdurulursa oturum kapansin (ilk akistaki davranisin ayni).
+          track.onended = async () => {
+            addLocalLog('Ekran paylasimi durduruldu — baglanti kesiliyor.', 'warn');
+            try { await m.disconnect(); } catch { /* yok say */ }
+          };
+          addLocalLog('Karsi taraf paylasilan ekrani degistirdi.', 'warn');
+          const res2 = api.listScreens ? await api.listScreens() : null;
+          m.sendControl({ k: 'screens', list: res2?.list ?? [], current: res2?.current ?? msg.id });
+        } catch (err) {
+          addLocalLog(`Ekran degistirilemedi: ${String(err)}`, 'error');
+        }
+      }
+    };
     m.onStateChange = (state) => {
       setRtcState(state);
       if (state === 'connecting') {
         postSessionEvent('connecting', targetId, EMBED.mode);
+        // ICE prepareIce() sırasında çözülür; TURN yoksa kullanıcıyı uyaralım.
+        setTurnAvailable(m.getIce()?.hasTurn !== false);
       }
       if (state === 'connected') {
         setIsConnecting(false);
+        setTurnAvailable(m.getIce()?.hasTurn !== false);
+        // Denetim: oturum basladi. Cihaz oznitelikleri yalnizca burada eklenir.
+        recordAudit('session_start', {
+          actorIdentity: connectionId,
+          peerIdentity: m.getPeerId(),
+          includeDevice: true,
+          detail: { rol: m.getRole(), relay: m.getIce()?.hasTurn ?? null },
+        });
         postSessionEvent('connected', targetId, EMBED.mode);
         if (connTimeoutRef.current) { clearTimeout(connTimeoutRef.current); connTimeoutRef.current = null; }
       }
       if (state === 'disconnected') {
+        recordAudit('session_end', {
+          actorIdentity: connectionId,
+          peerIdentity: m.getPeerId(),
+          detail: { rol: m.getRole() },
+        });
+        // Kayit varsa ONCE kapat: aksi halde toplanan parcalar diske yazilmadan
+        // durum temizlenir ve kayit kaybolur. Karsi tarafa bildirmiyoruz;
+        // baglanti zaten dustu.
+        if (mediaRecorderRef.current) stopRecording(false);
         setIsConnecting(false);
         setRemoteStream(null);
+        setQuality(null);
+        setVerifyCode(null);
+        setPeerLabel('');
+        setRemoteScreens([]);
         setInputEnabled(false);
         disableRemoteControl();
         postSessionEvent('ended', targetId, EMBED.mode);
@@ -889,7 +1801,7 @@ export default function App() {
         }
         if (connTimeoutRef.current) { clearTimeout(connTimeoutRef.current); connTimeoutRef.current = null; }
       }
-      if (state === 'idle') { setIsConnecting(false); setRemoteStream(null); setInputEnabled(false); disableRemoteControl(); }
+      if (state === 'idle') { if (mediaRecorderRef.current) stopRecording(false); setIsConnecting(false); setRemoteStream(null); setQuality(null); setInputEnabled(false); disableRemoteControl(); }
     };
     m.onRemoteStream = (stream) => {
       setRemoteStream(stream);
@@ -915,12 +1827,19 @@ export default function App() {
 
   const handleConnect = async () => {
     if (!isRegistered && !isGuest) { setShowAuth(true); setAuthMode('login'); return; }
+    // Kimlik sunucuda yoksa baglanti kurulamaz: karsi taraf cevap verse bile
+    // yanit bize ulasmaz (RLS okumaya izin vermez). Zaman asimini beklemek
+    // yerine sebebi simdi soyleyelim.
+    if (!identityReady) {
+      addLog('Kimliginiz sunucuda olusturulamadi, baglanti kurulamaz. Kimlik kartindaki "Tekrar Dene" ile yeniden deneyin.', 'error');
+      return;
+    }
     if (isRegistered && !isEmailVerified) { addLog('Baglanmak icin e-posta dogrulamasi gerekli.', 'error'); setShowAuth(true); return; }
     if (!targetId.trim()) return;
     if (targetId.trim() === connectionId || (currentUser && targetId.trim() === currentUser.id)) { addLog('Kendi cihaziniza baglanamazsiniz.', 'error'); return; }
 
     if (webrtc) await webrtc.disconnect();
-    setWebrtc(null); setRemoteStream(null); setRtcState('idle'); setIsConnecting(true);
+    setWebrtc(null); setRemoteStream(null); setQuality(null); setVerifyCode(null); setPeerLabel(''); setRtcState('idle'); setIsConnecting(true);
     addLog(`${targetId} adresine baglaniliyor...${EMBED.op ? ` (operator: ${EMBED.op})` : ''}`, 'warn');
     resetSessionEvents();
     postSessionEvent('connecting', targetId, EMBED.mode);
@@ -965,7 +1884,7 @@ export default function App() {
 
     const m = buildManager();
     setWebrtc(m);
-    try { await m.call(peerSignalId); }
+    try { await m.call(peerSignalId, { password: targetPassword.trim().toUpperCase() }); }
     catch (err) { postSessionEvent('error', targetId, EMBED.mode); addLog(`Baglantiyi gonderilemedi: ${String(err)}`, 'error'); setWebrtc(null); setIsConnecting(false); return; }
     // Kayıtlı bir müşteriye bağlanıldıysa son bağlantı zamanını güncelle (RLS izin verirse)
     if (currentUser) touchSavedContact(normalizedTarget).catch(() => {});
@@ -993,14 +1912,19 @@ export default function App() {
     // (button click). Closing the modal first breaks the gesture chain in Chrome.
     let screen: MediaStream | null = null;
     try {
-      screen = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: captureFrameRate }, audio: false });
+      screen = await navigator.mediaDevices.getDisplayMedia({
+        // cursor:'always' — operatör imleci görebilmeli. Standart dışı ama
+        // Chromium bunu destekliyor; desteklemeyen tarayıcı sessizce yok sayar.
+        video: { frameRate: captureFrameRate, cursor: 'always' } as MediaTrackConstraints,
+        audio: false,
+      });
     } catch { addLog('Ekran paylasimi secilmedi veya reddedildi.', 'error'); return; }
     setIncomingCall(null);
     if (localVideoRef.current) localVideoRef.current.srcObject = screen;
     if (webrtc) await webrtc.disconnect();
     disableRemoteControl(); // her oturum kontrol izni kapalı başlar
     const m = buildManager();
-    setWebrtc(m); setTargetId(fromId); setIsConnecting(true);
+    setWebrtc(m); setPeerLabel(shortPeerId(fromId)); setIsConnecting(true);
 
     // When the user stops screen sharing via the browser's native "Stop sharing" button,
     // the track fires onended. We use `m` directly (not the `webrtc` state variable) to
@@ -1012,13 +1936,19 @@ export default function App() {
         setWebrtc(null);
         setRtcState('idle');
         setRemoteStream(null);
+        setQuality(null);
         setIsConnecting(false);
         setInputEnabled(false);
         if (localVideoRef.current) { localVideoRef.current.srcObject = null; }
       };
     });
 
-    try { await m.accept(fromId, offerPayload, screen, { sessionId, addressedAs: toId, offerSignalId: signalId }); }
+    // DIKKAT: turetmede ARAYANIN gonderdigi parola kullanilir, bizimki degil.
+    // Parola zorunlu degilken arayan bos ya da baska bir sey gondermis
+    // olabilir; kendi parolamizi kullanirsak kodlar tutmaz ve kullaniciya
+    // sahte bir 'araya girme' uyarisi gostermis oluruz.
+    const offeredPw = String((offerPayload as { pw?: unknown })?.pw ?? '');
+    try { await m.accept(fromId, offerPayload, screen, { sessionId, addressedAs: toId, offerSignalId: signalId, password: offeredPw }); }
     catch (err) {
       screen?.getTracks().forEach(t => { t.onended = null; t.stop(); });
       addLog(`Baglaniti kabul edilemedi: ${String(err)}`, 'error');
@@ -1050,7 +1980,7 @@ export default function App() {
     // Ekran paylaşımını ve arayüzü önce durdur, teardown'ı sonra bekle.
     const m = webrtc;
     if (localVideoRef.current?.srcObject) { (localVideoRef.current.srcObject as MediaStream)?.getTracks().forEach(t => t.stop()); localVideoRef.current.srcObject = null; }
-    setWebrtc(null); setRemoteStream(null); setRtcState('idle'); setIsConnecting(false);
+    setWebrtc(null); setRemoteStream(null); setQuality(null); setVerifyCode(null); setPeerLabel(''); setRtcState('idle'); setIsConnecting(false);
     addLog('Baglaniti kesildi.', 'warn');
     postSessionEvent('ended', targetId, EMBED.mode);
     try { await m?.disconnect(); } catch { /* teardown hatasi arayuzu etkilemesin */ }
@@ -1080,6 +2010,51 @@ export default function App() {
   };
 
   const isLight = theme === 'umay';
+
+  // ── Bağlantı kalitesi göstergesi ───────────────────────────────────────────
+  // "Yavaş / bulanık / kopuyor" şikayetlerinin teşhisi buradan yapılır:
+  // RELAY etiketi TURN üzerinden gidildiğini (yani P2P delinemediğini),
+  // gecikme ve kayıp ise hattın durumunu gösterir.
+  const PATH_LABEL: Record<RtcQuality['path'], string> = {
+    host: 'YEREL AG', srflx: 'P2P', relay: 'RELAY', unknown: 'ANALIZ',
+  };
+  const rttColor = (ms: number | null) =>
+    ms === null ? 'var(--text-muted)' : ms < 80 ? '#4ade80' : ms < 200 ? '#facc15' : '#f87171';
+  const lossColor = (pct: number | null) =>
+    pct === null ? 'var(--text-muted)' : pct < 2 ? '#4ade80' : pct < 8 ? '#facc15' : '#f87171';
+
+  const QualityChips = ({ compact = false }: { compact?: boolean }) => {
+    if (!quality) return null;
+    const q = quality;
+    const mbps = q.kbps >= 1000 ? `${(q.kbps / 1000).toFixed(1)} Mbps` : `${q.kbps} kbps`;
+    const chip = 'px-1.5 py-0.5 text-[8px] uppercase tracking-widest whitespace-nowrap';
+    return (
+      <div className={`flex items-center gap-1.5 ${compact ? '' : 'flex-wrap'}`}>
+        <span
+          className={chip}
+          title={q.path === 'relay'
+            ? 'Trafik TURN sunucusu üzerinden aktarılıyor (doğrudan bağlantı kurulamadı).'
+            : 'Doğrudan uçtan uca bağlantı.'}
+          style={{
+            border: `1px solid ${q.path === 'relay' ? 'rgba(250,204,21,0.5)' : 'rgba(74,222,128,0.5)'}`,
+            color: q.path === 'relay' ? '#facc15' : '#4ade80',
+          }}
+        >{PATH_LABEL[q.path]}</span>
+        {q.rttMs !== null && (
+          <span className={chip} title="Gidiş-dönüş gecikmesi" style={{ color: rttColor(q.rttMs) }}>{q.rttMs} ms</span>
+        )}
+        <span className={chip} title="Video bit hızı" style={{ color: 'var(--text-muted)' }}>{mbps}</span>
+        {!compact && q.width && q.height && (
+          <span className={chip} title="Çözünürlük ve kare hızı" style={{ color: 'var(--text-muted)' }}>
+            {q.width}×{q.height}{q.fps !== null ? ` · ${q.fps} fps` : ''}
+          </span>
+        )}
+        {q.lossPct !== null && q.lossPct > 0 && (
+          <span className={chip} title="Paket kaybı" style={{ color: lossColor(q.lossPct) }}>%{q.lossPct} kayip</span>
+        )}
+      </div>
+    );
+  };
 
   return (
     <div className="min-h-screen flex flex-col selection:bg-steppe-gold selection:text-steppe-stone">
@@ -1144,11 +2119,37 @@ export default function App() {
               <div className="gokturk-border p-6 surface-card">
                 <p className="text-[10px] uppercase tracking-widest text-steppe-muted mb-4 flex items-center gap-2"><User size={12} className="text-steppe-gold" /> Sizin Kimliginiz</p>
                 <div className="flex items-center justify-between">
-                  <span className="text-2xl font-display text-steppe-gold">{connectionId}</span>
-                  <button onClick={copyId} className="p-2 border border-steppe-border hover:border-steppe-gold transition-colors text-steppe-muted hover:text-steppe-gold">
+                  {/* Kimlik sunucuda kayitli degilse numarayi gecerliymis gibi
+                      GOSTERME: kullanici onu karsi tarafa okur, kimse ulasamaz
+                      ve iki taraf da sebebini anlamaz. */}
+                  <span
+                    className="text-2xl font-display"
+                    style={{
+                      color: identityReady ? 'var(--accent-primary)' : 'var(--text-muted)',
+                      opacity: identityReady ? 1 : 0.45,
+                      textDecoration: identityReady ? 'none' : 'line-through',
+                    }}
+                  >{connectionId}</span>
+                  <button onClick={copyId} disabled={!identityReady}
+                    className="p-2 border border-steppe-border hover:border-steppe-gold transition-colors text-steppe-muted hover:text-steppe-gold disabled:opacity-30 disabled:cursor-not-allowed">
                     {copied ? <CheckCircle size={16} className="text-green-400" /> : <Copy size={16} />}
                   </button>
                 </div>
+                {!identityReady && (
+                  <div className="mt-3 p-3 border border-red-500/40 text-[10px] leading-relaxed text-red-300" style={{ background: 'rgba(239,68,68,0.08)' }}>
+                    <p className="mb-2">
+                      <strong>Kimliğiniz sunucuda oluşturulamadı.</strong> Bu kimliği karşı tarafa
+                      vermeyin — size ulaşamazlar.
+                    </p>
+                    {identityError && (
+                      <p className="mb-2 font-mono opacity-80 break-all">{identityError}</p>
+                    )}
+                    <button onClick={retryIdentity}
+                      className="text-[9px] uppercase tracking-widest border border-red-400/50 hover:border-red-400 px-2 py-1 transition-colors">
+                      Tekrar Dene
+                    </button>
+                  </div>
+                )}
                 <div className="flex items-center gap-2 mt-3">
                   <div className={`w-1.5 h-1.5 rounded-full ${isRegistered ? 'bg-green-400' : isGuest ? 'bg-yellow-400' : 'bg-gray-400'}`} />
                   <span className="text-[9px] text-steppe-muted uppercase tracking-widest">{isRegistered ? 'Profil ID' : isGuest ? 'Misafir ID' : 'Cihaz ID (Gecici)'}</span>
@@ -1156,6 +2157,39 @@ export default function App() {
                     <span className="text-[8px] px-1.5 py-0.5 rounded uppercase tracking-widest font-bold" style={{ background: 'var(--accent-primary)', color: 'var(--btn-text)' }}>
                       {entitlements.plan}{entitlements.source === 'qrtim' ? ' · QRtım' : ''}
                     </span>
+                  )}
+                </div>
+                {/* Oturum parolasi — kimlikle birlikte karsi tarafa okunur.
+                    Kimligi bilmek tek basina baglanmaya yetmez. */}
+                <div className="mt-4 pt-4 border-t" style={{ borderColor: 'var(--border-primary)' }}>
+                  <div className="flex items-center justify-between mb-2">
+                    <p className="text-[10px] uppercase tracking-widest text-steppe-muted flex items-center gap-2">
+                      <Lock size={11} className="text-steppe-gold" /> Oturum Parolasi
+                    </p>
+                    <label className="flex items-center gap-1.5 cursor-pointer" title="Kapatirsaniz kimliginizi bilen herkes size baglanma istegi gonderebilir.">
+                      <input
+                        type="checkbox"
+                        checked={requirePassword}
+                        onChange={e => toggleRequirePassword(e.target.checked)}
+                        className="w-3 h-3 accent-current"
+                        style={{ accentColor: 'var(--accent-primary)' }}
+                      />
+                      <span className="text-[9px] uppercase tracking-widest text-steppe-muted">Zorunlu</span>
+                    </label>
+                  </div>
+                  {requirePassword ? (
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-xl font-display tracking-[0.2em] text-steppe-gold select-all">{sessionPassword}</span>
+                      <button
+                        onClick={regenerateSessionPassword}
+                        className="text-[9px] uppercase tracking-widest text-steppe-muted hover:text-steppe-gold border border-steppe-border hover:border-steppe-gold px-2 py-1 transition-colors"
+                        title="Yeni parola uret"
+                      >Yenile</button>
+                    </div>
+                  ) : (
+                    <p className="text-[10px] text-yellow-400 leading-relaxed">
+                      Parola kapali. Kimliginizi bilen herkes baglanti istegi gonderebilir.
+                    </p>
                   )}
                 </div>
                 {isRegistered && sessionToken && (
@@ -1173,8 +2207,15 @@ export default function App() {
                   </div>
                 )}
                 <p className="text-[10px] uppercase tracking-widest text-steppe-muted mb-4 flex items-center gap-2"><Monitor size={12} className="text-steppe-gold" /> Uzak Masaustu Baglan</p>
-                <input type="text" placeholder="HEDEF KIMLIK (Orn: 123-456-789)" className="input-field mb-4" value={targetId}
+                <input type="text" placeholder="HEDEF KIMLIK (Orn: 123-456-789)" className="input-field mb-3" value={targetId}
                   onChange={e => setTargetId(e.target.value)}
+                  onKeyDown={e => { if (e.key === 'Enter' && targetId.trim() && !isConnecting && rtcState !== 'connected') { if (!isRegistered && !isGuest) { setShowAuth(true); return; } handleConnect(); } }}
+                />
+                {/* Karsi tarafin ekraninda yazan oturum parolasi. Parola
+                    zorunlulugunu kapatmis bir hedefe bos birakilabilir. */}
+                <input type="text" placeholder="OTURUM PAROLASI" className="input-field mb-4 tracking-[0.2em] uppercase"
+                  value={targetPassword} maxLength={12} autoComplete="off" spellCheck={false}
+                  onChange={e => setTargetPassword(e.target.value.toUpperCase())}
                   onKeyDown={e => { if (e.key === 'Enter' && targetId.trim() && !isConnecting && rtcState !== 'connected') { if (!isRegistered && !isGuest) { setShowAuth(true); return; } handleConnect(); } }}
                 />
                 {rtcState === 'connected' ? (
@@ -1215,13 +2256,78 @@ export default function App() {
               </div>
 
               {rtcState !== 'idle' && (
-                <div className={`flex items-center gap-3 px-4 py-2 border ${rtcState === 'connected' ? 'border-green-500/30' : rtcState === 'connecting' ? 'border-yellow-500/30' : 'border-red-500/30'}`}
+                <div className={`px-4 py-2 border ${rtcState === 'connected' ? 'border-green-500/30' : rtcState === 'connecting' ? 'border-yellow-500/30' : 'border-red-500/30'}`}
                   style={{ background: rtcState === 'connected' ? 'rgba(34,197,94,0.05)' : rtcState === 'connecting' ? 'rgba(234,179,8,0.05)' : 'rgba(239,68,68,0.05)' }}>
-                  <div className={`w-2 h-2 rounded-full animate-pulse ${rtcState === 'connected' ? 'bg-green-400' : rtcState === 'connecting' ? 'bg-yellow-400' : 'bg-red-400'}`} />
-                  <span className="text-[10px] uppercase tracking-widest text-steppe-muted">
-                    {rtcState === 'connected' ? `P2P Bagli - ${targetId}` : rtcState === 'connecting' ? 'Baglaniyor...' : 'Baglaniti Kesildi'}
-                  </span>
-                  {rtcState === 'connected' && <button onClick={handleDisconnect} className="ml-auto text-[9px] text-red-400 hover:text-red-300 uppercase tracking-widest">Kes</button>}
+                  <div className="flex items-center gap-3">
+                    <div className={`w-2 h-2 rounded-full animate-pulse ${rtcState === 'connected' ? 'bg-green-400' : rtcState === 'connecting' ? 'bg-yellow-400' : 'bg-red-400'}`} />
+                    <span className="text-[10px] uppercase tracking-widest text-steppe-muted">
+                      {rtcState === 'connected' ? `P2P Bagli - ${peerLabel || targetId}` : rtcState === 'connecting' ? 'Baglaniyor...' : 'Baglaniti Kesildi'}
+                    </span>
+                    {rtcState === 'connected' && <button onClick={handleDisconnect} className="ml-auto text-[9px] text-red-400 hover:text-red-300 uppercase tracking-widest">Kes</button>}
+                  </div>
+                  {rtcState === 'connected' && quality && (
+                    <div className="mt-2 pt-2 border-t" style={{ borderColor: 'var(--border-primary)' }}>
+                      <QualityChips />
+                    </div>
+                  )}
+                  {/* Baglanti dogrulama kodu. Iki ekrandaki kod AYNI degilse
+                      araya giren biri var demektir. */}
+                  {rtcState === 'connected' && verifyCode && (
+                    <div className="mt-2 pt-2 border-t flex items-center gap-2 flex-wrap" style={{ borderColor: 'var(--border-primary)' }}>
+                      <Shield size={11} className="text-steppe-gold shrink-0" />
+                      <span className="text-[9px] uppercase tracking-widest text-steppe-muted">Dogrulama</span>
+                      <span className="text-sm font-display tracking-[0.25em] text-steppe-gold select-all">{verifyCode}</span>
+                      <span className="text-[9px] text-steppe-muted leading-tight">
+                        Karsi taraftaki kodla ayni mi? Degilse baglantiyi kesin.
+                      </span>
+                    </div>
+                  )}
+                  {/* Dosya transferi - her iki taraf da gonderebilir; alan taraf
+                      her zaman onay verir. */}
+                  {rtcState === 'connected' && (
+                    <div className="mt-2 pt-2 border-t flex items-center gap-3" style={{ borderColor: 'var(--border-primary)' }}>
+                      <input ref={fileInputRef} type="file" className="hidden" onChange={handleFileChosen} />
+                      {fileProgress ? (
+                        <>
+                          <span className="text-[9px] uppercase tracking-widest text-steppe-muted whitespace-nowrap">
+                            {fileProgress.dir === 'out' ? 'Gonderiliyor' : 'Aliniyor'}
+                          </span>
+                          <div className="flex-1 h-1.5 rounded overflow-hidden" style={{ background: 'var(--border-primary)' }}>
+                            <div
+                              className="h-full transition-[width] duration-200"
+                              style={{
+                                width: `${fileProgress.total ? Math.round((fileProgress.done / fileProgress.total) * 100) : 0}%`,
+                                background: 'var(--accent-primary)',
+                              }}
+                            />
+                          </div>
+                          <span className="text-[9px] text-steppe-muted whitespace-nowrap font-mono">
+                            {formatBytes(fileProgress.done)} / {formatBytes(fileProgress.total)}
+                          </span>
+                          <button
+                            onClick={() => { webrtc?.cancelFile(fileProgress.id); setFileProgress(null); }}
+                            className="text-[9px] uppercase tracking-widest text-red-400 hover:text-red-300"
+                          >Iptal</button>
+                        </>
+                      ) : (
+                        <button
+                          onClick={pickAndSendFile}
+                          className="text-[9px] uppercase tracking-widest text-steppe-muted hover:text-steppe-gold border border-steppe-border hover:border-steppe-gold px-2 py-1 transition-colors"
+                          title="Karsi tarafa dosya gonder (karsi taraf onaylar)"
+                        >Dosya Gonder</button>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* TURN yoksa kısıtlı ağlarda bağlantı hiç kurulamaz — sebebi
+                  görünür olmalı, yoksa kullanıcı sadece "zaman aşımı" görür. */}
+              {!turnAvailable && rtcState !== 'idle' && (
+                <div className="px-4 py-2 border border-yellow-500/40 text-[9px] leading-relaxed text-yellow-300"
+                  style={{ background: 'rgba(234,179,8,0.08)' }}>
+                  Relay (TURN) sunucusu yapilandirilmamis. Kisitli aglarda (kurumsal guvenlik
+                  duvari, mobil operator) baglanti kurulamayabilir.
                 </div>
               )}
 
@@ -1244,7 +2350,8 @@ export default function App() {
                     <video ref={remoteVideoRef} autoPlay playsInline className="w-full h-full object-contain bg-black" />
                     <div className="absolute top-3 left-3 flex items-center gap-2 px-2 py-1 rounded" style={{ background: 'rgba(0,0,0,0.7)' }}>
                       <div className="w-2 h-2 rounded-full bg-green-400 animate-pulse" />
-                      <span className="text-[9px] text-green-400 uppercase tracking-widest">Bagli - {targetId}</span>
+                      <span className="text-[9px] text-green-400 uppercase tracking-widest">Bagli - {peerLabel || targetId}</span>
+                      <QualityChips compact />
                     </div>
                     <div className="absolute top-3 right-3 flex gap-2">
                       {EMBED.mode !== 'view' && (
@@ -1254,6 +2361,54 @@ export default function App() {
                         style={{ background: inputEnabled ? 'var(--accent-primary)' : 'rgba(0,0,0,0.7)', color: inputEnabled ? '#000' : 'var(--text-muted)' }}
                         title="Klavye/fare kontrolünü aç-kapat"
                       >{inputEnabled ? 'Kontrol: AÇIK' : 'Kontrol'}</button>
+                      )}
+                      {/* Coklu monitor: yalnizca kontrol aciksa ve karsi tarafta
+                          birden fazla ekran varsa gosterilir. */}
+                      {remoteScreens.length > 1 && (
+                        <select
+                          value={currentRemoteScreen}
+                          onChange={e => {
+                            const id = e.target.value;
+                            if (!id || !webrtc) return;
+                            setCurrentRemoteScreen(id);
+                            webrtc.sendControl({ k: 'screen-select', id });
+                            addLocalLog('Ekran degisikligi istendi...', 'info');
+                          }}
+                          title="Karsi tarafta paylasilan ekrani degistir"
+                          className="px-1 py-1 text-[9px] uppercase tracking-widest rounded border-0 outline-none"
+                          style={{ background: 'rgba(0,0,0,0.7)', color: 'var(--text-muted)' }}
+                        >
+                          {remoteScreens.map(sc => (
+                            <option key={sc.id} value={sc.id} style={{ background: '#111010' }}>{sc.name}</option>
+                          ))}
+                        </select>
+                      )}
+                      {EMBED.mode !== 'view' && (
+                        <>
+                          <button
+                            onClick={sendClipboardToRemote}
+                            className="px-2 py-1 text-[9px] uppercase tracking-widest text-steppe-muted hover:text-steppe-gold rounded"
+                            style={{ background: 'rgba(0,0,0,0.7)' }}
+                            title="Kendi panondaki metni karsi tarafin panosuna yaz (karsi tarafta kontrol izni gerekir)"
+                          >Pano →</button>
+                          <button
+                            onClick={() => (recState === 'recording' ? stopRecording() : requestRecording())}
+                            disabled={recState === 'requesting'}
+                            className="px-2 py-1 text-[9px] uppercase tracking-widest rounded transition-colors disabled:opacity-50"
+                            style={{
+                              background: recState === 'recording' ? '#dc2626' : 'rgba(0,0,0,0.7)',
+                              color: recState === 'recording' ? '#fff' : 'var(--text-muted)',
+                            }}
+                            title="Oturumu videoya kaydet (karsi tarafin onayi gerekir)"
+                          >{recState === 'recording' ? `KAYIT ${Math.floor(recElapsed / 60)}:${String(recElapsed % 60).padStart(2, '0')}`
+                            : recState === 'requesting' ? 'Onay bekleniyor' : 'Kayit'}</button>
+                          <button
+                            onClick={requestRemoteClipboard}
+                            className="px-2 py-1 text-[9px] uppercase tracking-widest text-steppe-muted hover:text-steppe-gold rounded"
+                            style={{ background: 'rgba(0,0,0,0.7)' }}
+                            title="Karsi tarafin panosunu kendi panona al (karsi tarafta kontrol izni gerekir)"
+                          >Pano ←</button>
+                        </>
                       )}
                       <button onClick={() => videoContainerRef.current?.requestFullscreen()} className="px-2 py-1 text-[9px] uppercase tracking-widest text-steppe-muted hover:text-steppe-gold rounded" style={{ background: 'rgba(0,0,0,0.7)' }}>Tam Ekran</button>
                       <button onClick={handleDisconnect} className="px-2 py-1 text-[9px] uppercase tracking-widest text-white rounded bg-red-500/80 hover:bg-red-500">Kes</button>
@@ -1273,6 +2428,14 @@ export default function App() {
                       <span className={`text-[9px] uppercase tracking-widest ${rtcState === 'connected' ? 'text-green-400' : 'text-yellow-400'}`}>
                         {rtcState === 'connected' ? 'Ekran Paylasiliyor - Bagli' : 'Ekran Paylasiliyor - Baglaniliyor...'}
                       </span>
+                      {/* Kayit gostergesi HER IKI tarafta da yanar — sessiz kayit yok. */}
+                      {recState === 'recording' && (
+                        <span className="flex items-center gap-1 px-1.5 py-0.5 rounded" style={{ background: '#dc2626' }}>
+                          <span className="w-1.5 h-1.5 rounded-full bg-white animate-pulse" />
+                          <span className="text-[9px] uppercase tracking-widest text-white">Kayit</span>
+                        </span>
+                      )}
+                      <QualityChips compact />
                     </div>
                     <div className="absolute top-3 right-3 flex gap-2">
                       {rtcState === 'connected' && (
@@ -1291,6 +2454,9 @@ export default function App() {
                       <div className="absolute bottom-3 left-3 flex items-center gap-2 px-2 py-1 rounded" style={{ background: 'rgba(0,0,0,0.7)' }}>
                         <div className="w-2 h-2 rounded-full bg-steppe-gold animate-pulse" />
                         <span className="text-[9px] text-steppe-gold uppercase tracking-widest">Karsi taraf kontrol edebilir</span>
+                        {controlNotice && (
+                          <span className="text-[9px] uppercase tracking-widest pl-2 ml-1 border-l border-steppe-border text-yellow-400">{controlNotice}</span>
+                        )}
                       </div>
                     )}
                   </div>
@@ -1414,10 +2580,23 @@ export default function App() {
                   <div className="space-y-2">
                     {savedContacts.map(sc => {
                       const cat = categories.find(c => c.id === sc.category_id);
+                      // Durum bilinmiyorsa (RPC yok / hiç okunmadı) nokta gösterilmez;
+                      // "çevrimdışı" demek yanlış bilgi vermek olurdu.
+                      const pres = presence.get(sc.connection_id);
                       return (
                         <div key={sc.id} className="flex items-center justify-between p-3 border border-steppe-border hover:border-steppe-gold transition-colors">
                           <div className="min-w-0">
                             <div className="flex items-center gap-2">
+                              {pres && (
+                                <span
+                                  title={pres.online
+                                    ? 'Cevrimici'
+                                    : pres.last_seen
+                                      ? `Son gorulme: ${new Date(pres.last_seen).toLocaleString('tr-TR')}`
+                                      : 'Cevrimdisi'}
+                                  className={`w-2 h-2 rounded-full shrink-0 ${pres.online ? 'bg-green-400' : 'bg-steppe-muted opacity-40'}`}
+                                />
+                              )}
                               <span className="text-sm text-steppe-gold font-mono">{sc.connection_id}</span>
                               {sc.org_id && <span className="text-[8px] uppercase tracking-widest text-steppe-muted border border-steppe-border px-1">Kurumsal</span>}
                               {cat && <span className="text-[8px] uppercase tracking-widest px-1.5 py-0.5 flex items-center gap-1" style={{ color: cat.color }}><span className="w-1.5 h-1.5 rounded-full" style={{ background: cat.color }} />{cat.name}</span>}
@@ -1606,8 +2785,94 @@ export default function App() {
                     ))}
                   </select>
                 </div>
+
+                {/* Oturum kaydi hedefi. Kayit dosyasi Arku sunucularina HIC
+                    gitmez; yalnizca bu makinede secilen klasorde durur. */}
+                {isElectron && (
+                  <div className="pt-4 border-t" style={{ borderColor: 'var(--border-primary)' }}>
+                    <div className="flex items-center justify-between gap-4">
+                      <div className="min-w-0">
+                        <p className="text-[10px] text-steppe-paper">Kayit Klasoru</p>
+                        <p className="text-[9px] text-steppe-muted mt-0.5 break-all">
+                          {recFolder || 'Secilmedi — ilk kayitta sorulacak.'}
+                        </p>
+                      </div>
+                      <div className="flex gap-2 shrink-0">
+                        {recFolder && (
+                          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                          <button onClick={() => (window as any).electronAPI?.openRecordingFolder?.()}
+                            className="text-[9px] uppercase tracking-widest text-steppe-muted hover:text-steppe-gold border border-steppe-border hover:border-steppe-gold px-2 py-1 transition-colors">Ac</button>
+                        )}
+                        <button onClick={chooseRecordingFolder}
+                          className="text-[9px] uppercase tracking-widest text-steppe-muted hover:text-steppe-gold border border-steppe-border hover:border-steppe-gold px-2 py-1 transition-colors">Degistir</button>
+                      </div>
+                    </div>
+                    <p className="text-[9px] text-steppe-muted mt-3 leading-relaxed">
+                      Kayit yalnizca iki taraf da onay verdiginde baslar ve kayit
+                      suresince iki ekranda da gosterge yanar. Dosya Arku
+                      sunucularina gonderilmez.
+                    </p>
+                  </div>
+                )}
               </div>
             </section>
+            <section className="gokturk-border surface-card p-8">
+              <h3 className="text-[10px] uppercase tracking-widest text-steppe-muted mb-2 flex items-center gap-2">
+                <Shield size={12} className="text-steppe-gold" /> Denetim Izi
+              </h3>
+              <p className="text-[9px] text-steppe-muted leading-relaxed mb-5">
+                Oturum, izin ve kayit olaylari degistirilemez bir zincire yazilir.
+                Her kayit bir oncekinin ozetini tasir; bir kayit silinse veya
+                degistirilse zincir kirilir ve dogrulama bunu gosterir.
+                Kayitlar guncellenemez ve silinemez.
+              </p>
+
+              <div className="flex items-center gap-2 mb-4">
+                <button onClick={loadAudit} disabled={auditBusy}
+                  className="text-[9px] uppercase tracking-widest text-steppe-muted hover:text-steppe-gold border border-steppe-border hover:border-steppe-gold px-3 py-1.5 transition-colors disabled:opacity-40">
+                  {auditBusy ? 'Yukleniyor...' : 'Kayitlari Getir ve Dogrula'}
+                </button>
+                {auditVerify && (
+                  <span className="text-[9px] uppercase tracking-widest px-2 py-1 border"
+                    style={{
+                      borderColor: auditVerify.ok ? 'rgba(74,222,128,0.5)' : 'rgba(248,113,113,0.6)',
+                      color: auditVerify.ok ? '#4ade80' : '#f87171',
+                    }}>
+                    {auditVerify.ok
+                      ? `Zincir saglam · ${auditVerify.kontrol_edilen} kayit`
+                      : `BOZUK · seq ${auditVerify.ilk_bozuk_seq}`}
+                  </span>
+                )}
+              </div>
+              {auditVerify && !auditVerify.ok && (
+                <p className="text-[10px] text-red-300 mb-4">{auditVerify.mesaj}</p>
+              )}
+
+              {auditRows && (
+                auditRows.length === 0 ? (
+                  <p className="text-[10px] text-steppe-muted">Henuz denetim kaydi yok.</p>
+                ) : (
+                  <div className="max-h-64 overflow-y-auto border border-steppe-border" style={{ background: 'var(--log-bg)' }}>
+                    {auditRows.map(r => (
+                      <div key={r.seq} className="flex items-baseline gap-3 px-3 py-2 border-b last:border-b-0 text-[10px]"
+                        style={{ borderColor: 'var(--border-primary)' }}>
+                        <span className="font-mono text-steppe-muted opacity-50 shrink-0">#{r.seq}</span>
+                        <span className="text-steppe-paper shrink-0">{AUDIT_LABEL[r.event] ?? r.event}</span>
+                        <span className="text-steppe-muted truncate">{r.peer_identity ?? ''}</span>
+                        <span className="ml-auto text-steppe-muted opacity-60 shrink-0">
+                          {new Date(r.created_at).toLocaleString('tr-TR')}
+                        </span>
+                        <span className="font-mono text-steppe-muted opacity-40 shrink-0" title={r.hash}>
+                          {r.hash.slice(0, 8)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )
+              )}
+            </section>
+
+            {QRTIM_ENABLED && (
             <section className="gokturk-border surface-card p-8">
               <h3 className="text-[10px] uppercase tracking-widest text-steppe-muted mb-6 flex items-center gap-2"><QrCode size={12} className="text-steppe-gold" /> QRtim Entegrasyonu</h3>
               {qrtimLinking ? (
@@ -1649,11 +2914,58 @@ export default function App() {
                 </>
               )}
             </section>
+            )}
           </div>
         )}
       </main>
 
       {/* Gelen Cagri Modali */}
+      {/* Oturum kaydi riza onayi. Kayit ASLA onay alinmadan baslamaz ve
+          onay veren taraf istedigi an durdurabilir. */}
+      <AnimatePresence>
+        {recPrompt && (
+          <div className="fixed inset-0 z-[220] flex items-center justify-center p-6 bg-black/80 backdrop-blur-sm">
+            <motion.div initial={{ opacity: 0, scale: 0.9 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.9 }} className="w-full max-w-md gokturk-border p-8" style={{ background: 'var(--bg-primary)' }}>
+              <div className="flex items-center gap-2 mb-4">
+                <span className="w-2.5 h-2.5 rounded-full" style={{ background: '#dc2626' }} />
+                <p className="text-[10px] uppercase tracking-widest text-steppe-muted">Oturum Kaydi Izni</p>
+              </div>
+              <p className="text-[11px] text-steppe-paper leading-relaxed mb-4">
+                {RECORDING_CONSENT_TEXT}
+              </p>
+              <p className="text-[9px] text-steppe-muted mb-6 font-mono">
+                Metin surumu: {RECORDING_CONSENT_VERSION}
+              </p>
+              <div className="flex gap-3">
+                <button onClick={rejectRecording} className="btn-ghost flex-1 py-2">Reddet</button>
+                <button onClick={acceptRecording} className="btn-primary flex-1 py-2">Onayliyorum</button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Gelen dosya onayi. Dosya ASLA sorulmadan yazilmaz; kaydetme yerini de
+          kullanici secer (masaustunde kaydetme penceresi acilir). */}
+      <AnimatePresence>
+        {incomingFile && (
+          <div className="fixed inset-0 z-[210] flex items-center justify-center p-6 bg-black/80 backdrop-blur-sm">
+            <motion.div initial={{ opacity: 0, scale: 0.9 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.9 }} className="w-full max-w-sm gokturk-border p-8 text-center" style={{ background: 'var(--bg-primary)' }}>
+              <p className="text-[10px] uppercase tracking-widest text-steppe-muted mb-3">Gelen Dosya</p>
+              <p className="text-sm text-steppe-gold break-all mb-1">{incomingFile.name}</p>
+              <p className="text-[11px] text-steppe-muted mb-6">{formatBytes(incomingFile.size)}</p>
+              <p className="text-[10px] text-yellow-400 leading-relaxed mb-6">
+                Yalnizca guvendiginiz kisilerden dosya kabul edin. Kaydedecegi yeri siz secersiniz.
+              </p>
+              <div className="flex gap-3">
+                <button onClick={rejectIncomingFile} className="btn-ghost flex-1 py-2">Reddet</button>
+                <button onClick={acceptIncomingFile} className="btn-primary flex-1 py-2">Kabul Et</button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
       <AnimatePresence>
         {incomingCall && (
           <div className="fixed inset-0 z-[200] flex items-center justify-center p-6 bg-black/80 backdrop-blur-sm">
@@ -1690,10 +3002,12 @@ export default function App() {
                   {authError && <p className="text-[10px] text-red-400">{authError}</p>}
                   <button onClick={handleLogin} className="btn-primary">Devam Et</button>
                   <button onClick={() => { setAuthMode('reset'); setAuthError(''); setResetSent(false); setResetEmail(''); }} className="w-full text-[10px] text-steppe-muted hover:text-steppe-gold transition-colors text-center">Sifremi Unuttum</button>
+                  {QRTIM_ENABLED && (<>
                   <div className="flex items-center gap-3 py-1"><div className="flex-1 h-px bg-steppe-border" /><span className="text-[9px] uppercase tracking-widest text-steppe-muted">veya</span><div className="flex-1 h-px bg-steppe-border" /></div>
                   <button onClick={handleQrtimLogin} className="w-full flex items-center justify-center gap-2 p-3 border border-steppe-gold/40 hover:border-steppe-gold hover:bg-steppe-gold/5 transition-all">
                     <QrCode size={14} className="text-steppe-gold" /><span className="text-[10px] uppercase tracking-widest text-steppe-gold">QRtım ile Giriş Yap</span>
                   </button>
+                  </>)}
                   <button onClick={handleGuestLogin} className="w-full flex items-center justify-center gap-2 p-3 border border-steppe-border hover:border-steppe-gold transition-all" style={{ background: 'var(--surface-primary)' }}>
                     <User size={14} className="text-steppe-muted" /><span className="text-[10px] uppercase tracking-widest text-steppe-muted">Hesap Acmadan Devam Et</span>
                   </button>
