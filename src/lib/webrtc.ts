@@ -85,6 +85,16 @@ export type FileEvent =
 const FILE_CHUNK_SIZE = 16 * 1024;
 const FILE_BUFFER_THRESHOLD = 1 * 1024 * 1024;
 const MAX_FILE_BYTES = 200 * 1024 * 1024;
+/**
+ * Parcalar BELLEKTE birlestirildiginde gecerli olan daha dar ust sinir.
+ *
+ * Masaustunde parcalar diske akitiliyor (onFileSink), dolayisiyla bellek
+ * kisiti yok ve MAX_FILE_BYTES gecerli. WEB surumunde ise dosya hala
+ * bellekte toplaniyor ve tepe kullanim boyutun birkac katina cikiyor
+ * (parca dizisi -> Blob -> ArrayBuffer). 200 MB'lik bir dosya orada sekmeyi
+ * cokertir; 50 MB guvenli bir tavan.
+ */
+const MAX_FILE_BYTES_MEMORY = 50 * 1024 * 1024;
 
 interface IncomingSignal {
   id?: string;
@@ -149,7 +159,7 @@ export class WebRTCManager {
   private unknownCandidates = new Map<string, RTCIceCandidateInit[]>();
   private channel: ReturnType<typeof supabase.channel> | null = null;
   private cleanupTimer: ReturnType<typeof setInterval> | null = null;
-  private pollingTimer: ReturnType<typeof setInterval> | null = null;
+  private pollingTimer: ReturnType<typeof setTimeout> | null = null;
   private sessionId: string | null = null;
   private pendingRemoteCandidates: RTCIceCandidateInit[] = [];
   private hasSessionIdColumn = true;
@@ -164,6 +174,16 @@ export class WebRTCManager {
   private statsTimer: ReturnType<typeof setInterval> | null = null;
   /** Karşı taraf sessizce gittiğinde bağlantıyı düşüren zamanlayıcı. */
   private disconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * Realtime kanalı SUBSCRIBED durumunda mı?
+   *
+   * Yedek HTTP sorgusunun SIKLIĞINI belirler — varlığını değil. Kanal
+   * "SUBSCRIBED" dediği hâlde olayları SESSİZCE teslim etmemesi mümkündür
+   * (2026-07-27'de yaşanan buydu: politikalar auth.uid()'e bağlandı,
+   * realtime.setAuth çağrılmadığı için postgres_changes olayları hiç gelmedi
+   * ve hiçbir hata da üretilmedi). Bu yüzden polling hiç kapatılmıyor.
+   */
+  private wsHealthy = false;
   /**
    * Arayanin urettigi tek kullanimlik oturum nonce'u.
    *
@@ -773,15 +793,47 @@ export class WebRTCManager {
   }
 
   // HTTP polling fallback — works even when Supabase Realtime WebSocket is down
+  /**
+   * Yedek HTTP sorgusunun aralığı (ms).
+   *
+   * HIZLI (1,5 sn) — kurulum aşamasında ya da WebSocket düşmüşken. Offer,
+   *   answer ve ICE adayları saniyeler içinde işlenmeli; burada gecikme
+   *   doğrudan "bağlanmıyor" demek.
+   * YAVAŞ (10 sn) — bağlantı kurulduktan SONRA ve WebSocket sağlıklıyken.
+   *   O noktada akış veri kanalından gidiyor; sinyalleşmede kalan tek iş
+   *   hangup ve ICE restart. 10 saniye onlar için yeterli ve oturum başına
+   *   istek sayısını ~%85 düşürür.
+   *
+   * POLLING HİÇ KAPATILMIYOR ve bu bilinçli: kanalın SUBSCRIBED görünüp
+   * sessizce teslim etmemesi gerçekten yaşanmış bir arıza (bkz. wsHealthy).
+   * Emniyet ağını kaldırmak, o arızayı yeniden sessiz hâle getirir.
+   */
+  private static readonly POLL_FAST_MS = 1500;
+  private static readonly POLL_SLOW_MS = 10_000;
+
+  private pollDelay(): number {
+    const established = this.pc?.connectionState === 'connected';
+    return (this.wsHealthy && established)
+      ? WebRTCManager.POLL_SLOW_MS
+      : WebRTCManager.POLL_FAST_MS;
+  }
+
   private startPolling(): void {
     if (this.pollingTimer) return;
     // Include signals from the last 10 seconds to catch anything sent just before we started
     this.pollSince = new Date(Date.now() - 10000).toISOString();
-    this.pollingTimer = setInterval(() => this.pollSignals(), 1500);
+    // Kendini planlayan döngü: aralık her turda yeniden hesaplanır, böylece
+    // bağlantı kurulduğu anda kendiliğinden yavaşlar.
+    const tick = async () => {
+      await this.pollSignals();
+      if (!this.pollingTimer) return; // close() çağrıldı
+      this.pollingTimer = setTimeout(tick, this.pollDelay());
+    };
+    this.pollingTimer = setTimeout(tick, WebRTCManager.POLL_FAST_MS);
   }
 
   private stopPolling(): void {
-    if (this.pollingTimer) { clearInterval(this.pollingTimer); this.pollingTimer = null; }
+    if (this.pollingTimer) { clearTimeout(this.pollingTimer); this.pollingTimer = null; }
   }
 
   private async pollSignals(): Promise<void> {
@@ -818,13 +870,13 @@ export class WebRTCManager {
         // Her satir ayri korunuyor: eskiden tek bir hata disaridaki catch'e
         // dusup AYNI TURDAKI KALAN SINYALLERI de dusuruyordu.
         try {
-        await this.handleSignal({
-          id: row.id,
-          type: row.type as SignalType,
-          from_id: row.from_id,
-          payload: row.payload as Record<string, unknown>,
-          session_id: (row as { session_id?: string | null }).session_id ?? null,
-        });
+          await this.handleSignal({
+            id: row.id,
+            type: row.type as SignalType,
+            from_id: row.from_id,
+            payload: row.payload as Record<string, unknown>,
+            session_id: (row as { session_id?: string | null }).session_id ?? null,
+          });
         } catch (err) {
           this.log(`Sinyal islenemedi (${row.type}): ${String(err)}`, 'warn');
         }
@@ -870,39 +922,39 @@ export class WebRTCManager {
 
     // WebSocket aboneliğini 5 saniyelik bir zaman aşımıyla dene.
     //
-    // POLLING ARTIK YEDEK — HER ZAMAN ÇALIŞMIYOR.
-    // Eskiden WebSocket sağlıklı olsa bile 1,5 saniyede bir HTTP sorgusu
-    // atılıyordu. Emniyet ağı olarak eklenmişti (kurumsal proxy'ler WebSocket'i
-    // düşürüyor) ama bedeli boştaki her istemcinin saniyede ~1 REST isteği
-    // üretmesiydi; bin kurulum saniyede bin istek demek. Artık kanal
-    // SUBSCRIBED olduğunda polling durduruluyor, kanal hata verdiğinde ya da
-    // kapandığında geri açılıyor.
+    // Kanalın durumu polling'i KAPATMAZ, yalnızca YAVAŞLATIR (bkz. pollDelay).
+    // Gerekçe: kanal SUBSCRIBED dediği hâlde olayları sessizce teslim etmemesi
+    // gerçekten yaşanmış bir arızadır ve hiçbir hata üretmez; emniyet ağını
+    // kaldırmak onu yeniden sessiz hâle getirir.
+    this.wsHealthy = false;
     await new Promise<void>((resolve) => {
       const timeout = setTimeout(() => {
         this.log('WebSocket zaman aşımı — polling modu aktif.', 'warn');
-        this.startPolling();
         resolve();
       }, 5000);
 
       this.channel?.subscribe((status: string) => {
         if (status === 'SUBSCRIBED') {
           clearTimeout(timeout);
+          this.wsHealthy = true;
           this.log('Signal kanalı hazır (WebSocket).', 'sys');
-          // Kanal sağlıklı: yedek sorguya gerek yok.
-          this.stopPolling();
           resolve();
           return;
         }
         if (status === 'CHANNEL_ERROR' || status === 'ERROR' || status === 'TIMED_OUT'
             || status === 'CLOSED') {
           clearTimeout(timeout);
-          // Kanal SONRADAN da düşebilir; o anda yedeği geri açıyoruz.
-          this.log(`WebSocket hatası (${status}) — polling devreye girdi.`, 'warn');
-          this.startPolling();
+          // Kanal SONRADAN da düşebilir; o anda yedek hızlanır.
+          this.wsHealthy = false;
+          this.log(`WebSocket hatası (${status}) — polling hizlandirildi.`, 'warn');
           resolve(); // Don't throw — polling covers this
         }
       });
     });
+
+    // Yedek sorgu her oturumda çalışır; hızı kanalın sağlığına ve bağlantının
+    // kurulup kurulmadığına göre kendini ayarlar.
+    this.startPolling();
   }
 
   // CALLER – sends offer, waits for receiver's screen
@@ -955,6 +1007,19 @@ export class WebRTCManager {
     //         bir kimlikten gelen `answer`ı benimsemeden önce aradığımız
     //         kanıtlardan biri (bkz. handleSignal).
     const proof = opts.password ? await derivePasswordProof(opts.password, this.sessionId) : null;
+    // GUVENLI OLMAYAN BAGLAM TUZAGI: crypto.subtle yalnizca guvenli baglamda
+    // (https, file://, localhost) vardir. Uygulamayi yerel agdan duz http ile
+    // acarsaniz (orn. http://192.168.1.25:3000 — `npm run dev` o adresi de
+    // yayinlar) kanit uretilemez ve karsi taraf "parola hatali" der. Sessizce
+    // basarisiz olmak yerine sebebi soyluyoruz.
+    if (opts.password && !proof) {
+      this.log(
+        'Oturum parolasi kaniti uretilemedi (crypto.subtle yok). Sayfa guvenli '
+        + 'olmayan bir baglamda acilmis olabilir: https, localhost ya da masaustu '
+        + 'uygulamasini kullanin. Baglanti parola dogrulanamadigi icin reddedilecek.',
+        'error',
+      );
+    }
     await this.send('offer', {
       type: offer.type, sdp: offer.sdp,
       n: this.sessionNonce,
@@ -1098,7 +1163,19 @@ export class WebRTCManager {
 
   /** Gelen teklifi kabul eder (arayuz kullaniciya sorduktan SONRA cagirir). */
   acceptIncomingFile(offer: FileOffer): void {
-    if (offer.size > MAX_FILE_BYTES) { this.rejectIncomingFile(offer.id); return; }
+    // Sinir, parcalarin nereye gittigine bagli: diske akiyorsa genis,
+    // bellekte birlesiyorsa dar.
+    const cap = this.onFileSink ? MAX_FILE_BYTES : MAX_FILE_BYTES_MEMORY;
+    if (offer.size > cap) {
+      this.log(
+        `Dosya cok buyuk (${Math.round(offer.size / 1048576)} MB). Bu surumde ust sinir `
+        + `${Math.round(cap / 1048576)} MB`
+        + (this.onFileSink ? '.' : ' — masaustu uygulamasinda daha buyuk dosya alabilirsiniz.'),
+        'error',
+      );
+      this.rejectIncomingFile(offer.id);
+      return;
+    }
     this.incomingFile = {
       id: offer.id, name: offer.name, size: offer.size,
       // Akis modunda (onFileSink ayarli) bellekte birikme YOK.
@@ -1268,6 +1345,7 @@ export class WebRTCManager {
     this.outgoingFile = null;
     this.incomingFile = null;
     this.sessionNonce = '';
+    this.wsHealthy = false;
     this.onVerification?.(null);
     // Oturum suresi ve bitis zamani geceye yazilir (beklenmez).
     this.finishConnectionRecord();

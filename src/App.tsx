@@ -1095,7 +1095,10 @@ export default function App() {
     try {
       const { data, error } = await supabase.auth.mfa.enroll({
         factorType: 'totp',
-        friendlyName: `Arku ${new Date().toLocaleDateString('tr-TR')}`,
+        // Benzersiz olmali: Supabase ayni friendlyName ile ikinci bir faktor
+        // kaydini reddediyor. Kullanici kaydi yarida birakip ayni gun tekrar
+        // denediginde eski (dogrulanmamis) faktor hala durabiliyor.
+        friendlyName: `Arku ${new Date().toISOString().slice(0, 16).replace('T', ' ')}`,
       });
       if (error || !data) { setMfaError(error?.message ?? 'Faktor olusturulamadi.'); return; }
       setMfaEnroll({ factorId: data.id, qr: data.totp.qr_code, secret: data.totp.secret });
@@ -1715,11 +1718,13 @@ export default function App() {
       mr.ondataavailable = (e) => {
         if (!e.data || e.data.size === 0) return;
         recBytesRef.current += e.data.size;
-        const stream = recStreamRef.current;
-        if (stream && api?.streamWrite) {
+        // Dis parametre `stream` (MediaStream) ile karismasin: bu diske
+        // yazma akisi.
+        const sink = recStreamRef.current;
+        if (sink && api?.streamWrite) {
           // Diske akit — bellekte tutma.
           void e.data.arrayBuffer().then((buf) => {
-            api.streamWrite(stream.id, new Uint8Array(buf));
+            api.streamWrite(sink.id, new Uint8Array(buf));
           }).catch(() => { /* parca okunamadi, kayit devam eder */ });
           return;
         }
@@ -1781,7 +1786,7 @@ export default function App() {
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const api = (window as any).electronAPI;
-    const stream = recStreamRef.current;
+    const sink = recStreamRef.current;
     recStreamRef.current = null;
 
     // Denetim: kaydin ustverisi. Dosyanin KENDISI sunucuya gitmez; buradaki
@@ -1795,14 +1800,14 @@ export default function App() {
     }
 
     // ── Masaustu: akis modunda dosya parca parca yazildi. ──
-    if (stream && api?.streamEnd) {
+    if (sink && api?.streamEnd) {
       if (bayt === 0) {
         // Hic veri gelmediyse bos dosyayi diskte birakmayalim.
-        await api.streamAbort?.(stream.id);
+        await api.streamAbort?.(sink.id);
         addLocalLog('Kayit bos, dosya yazilmadi.', 'warn');
         return;
       }
-      const res = await api.streamEnd(stream.id);
+      const res = await api.streamEnd(sink.id);
       addLocalLog(res?.ok
         ? `Kayit kaydedildi (${saniye} sn): ${res.path}`
         : `Kayit yazilamadi: ${res?.error ?? 'bilinmeyen hata'}`,
