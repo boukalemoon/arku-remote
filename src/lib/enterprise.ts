@@ -145,7 +145,14 @@ export async function listCategories(): Promise<ContactCategory[]> {
 export async function createCategory(name: string, color: string, orgId?: string): Promise<{ error?: string }> {
   const { data: { user } } = await supabase.auth.getUser();
   if (!user) return { error: 'Oturum gerekli' };
-  const row = orgId ? { org_id: orgId, name, color } : { owner_id: user.id, name, color };
+  // Tek bir nesne biçimi: iki ayrı şeklin birleşimi (union) supabase-js
+  // 2.116'nın sıkılaştırılmış insert tiplerini geçmiyor. Tablo kısıtı
+  // "owner_id veya org_id dolu olacak" diyor; ikisini de açıkça yazıyoruz.
+  const row: Record<string, unknown> = {
+    name, color,
+    org_id: orgId ?? null,
+    owner_id: orgId ? null : user.id,
+  };
   const { error } = await supabase.from('contact_categories').insert(row);
   return error ? { error: error.message } : {};
 }

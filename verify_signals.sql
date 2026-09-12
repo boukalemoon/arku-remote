@@ -27,14 +27,22 @@ FROM pg_policies
 WHERE tablename = 'signals'
   AND schemaname = 'public';
 
--- Tabloya test insert yap (çalışıp çalışmadığını gör)
--- Bu satırları tek tek çalıştırın
-INSERT INTO public.signals (from_id, to_id, type, payload)
-VALUES ('test-from', 'test-to', 'offer', '{"test": true}');
-
--- Test kaydını sil
-DELETE FROM public.signals
-WHERE from_id = 'test-from' AND to_id = 'test-to';
+-- ⚠ DIKKAT — AŞAĞIDAKİLER BİLEREK YORUMLU BIRAKILDI.
+--
+-- Dosyanın adı "kontrol" ama bu iki ifade ÜRETİM TABLOSUNA YAZAR. SQL
+-- Editor'da "tümünü çalıştır" denildiğinde sessizce bir test satırı
+-- ekliyordu; o satır artık hız sınırı tetikleyicisini de besliyor
+-- (20260909_signals_rate_limit.sql).
+--
+-- Salt okunur teşhis için supabase/verify_security_state.sql kullanın.
+-- Yazma testi gerçekten gerekiyorsa aşağıdaki iki bloğu TEK TEK, bilerek
+-- çalıştırın:
+--
+-- INSERT INTO public.signals (from_id, to_id, type, payload)
+-- VALUES ('test-from', 'test-to', 'offer', '{"test": true}');
+--
+-- DELETE FROM public.signals
+-- WHERE from_id = 'test-from' AND to_id = 'test-to';
 
 -- Son 5 kaydı gör
 SELECT * FROM public.signals

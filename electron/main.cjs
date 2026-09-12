@@ -76,7 +76,15 @@ function setupUpdates() {
   try { ({ autoUpdater } = require('electron-updater')); } catch { return; }
 
   autoUpdater.autoDownload = true;
-  autoUpdater.autoInstallOnAppQuit = true; // kullanıcı "Daha Sonra" derse çıkışta kurulur
+  // ÇIKIŞTA SESSİZ KURULUM KAPALI.
+  //
+  // Paketler kod imzalı değil (CI'da CSC_IDENTITY_AUTO_DISCOVERY: false), bu
+  // yüzden electron-updater imza doğrulaması yapamıyor: güvenin tek dayanağı
+  // GitHub release'inin bütünlüğü. Depoya release yazma yetkisi ele geçen
+  // biri, tüm kurulu istemcilere HABERSİZ kod gönderebilirdi. İndirme sürüyor
+  // (kullanıcı beklemesin) ama kurulum artık yalnızca kullanıcı onay
+  // verdiğinde yapılıyor. Authenticode sertifikası eklendiğinde açılabilir.
+  autoUpdater.autoInstallOnAppQuit = false;
 
   autoUpdater.on('update-downloaded', async (info) => {
     const win = BrowserWindow.getAllWindows()[0];
@@ -84,8 +92,9 @@ function setupUpdates() {
       type: 'info',
       title: 'Güncelleme hazır',
       message: `Arku Remote v${info.version} indirildi.`,
-      detail: 'Şimdi yeniden başlatarak güncelleyebilirsiniz; ertelerseniz uygulama kapanırken otomatik kurulur.',
-      buttons: ['Şimdi Yeniden Başlat', 'Daha Sonra'],
+      detail: 'Şimdi yeniden başlatıp kurabilirsiniz. Ertelerseniz kurulum '
+        + 'YAPILMAZ; uygulamayı bir sonraki açışınızda yeniden sorulur.',
+      buttons: ['Şimdi Yeniden Başlat ve Kur', 'Daha Sonra'],
       defaultId: 0,
       cancelId: 1,
     });
@@ -170,10 +179,19 @@ function createWindow() {
   // DAHA İYİSİ: QRtım girişini varsayılan tarayıcıda açıp dönüşü özel bir
   // protokolle (arku://) almak. O zaman hiçbir uzak sayfa uygulama
   // penceresinde açılmaz ve köprüye hiç yaklaşamaz. Ayrı bir iş kalemi.
+  //
+  // QRTİM ASKIYA ALINDIĞI İÇİN (src/App.tsx > QRTIM_ENABLED = false) o akışın
+  // gerektirdiği iki uzak köken LİSTEDEN ÇIKARILDI. Preload köprüsünü taşıyan
+  // bir pencerenin gidebileceği her uzak adres gereksiz yüzeydir; kapalı bir
+  // akış için tutulmasına gerek yok.
+  //
+  // QRtım geri açıldığında doğru çözüm bu listeye eklemek DEĞİL, yukarıda
+  // anlatılan yoldur: girişi varsayılan tarayıcıda açıp dönüşü arku://
+  // protokolüyle almak. O zaman hiçbir uzak sayfa uygulama penceresinde
+  // açılmaz. Geçici olarak eski davranış gerekirse şu ikisi eklenir:
+  //   'https://qartim.com', 'https://arku-remote.vercel.app'
   const NAV_ALLOWED_ORIGINS = new Set([
     'http://localhost:3000',
-    'https://qartim.com',
-    'https://arku-remote.vercel.app',
   ]);
 
   const isInternalUrl = (url) => {
@@ -861,6 +879,18 @@ ipcMain.handle('check-for-updates', async () => {
 });
 
 app.whenReady().then(() => {
+  // ── İzinler: varsayılan REDDET ──────────────────────────────────────────
+  // Electron, işleyici tanımlanmazsa izin isteklerini VERİR. Arku kamera,
+  // mikrofon, bildirim, konum veya pano-okuma izni kullanmıyor; ekran
+  // paylaşımı ise aşağıdaki setDisplayMediaRequestHandler ile kendi
+  // seçicimize bağlı. Gezinme muhafızı yabancı içeriğin pencereye girmesini
+  // zaten engelliyor, ama varsayılanı reddetmek bedava bir katman.
+  session.defaultSession.setPermissionRequestHandler((_wc, _permission, callback) => {
+    callback(false);
+  });
+  // İzin SORULMADAN kontrol edilen yol (permission check).
+  session.defaultSession.setPermissionCheckHandler(() => false);
+
   // Oturum genelinde bir kez bağlanır (pencere başına değil).
   setupDisplayMediaHandler();
   createWindow();

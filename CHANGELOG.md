@@ -8,6 +8,116 @@ Sürümleme: [Semantic Versioning](https://semver.org/lang/tr/)
 
 ---
 
+## [1.5.0] — 2026-09-12
+
+Kod tabanının tamamı (12.966 satır) satır satır denetlendi; çıkan 34 bulgunun
+tamamı bu sürümde kapatıldı. Aşağıdakiler kullanıcıyı doğrudan etkileyenler.
+
+### ⚠ Yükseltme notu
+
+**İki taraf da v1.5.0 olmalı.** Oturum parolası artık düz metin
+gönderilmiyor; v1.5.0 bir istemci v1.4.0 bir istemciyi aradığında karşı taraf
+parolayı doğrulayamaz ve çağrı "parola hatalı" ile düşer. Ters yön (v1.4.0 →
+v1.5.0) çalışmaya devam eder. Windows ve AppImage kurulumları otomatik
+güncelleme aldığı için bu geçiş kendiliğinden tamamlanır.
+
+**Veritabanı:** dört yeni migration var, ilki zorunlu. Sıra ve gerekçeler
+`DEPLOYMENT.md` → "Veritabanı migration'ları" bölümünde.
+
+### Düzeltildi
+
+- **Kurumsal modül artık çalışıyor.** Firma açılıyor ama kurucu üyeliği
+  veritabanı politikası tarafından reddediliyor, dönen hata da kontrol
+  edilmediği için sessizce yutuluyordu: firma üyesiz kalıyor ve sahibi bir
+  daha hiç üye ekleyemiyordu. Zincirleme etkisi, `acme-01` biçimindeki
+  kurumsal kimliğin hiç çözümlenememesiydi. Kurucu üyeliğini artık sunucu
+  yazıyor; bu hatayla açılmış mevcut firmalar migration ile onarılıyor.
+- **Yazı tipleri uygulamanın içine alındı.** Web sürümünde içerik güvenlik
+  politikası Google Fonts isteğini blokluyordu: arayüz sistem yazı tipine
+  düşüyordu. Masaüstünde ise istek gerçekten gidiyor ve her açılışta
+  kullanıcının IP adresi Google'a açılıyordu. İkisi de bitti; çevrimdışı
+  kullanımda da doğru tipografi görünüyor.
+- **"Kimliğiniz hazır" göstergesi artık doğruyu söylüyor.** Sunucu kimlik
+  atayamadığında da yeşil yanıyordu; kullanıcı ekranda geçerli görünen bir
+  numarayı karşı tarafa okuyor, ama o kimliğe hiçbir çağrı ulaşamıyordu.
+  "Tekrar Dene" düğmesi de artık gerçekten kimliği yeniden istiyor.
+- **Oturum kaydı artık kaybolmuyor.** Kayıt, durdurulana kadar tamamen
+  bellekte tutuluyordu: bir saatlik kayıt ~1,8 GB RAM demek ve sekme çökerse
+  kayıt tümüyle gidiyordu. Artık her parça anında diske yazılıyor. Alınan
+  dosyalar için de aynı düzeltme yapıldı.
+- **Çağrı çakışmasında bağlantı bozulması.** İki taraf aynı anda birbirini
+  aradığında arayan tarafta bir istisna oluşuyor ve o turdaki diğer
+  sinyaller de düşüyordu.
+- **Panelde uydurma değerler kaldırıldı.** "Gecikme 4 ms" ölçüm değil sabitti,
+  "Frankfurt" diye bir sunucu yok (mimari eşler arası), "AES-256" da yanlıştı.
+  Üç kutu artık gerçek ölçümleri gösteriyor: şifreleme yöntemi, ölçülen
+  gidiş-dönüş süresi ve bağlantı yolu (yerel ağ / P2P / relay).
+
+### Güvenlik
+
+- **Operatörün panosuna izinsiz yazma kapatıldı.** Karşı taraf, oturum
+  boyunca istediği an operatörün panosundaki metni (IBAN, parola, komut)
+  kendi metniyle değiştirebiliyordu. Artık yalnızca operatörün kendi
+  isteğinin yanıtı kabul ediliyor; istenmemiş yazım reddedilip günlüğe
+  düşüyor.
+- **Çağrı kaçırma kapatıldı.** Kimliğinizi bilen biri, siz birini ararken
+  araya girip meşru alıcıdan önce yanıt verebiliyor ve size taklit bir ekran
+  gösterebiliyordu. Yanıtın sahipliği artık doğrulanıyor.
+- **Oturum parolası düz metin gönderilmiyor.** Parola sinyalleşme tablosunda
+  açıktan duruyordu; veritabanına erişen biri hem araya girebilir hem
+  parolayı öğrenebilirdi. Artık yalnızca tekrar oynatılamaz bir kanıt gidiyor.
+- **Tek pencere paylaşımından tüm ekrana geçiş artık onay istiyor.** Kontrol
+  izni verdiğinizde karşı taraf, siz yalnızca bir pencere paylaşıyor olsanız
+  bile sessizce tüm masaüstüne geçebiliyordu.
+- **İki adımlı doğrulama (TOTP) eklendi.** Doğrulama ekranı vardı ama kayıt
+  akışı hiç yoktu; özellik pratikte ulaşılamazdı. Ayarlar → Hesap Güvenliği
+  altında QR kodla açılıyor.
+- **Çıkış artık sunucudaki oturumu da iptal ediyor.** Yalnızca yerel jeton
+  siliniyordu; ortak kullanılan bir makinede çıkış hiçbir şeyi
+  değiştirmiyordu.
+- **Parola en az 10 karakter** (eskiden 6). Bu hesap başkasının bilgisayarına
+  bağlanma yetkisi taşıyor.
+- **Plan sınırları artık sunucuda.** Ücretli özellikler yalnızca arayüzde
+  gizliydi; doğrudan API çağrısıyla serbestçe kullanılabiliyordu. Koltuk
+  sayısı da ilk kez zorlanıyor.
+- **Kullanıcı kendi kimlik numarasını ve rolünü değiştiremiyor.** Kolon
+  düzeyinde yetki kısıtı eklendi.
+- **Abonelik sorgusu başkasının planını döndürmüyor.**
+- Masaüstünde izin istekleri artık varsayılan olarak reddediliyor; QRtım
+  askıda olduğu için gezinme izin listesi daraltıldı; TURN yapılandırmasına
+  IPv6 iç ağ engelleme kuralları eklendi.
+- **Otomatik güncelleme artık çıkışta sessizce kurulmuyor.** Paketler kod
+  imzalı olmadığı için imza doğrulaması yapılamıyor; kurulum kullanıcı onayına
+  bağlandı.
+- `ws` ve `js-yaml` bağımlılıklarındaki yüksek öneme sahip uyarılar kapandı.
+
+### KVKK
+
+- **`KVKK.md` eklendi:** hangi verinin nereye yazıldığı, saklama süreleri,
+  yurt dışı aktarımlar ve denetim izinin silinemezliğinin dayanağı.
+- **Saklama süreleri tanımlandı.** Uygulama günlüğü 90 gün, hiç bağlantı
+  kurmamış anonim hesaplar 30 gün sonra otomatik siliniyor. Sinyalleşme
+  kayıtlarındaki 5 dakikalık süre zaten vardı.
+- **MAC adresi ve kullanıcı adı artık varsayılan olarak kaydedilmiyor.**
+  İkisi de kişisel veridir ve toplanmaları ayrı bir işleme faaliyetidir.
+  Ayarlar → Denetim İzi altından açılabilir; açıldığında bunun aydınlatma
+  metninde yer alması gerektiği söyleniyor.
+- **Günlük hacmi düşürüldü.** WebRTC iç durumları (ICE, bağlantı durumu) artık
+  sunucuya yazılmıyor, yerelde kalıyor.
+
+### Değişti
+
+- Boştaki uygulama artık sunucuyu yormuyor. Realtime bağlantısı sağlıklıyken
+  yedek HTTP sorgusu durduruluyor; eskiden her istemci saniyede yaklaşık bir
+  istek üretiyordu.
+- Uygulama paketi parçalara ayrıldı (React / Supabase / arayüz kitaplıkları);
+  güncellemelerde tarayıcı satıcı kodunu önbellekten kullanıyor.
+- `DEPLOYMENT.md` baştan yazıldı — eski hâli Firebase, Socket.io ve Capacitor
+  anlatıyordu; hiçbiri kullanılmıyor. Ölü dosyalar kaldırıldı
+  (`firestore.rules`, `TODO.md`, `docs/`).
+
+---
+
 ## [1.4.0] — 2026-09-09
 
 ### Sunucu tarafı (yayın sonrası, 2026-09-10)

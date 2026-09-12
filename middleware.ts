@@ -37,7 +37,11 @@ const CSP_DIRECTIVES = [
   // CSP'ye takılmaz, ancak derlenmiş CSS bazı durumlarda satır içi stil
   // enjekte eder. Betik tarafı sıkı kaldığı için risk düşüktür.
   "style-src 'self' 'unsafe-inline'",
-  "img-src 'self' data: blob:",
+  // https: — kurumsal logo (organizations.logo_url) müşterinin kendi
+  // sunucusundaki bir görsel olabiliyor; 'self' ile o logo hiç yüklenmiyordu.
+  // Görsel çalıştırılamaz ve script-src zaten 'self' ile kapalı; bedeli,
+  // logoyu belirleyen firma yöneticisinin üyelerin IP adresini görebilmesi.
+  "img-src 'self' data: blob: https:",
   "media-src 'self' blob:",
   "connect-src 'self' https://*.supabase.co wss://*.supabase.co",
   "font-src 'self' data:",

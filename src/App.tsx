@@ -16,7 +16,7 @@ import { WebRTCManager } from './lib/webrtc';
 import type { ConnectionState, InputEventMsg, RtcQuality, ControlMsg, RemoteScreen, FileOffer } from './lib/webrtc';
 import { EMBED, postSessionEvent, resetSessionEvents } from './lib/embed';
 import { resetIceCache } from './lib/ice';
-import { recordAudit, listAudit, verifyAuditChain } from './lib/audit';
+import { recordAudit, listAudit, verifyAuditChain, setDeviceIdPolicy } from './lib/audit';
 import { verifyOfferPassword } from './lib/verify';
 import type { AuditRow, AuditVerifyResult } from './lib/audit';
 
@@ -224,6 +224,17 @@ export default function App() {
   const [passwordChangeError, setPasswordChangeError] = React.useState('');
   const [passwordChangeDone, setPasswordChangeDone] = React.useState(false);
   const [profileUpdateDone, setProfileUpdateDone] = React.useState(false);
+  // ── Iki adimli dogrulama (TOTP) ──
+  // KAYIT AKISI ESKIDEN HIC YOKTU: mfa.enroll cagrilmadigi icin kullanici
+  // Arku icinden faktor ekleyemiyordu. Dogrulama ekrani (authMode='mfa')
+  // calisiyordu ama yalnizca baska bir yolla (API) kaydedilmis faktorler
+  // icin; yani ozellik pratikte ulasilamazdi.
+  const [mfaFactors, setMfaFactors] = React.useState<{ id: string; friendly_name?: string }[]>([]);
+  const [mfaEnroll, setMfaEnroll] = React.useState<{ factorId: string; qr: string; secret: string } | null>(null);
+  const [mfaEnrollCode, setMfaEnrollCode] = React.useState('');
+  const [mfaBusy, setMfaBusy] = React.useState(false);
+  const [mfaError, setMfaError] = React.useState('');
+  const [mfaNotice, setMfaNotice] = React.useState('');
   const [connectionId, setConnectionId] = React.useState(() => getOrCreateGuestId());
   /**
    * Kimlik SUNUCU tarafindan taniniyor mu?
@@ -321,6 +332,27 @@ export default function App() {
   const [remoteControlAllowed, setRemoteControlAllowed] = React.useState(false);
   const remoteControlAllowedRef = React.useRef(false);
   const [captureFrameRate, setCaptureFrameRate] = React.useState(15);
+  /**
+   * Denetim kaydina MAC adresi ve isletim sistemi kullanici adi eklensin mi?
+   *
+   * VARSAYILAN KAPALI. Ikisi de tek baslarina KISISEL VERIDIR ve toplanmalari
+   * ayri bir isleme faaliyetidir; aydinlatma metninde yer almadan yazilmamali.
+   * Kaydin curutulemezligi zaten hash zincirinden geliyor, MAC'ten degil
+   * (MAC saniyeler icinde degistirilebilir ve Windows 10+ ile mobil cihazlarda
+   * Wi-Fi icin rastgelelestirme varsayilan olarak aciktir).
+   * Ayrinti: docs/KVKK.md
+   */
+  const [collectDeviceIds, setCollectDeviceIds] = React.useState(() => {
+    try { return localStorage.getItem('arku_collect_device_ids') === '1'; } catch { return false; }
+  });
+  const toggleCollectDeviceIds = (v: boolean) => {
+    setCollectDeviceIds(v);
+    try { localStorage.setItem('arku_collect_device_ids', v ? '1' : '0'); } catch { /* yok say */ }
+    setDeviceIdPolicy(v);
+    addLocalLog(v
+      ? 'Denetim kaydina MAC adresi ve kullanici adi da yazilacak.'
+      : 'Denetim kaydina MAC adresi ve kullanici adi yazilmayacak.', 'warn');
+  };
   // Elle güncelleme kontrolü (yalnızca masaüstü uygulamasında anlamlı)
   const [updateCheck, setUpdateCheck] = React.useState<{ status: string; version?: string; message?: string } | null>(null);
   const [updateChecking, setUpdateChecking] = React.useState(false);
@@ -468,6 +500,8 @@ export default function App() {
     await supabase.from('logs').insert({ user_id: currentUser.id, msg, type });
   };
 
+  // Cihaz oznitelik politikasini acilista audit katmanina bildir.
+  React.useEffect(() => { setDeviceIdPolicy(collectDeviceIds); }, []);
   React.useEffect(() => { rtcStateRef.current = rtcState; }, [rtcState]);
   React.useEffect(() => { webrtcRef.current = webrtc; }, [webrtc]);
   React.useEffect(() => { remoteControlAllowedRef.current = remoteControlAllowed; }, [remoteControlAllowed]);
@@ -588,7 +622,14 @@ export default function App() {
     // yolundan gelebilir; iki kez işlenirse iki kez "meşgul" sinyali gönderilirdi.
     if (sig.id) {
       if (processedOfferIdsRef.current.has(sig.id)) return;
-      if (processedOfferIdsRef.current.size > 200) processedOfferIdsRef.current.clear();
+      // KIRP, TEMIZLEME. Eskiden kume 200'u asinca tamamen bosaltiliyordu;
+      // polling penceresi hala geriye baktigi icin ayni offer yeniden "yeni"
+      // sayilabiliyor ve ikinci bir "mesgul" sinyali ya da ikinci bir gelen
+      // cagri penceresi doguyordu. WebRTCManager.markProcessed ayni sorunu
+      // en yeni 250 kimligi koruyarak dogru cozuyor.
+      if (processedOfferIdsRef.current.size > 200) {
+        processedOfferIdsRef.current = new Set([...processedOfferIdsRef.current].slice(-100));
+      }
       processedOfferIdsRef.current.add(sig.id);
     }
 
@@ -925,7 +966,10 @@ export default function App() {
   React.useEffect(() => {
     if (!EMBED.embed) return;
     const onMsg = (e: MessageEvent) => {
-      if (EMBED.parentOrigin !== '*' && e.origin !== EMBED.parentOrigin) return;
+      // Koken cozulemediyse (trusted=false) hicbir komut kabul edilmez.
+      // Eskiden o durumda filtre devre disi kaliyor ve HERHANGI BIR koken
+      // oturumu kesebiliyordu.
+      if (!EMBED.trusted || e.origin !== EMBED.parentOrigin) return;
       const d = e.data as { type?: string; action?: string } | null;
       if (d?.type !== 'arku:command') return;
       if (d.action === 'end') handleDisconnectRef.current?.();
@@ -1037,6 +1081,70 @@ export default function App() {
     if (error) { addLog(`Profil guncellenemedi: ${error.message}`, 'error'); return; }
     setProfileUpdateDone(true); addLog('Profil guncellendi.', 'sys'); setTimeout(() => setProfileUpdateDone(false), 3000);
   };
+  /** Kayitli TOTP faktorlerini getirir (yalnizca dogrulanmis olanlar). */
+  const loadMfaFactors = async () => {
+    const { data, error } = await supabase.auth.mfa.listFactors();
+    if (error) { setMfaFactors([]); return; }
+    setMfaFactors((data?.totp ?? []).filter(f => f.status === 'verified')
+      .map(f => ({ id: f.id, friendly_name: f.friendly_name ?? undefined })));
+  };
+
+  /** Yeni faktor kaydi baslatir: QR kodu ve gizli anahtar uretir. */
+  const startMfaEnroll = async () => {
+    setMfaError(''); setMfaNotice(''); setMfaBusy(true);
+    try {
+      const { data, error } = await supabase.auth.mfa.enroll({
+        factorType: 'totp',
+        friendlyName: `Arku ${new Date().toLocaleDateString('tr-TR')}`,
+      });
+      if (error || !data) { setMfaError(error?.message ?? 'Faktor olusturulamadi.'); return; }
+      setMfaEnroll({ factorId: data.id, qr: data.totp.qr_code, secret: data.totp.secret });
+      setMfaEnrollCode('');
+    } finally { setMfaBusy(false); }
+  };
+
+  /** Uygulamadaki kodu dogrulayarak faktoru etkinlestirir. */
+  const confirmMfaEnroll = async () => {
+    if (!mfaEnroll) return;
+    setMfaError(''); setMfaBusy(true);
+    try {
+      const { data: ch, error: chErr } = await supabase.auth.mfa.challenge({ factorId: mfaEnroll.factorId });
+      if (chErr || !ch) { setMfaError(chErr?.message ?? 'Dogrulama baslatilamadi.'); return; }
+      const { error: vErr } = await supabase.auth.mfa.verify({
+        factorId: mfaEnroll.factorId, challengeId: ch.id, code: mfaEnrollCode.replace(/\D/g, ''),
+      });
+      if (vErr) { setMfaError('Kod dogrulanamadi. Uygulamadaki guncel kodu girin.'); return; }
+      setMfaEnroll(null); setMfaEnrollCode('');
+      setMfaNotice('Iki adimli dogrulama acildi. Bundan sonra her giriste kod istenecek.');
+      await loadMfaFactors();
+      addLog('Iki adimli dogrulama etkinlestirildi.', 'sys');
+    } finally { setMfaBusy(false); }
+  };
+
+  /** Kaydi iptal eder (henuz dogrulanmamis faktoru de temizler). */
+  const cancelMfaEnroll = async () => {
+    const f = mfaEnroll;
+    setMfaEnroll(null); setMfaEnrollCode(''); setMfaError('');
+    if (f) { try { await supabase.auth.mfa.unenroll({ factorId: f.factorId }); } catch { /* yok say */ } }
+  };
+
+  const removeMfaFactor = async (factorId: string) => {
+    setMfaError(''); setMfaBusy(true);
+    try {
+      const { error } = await supabase.auth.mfa.unenroll({ factorId });
+      if (error) { setMfaError(error.message); return; }
+      setMfaNotice('Iki adimli dogrulama kapatildi.');
+      await loadMfaFactors();
+      addLog('Iki adimli dogrulama kapatildi.', 'warn');
+    } finally { setMfaBusy(false); }
+  };
+
+  // Ayarlar sekmesi acildiginda faktorleri yukle.
+  React.useEffect(() => {
+    if (activeTab === 'settings' && isRegistered) loadMfaFactors();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, currentUser?.id]);
+
   const handleChangePassword = async () => {
     setPasswordChangeError('');
     if (!currentPassword) { setPasswordChangeError('Mevcut sifrenizi girin.'); return; }
@@ -1385,10 +1493,18 @@ export default function App() {
 
   const handleQrtimDisconnect = async () => {
     if (!currentUser) return;
-    await supabase.from('users').update({
-      qrtim_id: null, qrtim_username: null, qrtim_name: null,
-      qrtim_email: null, qrtim_connected_at: null,
-    }).eq('id', currentUser.id);
+    // qrtim_* kolonlarina istemci yetkisi KALDIRILDI (kolon duzeyinde grant);
+    // temizlik, yalnizca kendi satirinda bu alanlari bosaltan dar bir RPC ile
+    // yapiliyor. Gerekce: 20260912_authz_hardening.sql
+    const { error } = await supabase.rpc('arku_qrtim_unlink');
+    if (error) {
+      // Migration henuz uygulanmadiysa eski yola dus (kolon yetkisi hala var).
+      const { error: legacy } = await supabase.from('users').update({
+        qrtim_id: null, qrtim_username: null, qrtim_name: null,
+        qrtim_email: null, qrtim_connected_at: null,
+      }).eq('id', currentUser.id);
+      if (legacy) { addLocalLog(`QRtım bağlantısı kesilemedi: ${legacy.message}`, 'error'); return; }
+    }
     setQrtimUser(null);
     addLocalLog('QRtım hesabı bağlantısı kesildi.', 'warn');
   };
@@ -2061,7 +2177,18 @@ export default function App() {
       if (remoteVideoRef.current) remoteVideoRef.current.srcObject = stream;
       addLog('Uzak ekran aliniyor.', 'sys');
     };
-    m.onLog = (msg, type) => addLog(msg, (type as LogType) || 'info');
+    // WebRTC ic gunlukleri YERELDE kalir; yalnizca hatalar sunucuya yazilir.
+    //
+    // Eskiden her satir (ICE durumu, baglanti durumu, toplama durumu...)
+    // `logs` tablosuna AYRI bir insert olarak gidiyordu: tek oturum kolayca
+    // 20-30 satir uretiyor, arayuz ise yalnizca son 50'yi okuyor. Tabloda
+    // saklama suresi de yoktu ve icinde karsi taraf kimlikleri var — teknik
+    // gunluk degil kisisel veri kaydi. Saklama suresi icin bkz.
+    // supabase/migrations/20260912_retention_cleanup.sql
+    m.onLog = (msg, type) => {
+      const t = (type as LogType) || 'info';
+      if (t === 'error') addLog(msg, t); else addLocalLog(msg, t);
+    };
     m.onInputEvent = (event: InputEventMsg) => {
       // Ekranı paylaşan kullanıcı izin vermeden uzaktan kontrol işletilmez
       if (!remoteControlAllowedRef.current) return;
@@ -2502,9 +2629,21 @@ export default function App() {
 
             <div className="lg:col-span-8 space-y-6">
               <div className="grid grid-cols-3 gap-4">
-                <StatCard icon={<Shield size={18} />} title="Guvenlik" value="AES-256" sub="Uctan Uca" />
-                <StatCard icon={<Zap size={18} />} title="Gecikme" value={rtcState === 'connected' ? '4ms' : '12ms'} sub="Dusuk Gecikme" />
-                <StatCard icon={<Globe size={18} />} title="Sunucu" value="Frankfurt" sub="Aktif" />
+                {/* GERCEK OLCUMLER. Eskiden ucu de sabit metindi: gecikme
+                    olculmuyor, baglanti durumuna gore iki sabitten biri
+                    yaziliyordu; "Frankfurt" diye bir sunucu yok (mimari
+                    eslerarasi); AES-256 de yanlis — WebRTC'nin SRTP anahtar
+                    takimi Chromium'da AES-128-GCM olarak pazarlasir.
+                    Olculmus veri zaten elimizdeydi (QualityChips). */}
+                <StatCard icon={<Shield size={18} />} title="Sifreleme" value="DTLS-SRTP" sub="Uctan Uca" />
+                <StatCard icon={<Zap size={18} />} title="Gecikme"
+                  value={quality?.rttMs != null ? `${quality.rttMs} ms` : '—'}
+                  sub={quality?.rttMs != null ? 'Olculen gidis-donus' : 'Baglanti yok'} />
+                <StatCard icon={<Globe size={18} />} title="Baglanti Yolu"
+                  value={quality ? PATH_LABEL[quality.path] : '—'}
+                  sub={quality
+                    ? (quality.path === 'relay' ? 'TURN uzerinden' : 'Dogrudan P2P')
+                    : 'Baglanti yok'} />
               </div>
 
               {rtcState !== 'idle' && (
@@ -3016,6 +3155,78 @@ export default function App() {
                     {!passwordChangeDone && <button onClick={handleChangePassword} className="btn-primary">Sifreyi Guncelle</button>}
                   </div>
                 )}
+
+                {/* ── Iki adimli dogrulama (TOTP) ──
+                    Uzaktan erisim yetkisi tasiyan bir hesapta parolanin tek
+                    basina yetmemesi gerekir. Dogrulama ekrani zaten vardi;
+                    eksik olan kayit akisiydi. */}
+                {isRegistered && (
+                  <div className="pt-4 border-t space-y-3" style={{ borderColor: 'var(--border-primary)' }}>
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
+                        <p className="text-[10px] text-steppe-paper flex items-center gap-2">
+                          <Lock size={11} className="text-steppe-gold" /> Iki Adimli Dogrulama
+                        </p>
+                        <p className="text-[9px] text-steppe-muted mt-0.5">
+                          {mfaFactors.length > 0
+                            ? 'Acik — her giriste uygulamanizdaki kod istenir.'
+                            : 'Kapali. Parolaniz ele gecse bile hesabiniza girilemesin.'}
+                        </p>
+                      </div>
+                      {mfaFactors.length > 0 ? (
+                        <button onClick={() => removeMfaFactor(mfaFactors[0].id)} disabled={mfaBusy}
+                          className="text-[9px] uppercase tracking-widest text-red-400 border border-red-500/40 hover:bg-red-500/10 px-3 py-2 transition-colors disabled:opacity-40 whitespace-nowrap">
+                          Kapat
+                        </button>
+                      ) : !mfaEnroll ? (
+                        <button onClick={startMfaEnroll} disabled={mfaBusy}
+                          className="text-[9px] uppercase tracking-widest text-steppe-gold border border-steppe-border hover:border-steppe-gold px-3 py-2 transition-colors disabled:opacity-40 whitespace-nowrap">
+                          {mfaBusy ? 'Hazirlaniyor...' : 'Ac'}
+                        </button>
+                      ) : null}
+                    </div>
+
+                    {mfaEnroll && (
+                      <div className="p-4 border border-steppe-border space-y-3" style={{ background: 'var(--log-bg)' }}>
+                        <p className="text-[10px] text-steppe-muted leading-relaxed">
+                          1. Google Authenticator, Microsoft Authenticator veya benzeri bir
+                          uygulamayla asagidaki kodu okutun.<br />
+                          2. Uygulamada gorunen 6 haneli kodu girin.
+                        </p>
+                        {/* Supabase QR'i SVG olarak dondurur; harici istek yok. */}
+                        <div className="flex flex-col sm:flex-row items-start gap-4">
+                          <img src={mfaEnroll.qr} alt="TOTP QR kodu"
+                            className="w-40 h-40 bg-white p-2 shrink-0" />
+                          <div className="space-y-2 min-w-0">
+                            <p className="text-[9px] uppercase tracking-widest text-steppe-muted">
+                              QR okutamiyorsaniz anahtari elle girin
+                            </p>
+                            <p className="font-mono text-[11px] text-steppe-gold break-all select-all">
+                              {mfaEnroll.secret}
+                            </p>
+                          </div>
+                        </div>
+                        <input
+                          className="input-field tracking-[0.3em] text-center" inputMode="numeric"
+                          placeholder="000000" maxLength={6} autoComplete="one-time-code"
+                          value={mfaEnrollCode}
+                          onChange={e => setMfaEnrollCode(e.target.value.replace(/\D/g, ''))}
+                          onKeyDown={e => { if (e.key === 'Enter' && mfaEnrollCode.length === 6) confirmMfaEnroll(); }}
+                        />
+                        <div className="grid grid-cols-2 gap-3">
+                          <button onClick={cancelMfaEnroll} className="btn-ghost">Vazgec</button>
+                          <button onClick={confirmMfaEnroll} disabled={mfaBusy || mfaEnrollCode.length !== 6}
+                            className="btn-primary disabled:opacity-40">
+                            {mfaBusy ? 'Dogrulaniyor...' : 'Dogrula ve Ac'}
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                    {mfaError && <p className="text-[10px] text-red-400">{mfaError}</p>}
+                    {mfaNotice && <p className="text-[10px] text-green-400">{mfaNotice}</p>}
+                  </div>
+                )}
               </div>
             </section>
             <section className="gokturk-border surface-card p-8">
@@ -3076,7 +3287,9 @@ export default function App() {
                 Oturum, izin ve kayit olaylari degistirilemez bir zincire yazilir.
                 Her kayit bir oncekinin ozetini tasir; bir kayit silinse veya
                 degistirilse zincir kirilir ve dogrulama bunu gosterir.
-                Kayitlar guncellenemez ve silinemez.
+                Kayitlar guncellenemez ve silinemez. Asagida yalnizca
+                <strong> kendi kayitlariniz</strong> listelenir; dogrulama ise
+                zincirin tamamini kontrol eder.
               </p>
 
               <div className="flex items-center gap-2 mb-4">
@@ -3100,15 +3313,48 @@ export default function App() {
                 <p className="text-[10px] text-red-300 mb-4">{auditVerify.mesaj}</p>
               )}
 
+              {/* Cihaz oznitelikleri — KVKK tercihi.
+                  MAC ve kullanici adi varsayilan olarak yazilmaz; toplanmalari
+                  ayri bir isleme faaliyetidir ve aydinlatma metninde yer
+                  almalidir. Kaydin curutulemezligi zincirden gelir. */}
+              <div className="flex items-start justify-between gap-3 p-3 mb-4 border border-steppe-border"
+                style={{ background: 'var(--surface-primary)' }}>
+                <div>
+                  <p className="text-[10px] text-steppe-paper">MAC adresi ve kullanici adini da kaydet</p>
+                  <p className="text-[9px] text-steppe-muted mt-0.5 leading-relaxed">
+                    Varsayilan kapali. Bunlar kisisel veridir; acarsaniz aydinlatma
+                    metninizde yer almalidir. Kayit her zaman makine adi ve isletim
+                    sistemi bilgisini icerir.
+                  </p>
+                </div>
+                <label className="flex items-center gap-1.5 cursor-pointer shrink-0 pt-0.5">
+                  <input type="checkbox" id="collect-device-ids" checked={collectDeviceIds}
+                    onChange={e => toggleCollectDeviceIds(e.target.checked)}
+                    className="w-3 h-3" style={{ accentColor: 'var(--accent-primary)' }} />
+                  <span className="text-[9px] uppercase tracking-widest text-steppe-muted">
+                    {collectDeviceIds ? 'Acik' : 'Kapali'}
+                  </span>
+                </label>
+              </div>
+
               {auditRows && (
                 auditRows.length === 0 ? (
                   <p className="text-[10px] text-steppe-muted">Henuz denetim kaydi yok.</p>
                 ) : (
                   <div className="max-h-64 overflow-y-auto border border-steppe-border" style={{ background: 'var(--log-bg)' }}>
-                    {auditRows.map(r => (
+                    {/* NUMARALANDIRMA: listedeki sira gosteriliyor, zincirdeki
+                        global `seq` degil. Zincir SISTEM GENELINDE tek oldugu
+                        icin kullanicinin kendi kayitlarinda seq atlamali
+                        gorunuyor ve arayuzde "kayit silinmis" gibi okunuyordu.
+                        Global numara teknik ayrinti olarak baslikta (title)
+                        duruyor; zincirin sagligini `Dogrula` dugmesi soyluyor. */}
+                    {auditRows.map((r, i) => (
                       <div key={r.seq} className="flex items-baseline gap-3 px-3 py-2 border-b last:border-b-0 text-[10px]"
                         style={{ borderColor: 'var(--border-primary)' }}>
-                        <span className="font-mono text-steppe-muted opacity-50 shrink-0">#{r.seq}</span>
+                        <span className="font-mono text-steppe-muted opacity-50 shrink-0"
+                          title={`Zincir sira no (sistem genelinde): ${r.seq}`}>
+                          #{auditRows.length - i}
+                        </span>
                         <span className="text-steppe-paper shrink-0">{AUDIT_LABEL[r.event] ?? r.event}</span>
                         <span className="text-steppe-muted truncate">{r.peer_identity ?? ''}</span>
                         <span className="ml-auto text-steppe-muted opacity-60 shrink-0">
