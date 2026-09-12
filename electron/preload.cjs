@@ -23,7 +23,17 @@ contextBridge.exposeInMainWorld('electronAPI', {
   saveRecording: (payload) => ipcRenderer.invoke('recording:save', payload),
   openRecordingFolder: () => ipcRenderer.invoke('recording:open-folder'),
   // Alinan dosyayi diske kaydet (kaydetme penceresi ana surecte acilir).
+  // NOT: kucuk dosyalar icin duruyor; buyuk transferler artik stream* ile
+  // akis halinde yaziliyor (bellekte birikme yok).
   saveFile: (payload) => ipcRenderer.invoke('file:save', payload),
+  // Akis halinde diske yazma. Hedef yolu ANA SUREC belirler; renderer
+  // yalnizca "bu turden bir akis ac" diyebilir.
+  //   kind: 'recording' -> kayit klasorune, ad ana surecte uretilir
+  //   kind: 'file'      -> kaydetme penceresi, ad path.basename'den gecer
+  streamBegin: (opts) => ipcRenderer.invoke('stream:begin', opts),
+  streamWrite: (id, chunk) => ipcRenderer.send('stream:write', { id, chunk }),
+  streamEnd: (id) => ipcRenderer.invoke('stream:end', id),
+  streamAbort: (id) => ipcRenderer.invoke('stream:abort', id),
   // Coklu monitor: paylasilan ekrani oturum ortasinda degistirme.
   // Ikisi de ana surecte kontrol iznine baglidir.
   listScreens: () => ipcRenderer.invoke('screens:list'),

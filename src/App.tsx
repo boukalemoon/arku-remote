@@ -266,8 +266,23 @@ export default function App() {
   const recStateRef = React.useRef(recState);
   React.useEffect(() => { recStateRef.current = recState; }, [recState]);
   const mediaRecorderRef = React.useRef<MediaRecorder | null>(null);
+  /**
+   * Kayit parcalari.
+   *
+   * MASAUSTUNDE KULLANILMAZ: parcalar dogrudan diske akitilir (recStreamRef).
+   * Yalnizca WEB surumunde, tarayici indirmesi icin bellekte birikir; orada
+   * da bir ust sinir var (REC_WEB_MAX_BYTES), aksi halde uzun bir oturum
+   * sekmeyi cokertiyordu.
+   */
   const recChunksRef = React.useRef<Blob[]>([]);
+  const recBytesRef = React.useRef(0);
+  /** Masaustunde acik kayit akisi: { id, path }. */
+  const recStreamRef = React.useRef<{ id: string; path: string } | null>(null);
+  /** Masaustunde acik gelen-dosya akisi. */
+  const fileStreamRef = React.useRef<{ id: string; path: string } | null>(null);
   const recStartedAtRef = React.useRef(0);
+  /** Web surumunde kayit icin bellek tavani (~512 MB). */
+  const REC_WEB_MAX_BYTES = 512 * 1024 * 1024;
   // Bu cihazin gecerli oturum parolasi. Her oturum bitiminde yenilenir.
   const [sessionPassword, setSessionPassword] = React.useState(() => generateSessionPassword());
   const [requirePassword, setRequirePassword] = React.useState(() => {
@@ -336,6 +351,15 @@ export default function App() {
   const [incomingFile, setIncomingFile] = React.useState<FileOffer | null>(null);
   const [fileProgress, setFileProgress] = React.useState<{ id: string; done: number; total: number; dir: 'in' | 'out' } | null>(null);
   const fileInputRef = React.useRef<HTMLInputElement>(null);
+  /**
+   * Gelen cagri kanallarinin WebSocket sagligi (kimlik -> abone mi).
+   *
+   * Buna gore HTTP yedek sorgusunun SIKLIGI degisiyor: kanal saglikliysa
+   * seyrek (30 sn) bir emniyet sorgusu, dustuyse sik (2 sn). Eskiden kanal
+   * saglikli olsa bile 2 saniyede bir sorgu atiliyordu ve bostaki her istemci
+   * saniyede ~1 REST istegi uretiyordu.
+   */
+  const callWsHealthyRef = React.useRef<Record<string, boolean>>({});
   // Polling fallback refs for when Supabase Realtime WebSocket is unavailable
   const incomingPollSinceRef = React.useRef(new Date().toISOString());
   const processedOfferIdsRef = React.useRef(new Set<string>());
@@ -650,9 +674,14 @@ export default function App() {
               localVideoRef.current.srcObject = null;
             }
           }
-        }).subscribe()
+        }).subscribe((status: string) => {
+          callWsHealthyRef.current[rid] = status === 'SUBSCRIBED';
+        })
     );
-    return () => { channels.forEach(ch => supabase.removeChannel(ch)); };
+    return () => {
+      ids.forEach(rid => { delete callWsHealthyRef.current[rid]; });
+      channels.forEach(ch => supabase.removeChannel(ch));
+    };
   }, [currentUser?.id, connectionId]);
 
   // Polling fallback: detects incoming offers via HTTP when Realtime WebSocket is unavailable.
@@ -681,8 +710,19 @@ export default function App() {
       }
     };
 
-    const timer = setInterval(poll, 2000);
-    return () => clearInterval(timer);
+    // Kendini planlayan dongu: aralik kanal sagligina gore degisiyor.
+    // Saglikli  -> 30 sn (yalnizca emniyet agi; teslimat WebSocket'ten gelir)
+    // Dusmus    -> 2 sn  (tek teslimat yolu bu; cagri kacmamali)
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const tick = async () => {
+      await poll();
+      if (stopped) return;
+      const healthy = ids.every(rid => callWsHealthyRef.current[rid]);
+      timer = setTimeout(tick, healthy ? 30000 : 2000);
+    };
+    timer = setTimeout(tick, 2000);
+    return () => { stopped = true; clearTimeout(timer); };
   }, [currentUser?.id, connectionId]);
 
   // Gelen çağrı penceresi sonsuza kadar açık kalmasın: arayan vazgeçip sekmeyi
@@ -943,7 +983,11 @@ export default function App() {
   const handleRegister = async () => {
     setAuthError('');
     if (!displayName.trim()) { setAuthError('Ad Soyad zorunludur.'); return; }
-    if (password.length < 6) { setAuthError('Sifre en az 6 karakter olmali.'); return; }
+    // Bu hesap, bir baskasinin bilgisayarina baglanma yetkisi tasiyor; esigin
+    // bir e-ticaret sitesiyle ayni olmamasi gerekir. Supabase panelinde de
+    // asgari uzunluk 10 yapilmali ve "Leaked password protection" acilmali
+    // (bkz. DEPLOYMENT.md > Supabase panel ayarlari).
+    if (password.length < 10) { setAuthError('Sifre en az 10 karakter olmali.'); return; }
     // Anonim oturum açıkken signUp, YENİ hesap açmak yerine mevcut anonim
     // kullanıcıya kimlik bağlar. Kayıt akışının öngörülebilir olması ve e-posta
     // doğrulamasının beklendiği gibi işlemesi için önce anonim oturumu kapatıyoruz.
@@ -996,7 +1040,7 @@ export default function App() {
   const handleChangePassword = async () => {
     setPasswordChangeError('');
     if (!currentPassword) { setPasswordChangeError('Mevcut sifrenizi girin.'); return; }
-    if (newPassword.length < 6) { setPasswordChangeError('Yeni sifre en az 6 karakter olmali.'); return; }
+    if (newPassword.length < 10) { setPasswordChangeError('Yeni sifre en az 10 karakter olmali.'); return; }
     if (newPassword !== newPasswordConfirm) { setPasswordChangeError('Sifreler eslesmiyor.'); return; }
     const { error: e1 } = await supabase.auth.signInWithPassword({ email: currentUser?.email || '', password: currentPassword });
     if (e1) { setPasswordChangeError('Mevcut sifreniz hatali.'); return; }
@@ -1022,9 +1066,23 @@ export default function App() {
   const handleLogout = async () => {
     if (connTimeoutRef.current) clearTimeout(connTimeoutRef.current);
     if (webrtc) { try { await webrtc.disconnect(); } catch { /* yok say */ } setWebrtc(null); }
-    // signOut'un sunucu çağrısı (global scope) başarısız olsa bile yerel oturumu
-    // kesin temizle; aksi halde state güncellenmez ve "çıkış yapılmıyor" görünür.
-    try { await supabase.auth.signOut({ scope: 'local' }); } catch { /* yok say */ }
+    // ÖNCE GLOBAL çıkış: yenileme jetonu sunucuda da iptal edilsin.
+    //
+    // Eskiden yalnızca `scope: 'local'` çağrılıyordu; gerekçe ağ hatasında
+    // arayüzün kilitlenmemesiydi. Ama uzaktan erişim ürününde çıkış, bir
+    // oturumu GERÇEKTEN kapatma beklentisi taşır: ortak kullanılan ya da
+    // kaybolan bir makinede jeton kopyalanmışsa yerel silme hiçbir şeyi
+    // değiştirmiyordu. Global çağrı başarısız olursa yerele düşüp kullanıcıya
+    // durumu söylüyoruz — arayüz yine kilitlenmiyor.
+    let globalOk = false;
+    try {
+      const { error } = await supabase.auth.signOut();
+      globalOk = !error;
+    } catch { globalOk = false; }
+    if (!globalOk) {
+      try { await supabase.auth.signOut({ scope: 'local' }); } catch { /* yok say */ }
+      addLocalLog('Bu cihazdan cikildi, ancak sunucudaki oturum iptal edilemedi (ag hatasi). Diger oturumlar acik kalmis olabilir.', 'warn');
+    }
     // QRtım yeniden-giriş döngüsünü kır: kalan callback/token izlerini temizle.
     try { sessionStorage.removeItem('partner_callback'); } catch { /* yok say */ }
     // TURN kimlik bilgisi çağıranın kimliğine bağlıdır — sonraki kullanıcı
@@ -1392,7 +1450,14 @@ export default function App() {
     : n >= 1024 ? Math.round(n / 1024) + ' KB'
     : n + ' B';
 
-  /** Alinan dosyayi diske yazar. Masaustunde kaydetme penceresi, webde indirme. */
+  /**
+   * Alinan dosyayi diske yazar — YALNIZCA WEB surumu icin.
+   *
+   * Masaustunde dosya artik akis halinde yaziliyor (acceptIncomingFile ->
+   * streamBegin/streamWrite/streamEnd), bu yuzden buraya hic dusulmez.
+   * Eskiden 200 MB'lik ust sinirda ayni anda 4 kopya olusuyordu:
+   * parca dizisi -> Blob -> ArrayBuffer -> IPC kopyasi.
+   */
   const saveReceivedFile = async (name: string, blob: Blob) => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const api = (window as any).electronAPI;
@@ -1415,6 +1480,22 @@ export default function App() {
     addLocalLog(`Dosya indirildi: ${name}`, 'sys');
   };
 
+  /**
+   * Acik gelen-dosya akisini kapatir. `discard` ile yarim dosya silinir.
+   * Manager'in sink'i de temizlenir, aksi halde sonraki transfer kapali bir
+   * akisa yazmaya calisir.
+   */
+  const closeFileStream = async (opts: { discard?: boolean } = {}) => {
+    const st = fileStreamRef.current;
+    fileStreamRef.current = null;
+    if (webrtcRef.current) webrtcRef.current.onFileSink = undefined;
+    if (!st) return null;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const api = (window as any).electronAPI;
+    if (opts.discard) return api?.streamAbort?.(st.id) ?? null;
+    return api?.streamEnd?.(st.id) ?? null;
+  };
+
   const pickAndSendFile = () => { fileInputRef.current?.click(); };
 
   const handleFileChosen = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -1427,17 +1508,44 @@ export default function App() {
     addLocalLog(`Dosya teklif edildi: ${file.name} (${formatBytes(file.size)})`, 'info');
   };
 
-  const acceptIncomingFile = () => {
+  const acceptIncomingFile = async () => {
     if (!incomingFile || !webrtc) return;
-    webrtc.acceptIncomingFile(incomingFile);
-    setFileProgress({ id: incomingFile.id, done: 0, total: incomingFile.size, dir: 'in' });
-    addLocalLog(`Dosya aliniyor: ${incomingFile.name}`, 'sys');
+    const offer = incomingFile;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const api = (window as any).electronAPI;
+
+    // Masaustunde kaydetme yerini SIMDI sor ve akisi SIMDI ac: file-accept
+    // gonderildikten sonra parcalar hemen gelmeye baslar, ilk parcalar
+    // kaybedilmemeli. (Akisi acamazsak transferi hic kabul etmiyoruz.)
+    if (api?.streamBegin) {
+      const res = await api.streamBegin({ kind: 'file', name: offer.name });
+      if (res?.cancelled) {
+        webrtc.rejectIncomingFile(offer.id);
+        addLocalLog('Kaydetme iptal edildi, dosya reddedildi.', 'warn');
+        setIncomingFile(null);
+        return;
+      }
+      if (!res?.id) {
+        webrtc.rejectIncomingFile(offer.id);
+        addLocalLog(`Dosya acilamadi: ${res?.error ?? 'bilinmeyen hata'}`, 'error');
+        setIncomingFile(null);
+        return;
+      }
+      fileStreamRef.current = { id: res.id, path: res.path };
+      // Manager artik parcalari biriktirmiyor, buraya akitiyor.
+      webrtc.onFileSink = (buf: ArrayBuffer) => api.streamWrite(res.id, new Uint8Array(buf));
+    }
+
+    webrtc.acceptIncomingFile(offer);
+    setFileProgress({ id: offer.id, done: 0, total: offer.size, dir: 'in' });
+    addLocalLog(`Dosya aliniyor: ${offer.name}`, 'sys');
     setIncomingFile(null);
   };
 
-  const rejectIncomingFile = () => {
+  const rejectIncomingFile = async () => {
     if (!incomingFile || !webrtc) return;
     webrtc.rejectIncomingFile(incomingFile.id);
+    await closeFileStream({ discard: true });
     addLocalLog('Dosya reddedildi.', 'warn');
     setIncomingFile(null);
   };
@@ -1459,17 +1567,54 @@ export default function App() {
     return '';
   };
 
-  /** Kaydi fiilen baslatir (onay ALINDIKTAN sonra cagrilir). */
-  const startRecording = (stream: MediaStream): boolean => {
+  /**
+   * Kaydi fiilen baslatir (onay ALINDIKTAN sonra cagrilir).
+   *
+   * MASAUSTUNDE parcalar bellekte BIRIKMEZ: her parca ana surece gonderilip
+   * dosyaya append edilir. Eskiden hepsi durdurulana kadar bellekte
+   * tutuluyordu; 4 Mbps tavanla bir saatlik kayit ~1,8 GB RAM demekti ve
+   * sekme cokerse KAYIT TAMAMEN KAYBOLUYORDU.
+   */
+  const startRecording = async (stream: MediaStream): Promise<boolean> => {
     if (typeof MediaRecorder === 'undefined') {
       addLocalLog('Bu tarayici kayit desteklemiyor.', 'error');
       return false;
+    }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const api = (window as any).electronAPI;
+    // Akisi kayit BASLAMADAN once ac: klasor secimi gerekebilir ve ilk
+    // parcalar kaybedilmemeli.
+    if (api?.streamBegin) {
+      const res = await api.streamBegin({ kind: 'recording', peer: peerLabel || targetId });
+      if (res?.cancelled) { addLocalLog('Kayit klasoru secilmedi, kayit baslatilmadi.', 'warn'); return false; }
+      if (!res?.id) { addLocalLog(`Kayit dosyasi acilamadi: ${res?.error ?? 'bilinmeyen hata'}`, 'error'); return false; }
+      recStreamRef.current = { id: res.id, path: res.path };
+      if (res.folder) setRecFolder(res.folder);
     }
     try {
       const mimeType = pickRecorderMime();
       const mr = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
       recChunksRef.current = [];
-      mr.ondataavailable = (e) => { if (e.data && e.data.size > 0) recChunksRef.current.push(e.data); };
+      recBytesRef.current = 0;
+      mr.ondataavailable = (e) => {
+        if (!e.data || e.data.size === 0) return;
+        recBytesRef.current += e.data.size;
+        const stream = recStreamRef.current;
+        if (stream && api?.streamWrite) {
+          // Diske akit — bellekte tutma.
+          void e.data.arrayBuffer().then((buf) => {
+            api.streamWrite(stream.id, new Uint8Array(buf));
+          }).catch(() => { /* parca okunamadi, kayit devam eder */ });
+          return;
+        }
+        // Web surumu: bellekte birikir, tavan asilirsa kaydi durdur.
+        if (recBytesRef.current > REC_WEB_MAX_BYTES) {
+          addLocalLog('Kayit bellek sinirina ulasti, durduruluyor. Masaustu surumunde bu sinir yoktur.', 'warn');
+          stopRecording();
+          return;
+        }
+        recChunksRef.current.push(e.data);
+      };
       mr.onerror = () => addLocalLog('Kayit sirasinda hata olustu.', 'error');
       mr.onstop = () => { void finalizeRecording(); };
       // 1 sn'lik parcalar: kayit ortasinda cokme olursa o ana kadarki veri durur.
@@ -1478,7 +1623,9 @@ export default function App() {
       recStartedAtRef.current = Date.now();
       setRecElapsed(0);
       setRecState('recording');
-      addLocalLog('Oturum kaydi basladi.', 'warn');
+      addLocalLog(recStreamRef.current
+        ? `Oturum kaydi basladi: ${recStreamRef.current.path}`
+        : 'Oturum kaydi basladi.', 'warn');
       recordAudit('recording_start', {
         actorIdentity: connectionId,
         peerIdentity: webrtcRef.current?.getPeerId(),
@@ -1487,6 +1634,11 @@ export default function App() {
       return true;
     } catch (err) {
       addLocalLog(`Kayit baslatilamadi: ${String(err)}`, 'error');
+      // Acilan akisi geride birakmayalim.
+      const st = recStreamRef.current;
+      recStreamRef.current = null;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      if (st) void (window as any).electronAPI?.streamAbort?.(st.id);
       return false;
     }
   };
@@ -1500,44 +1652,50 @@ export default function App() {
     if (bildir) webrtcRef.current?.sendControl({ k: 'rec-stopped' });
   };
 
-  /** Toplanan parcalari birlestirip diske yazar. */
+  /** Kaydi kapatir. Akis modunda dosya zaten diskte, yalnizca akis kapanir. */
   const finalizeRecording = async () => {
     const parts = recChunksRef.current;
     recChunksRef.current = [];
+    const bayt = recBytesRef.current;
+    recBytesRef.current = 0;
     const saniye = recStartedAtRef.current
       ? Math.round((Date.now() - recStartedAtRef.current) / 1000) : 0;
     recStartedAtRef.current = 0;
     setRecElapsed(0);
-    if (!parts.length) { addLocalLog('Kayit bos, dosya yazilmadi.', 'warn'); return; }
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const api = (window as any).electronAPI;
+    const stream = recStreamRef.current;
+    recStreamRef.current = null;
 
     // Denetim: kaydin ustverisi. Dosyanin KENDISI sunucuya gitmez; buradaki
     // boyut ve sure, kaydin varligini ve kapsamini belgeler.
-    recordAudit('recording_stop', {
-      actorIdentity: connectionId,
-      peerIdentity: webrtcRef.current?.getPeerId(),
-      detail: { saniye, bayt: parts.reduce((t, b) => t + b.size, 0),
-                consentVersion: RECORDING_CONSENT_VERSION },
-    });
-
-    const blob = new Blob(parts, { type: 'video/webm' });
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const api = (window as any).electronAPI;
-    if (api?.saveRecording) {
-      const buf = await blob.arrayBuffer();
-      const res = await api.saveRecording({
-        data: new Uint8Array(buf),
-        peer: peerLabel || targetId,
+    if (bayt > 0) {
+      recordAudit('recording_stop', {
+        actorIdentity: connectionId,
+        peerIdentity: webrtcRef.current?.getPeerId(),
+        detail: { saniye, bayt, consentVersion: RECORDING_CONSENT_VERSION },
       });
-      if (res?.ok) {
-        if (res.folder) setRecFolder(res.folder);
-        addLocalLog(`Kayit kaydedildi (${saniye} sn): ${res.path}`, 'sys');
-      } else if (res?.cancelled) {
-        addLocalLog('Kayit klasoru secilmedi, dosya yazilmadi.', 'warn');
-      } else {
-        addLocalLog(`Kayit yazilamadi: ${res?.error ?? 'bilinmeyen hata'}`, 'error');
+    }
+
+    // ── Masaustu: akis modunda dosya parca parca yazildi. ──
+    if (stream && api?.streamEnd) {
+      if (bayt === 0) {
+        // Hic veri gelmediyse bos dosyayi diskte birakmayalim.
+        await api.streamAbort?.(stream.id);
+        addLocalLog('Kayit bos, dosya yazilmadi.', 'warn');
+        return;
       }
+      const res = await api.streamEnd(stream.id);
+      addLocalLog(res?.ok
+        ? `Kayit kaydedildi (${saniye} sn): ${res.path}`
+        : `Kayit yazilamadi: ${res?.error ?? 'bilinmeyen hata'}`,
+        res?.ok ? 'sys' : 'error');
       return;
     }
+
+    if (!parts.length) { addLocalLog('Kayit bos, dosya yazilmadi.', 'warn'); return; }
+    const blob = new Blob(parts, { type: 'video/webm' });
     // Web surumu: tarayici indirmesi.
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -1689,6 +1847,9 @@ export default function App() {
       if (ev.t === 'cancelled') {
         setFileProgress(null);
         setIncomingFile(null);
+        // Yarim kalan dosyayi diskte birakmayalim: akis iptal edilir ve
+        // dosya silinir (bozuk bir dosya kullaniciyi yaniltir).
+        await closeFileStream({ discard: true });
         addLocalLog(
           ev.reason === 'size' ? 'Dosya beyan edilenden buyuk, transfer kesildi.'
           : ev.reason === 'incomplete' ? 'Dosya eksik geldi, kaydedilmedi.'
@@ -1698,7 +1859,12 @@ export default function App() {
       }
       if (ev.t === 'complete') {
         setFileProgress(null);
-        await saveReceivedFile(ev.name, ev.blob);
+        if (ev.blob) { await saveReceivedFile(ev.name, ev.blob); return; }
+        // Akis modu: dosya zaten diske yazildi, yalnizca kapatiyoruz.
+        const res = await closeFileStream();
+        addLocalLog(res?.ok ? `Dosya kaydedildi: ${res.path}`
+          : `Dosya kaydedilemedi: ${res?.error ?? 'bilinmeyen hata'}`,
+          res?.ok ? 'sys' : 'error');
       }
     };
 
@@ -1759,7 +1925,7 @@ export default function App() {
         // Izleyen taraf: onay geldi, kaydi baslat.
         const stream = remoteVideoRef.current?.srcObject as MediaStream | null;
         if (!stream) { addLocalLog('Kayit baslatilamadi: goruntu akisi yok.', 'error'); setRecState('off'); return; }
-        if (startRecording(stream)) m.sendControl({ k: 'rec-started' });
+        if (await startRecording(stream)) m.sendControl({ k: 'rec-started' });
         else { setRecState('off'); m.sendControl({ k: 'rec-stopped' }); }
         return;
       }
@@ -1876,6 +2042,10 @@ export default function App() {
         setRemoteScreens([]);
         setInputEnabled(false);
         clipReqRef.current = null; // bekleyen pano istegi oturumla birlikte duser
+        // Yarim kalan dosya transferinin akisini kapat ve dosyayi sil:
+        // baglanti dustugunde manager sessizce vazgeciyor, akis ise ana
+        // surecte acik kaliyordu.
+        void closeFileStream({ discard: true });
         disableRemoteControl();
         postSessionEvent('ended', targetId, EMBED.mode);
         if (localVideoRef.current?.srcObject) {

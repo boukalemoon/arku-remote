@@ -223,6 +223,10 @@ if (isDev) {
     captureTargets.delete(wcId);
     // Basılı kalmış tuşları bırak — pencere kapanırken/gezinirken keyup gelmez.
     queueRelease(wcId);
+    // Açık kalmış diske yazma akışlarını kapat. Kayıt akışı KORUNUR (o ana
+    // kadarki görüntü değerlidir); yarım kalmış dosya transferi SİLİNİR
+    // (bozuk bir dosyayı diskte bırakmak kullanıcıyı yanıltır).
+    closeStreamsOf(wcId);
   };
   win.webContents.on('did-start-navigation', dropGrant);
   win.on('closed', dropGrant);
@@ -597,6 +601,131 @@ ipcMain.handle('recording:open-folder', async () => {
   return true;
 });
 
+// ── Akış halinde diske yazma (kayıt + gelen dosya) ───────────────────────────
+//
+// NEDEN: hem oturum kaydı hem gelen dosya renderer'da TAMAMEN BELLEKTE
+// birikiyordu. Kayıt için MediaRecorder saniyelik parçalar üretiyor ama
+// hiçbiri durdurulana kadar diske yazılmıyordu: 4 Mbps tavanla bir saatlik
+// kayıt ~1,8 GB RAM demek. Sekme çöktüğünde kayıt TAMAMEN kayboluyordu —
+// delil olarak tutulan bir veri için kabul edilemez. Dosya tarafında da
+// 200 MB'lık üst sınırda aynı anda 4 kopya oluşuyordu (dizi -> Blob ->
+// ArrayBuffer -> IPC kopyası).
+//
+// GÜVENLİK: hedef yolu RENDERER BELİRLEMEZ. Yol ya ana süreçte saklanan
+// kayıt klasöründen ya da kullanıcının kaydetme penceresinden gelir.
+// Akış kimliği onu açan webContents'e bağlıdır; başka bir pencere o akışa
+// yazamaz.
+const streams = new Map(); // id -> { wcId, fh, path, chain, error, bytes }
+let streamSeq = 0;
+
+/** Yazımları sıraya alır: eşzamanlı append çağrıları veriyi karıştırmamalı. */
+function queueWrite(st, buf) {
+  st.chain = st.chain.then(async () => {
+    if (st.error) return;
+    try {
+      await st.fh.write(buf);
+      st.bytes += buf.length;
+    } catch (err) {
+      st.error = String((err && err.message) || err);
+    }
+  });
+}
+
+async function closeStream(id, { discard = false } = {}) {
+  const st = streams.get(id);
+  if (!st) return { ok: false, error: 'Akis bulunamadi' };
+  streams.delete(id);
+  await st.chain.catch(() => {});
+  try { await st.fh.close(); } catch { /* yok say */ }
+  if (discard) {
+    try { await fs.promises.unlink(st.path); } catch { /* yok say */ }
+    return { ok: false, cancelled: true };
+  }
+  if (st.error) return { ok: false, error: st.error, path: st.path };
+  return { ok: true, path: st.path, bytes: st.bytes };
+}
+
+/**
+ * Bir pencereye ait tüm açık akışları kapatır.
+ * Kayıt akışı saklanır, yarım dosya transferi silinir.
+ */
+function closeStreamsOf(wcId) {
+  for (const [id, st] of streams) {
+    if (st.wcId !== wcId) continue;
+    void closeStream(id, { discard: st.kind === 'file' });
+  }
+}
+
+ipcMain.handle('stream:begin', async (e, opts) => {
+  const kind = opts && opts.kind;
+  const win = BrowserWindow.fromWebContents(e.sender);
+  let target = '';
+
+  if (kind === 'recording') {
+    let dir = readRecordingFolder();
+    if (!dir) {
+      const { canceled, filePaths } = await dialog.showOpenDialog(win, {
+        title: 'Kayitlarin saklanacagi klasoru secin',
+        properties: ['openDirectory', 'createDirectory'],
+      });
+      if (canceled || !filePaths || !filePaths[0]) return { cancelled: true };
+      dir = filePaths[0];
+      writeRecordingFolder(dir);
+    }
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    // Dosya adını ana süreç üretir; renderer'dan gelen `peer` yalnızca
+    // etiket olarak kullanılır ve yol ayırıcılarından arındırılır.
+    const peer = String((opts && opts.peer) || 'oturum').replace(/[^A-Za-z0-9._-]/g, '').slice(0, 40);
+    target = path.join(dir, `arku-${stamp}-${peer || 'oturum'}.webm`);
+  } else if (kind === 'file') {
+    // path.basename: dosya adını KARŞI TARAF belirler; yol ayırıcıları
+    // temizlenmezse "../../Startup/x.exe" gibi bir ad varsayılan kaydetme
+    // yolunu kullanıcının beklemediği bir yere taşır.
+    const safeName = path.basename(String((opts && opts.name) || 'dosya')) || 'dosya';
+    const { canceled, filePath } = await dialog.showSaveDialog(win, {
+      title: 'Alinan dosyayi kaydet',
+      defaultPath: safeName,
+    });
+    if (canceled || !filePath) return { cancelled: true };
+    target = filePath;
+  } else {
+    return { error: 'Bilinmeyen akis turu' };
+  }
+
+  try {
+    const fh = await fs.promises.open(target, 'w');
+    const id = `s${++streamSeq}`;
+    streams.set(id, {
+      wcId: e.sender.id, kind, fh, path: target,
+      chain: Promise.resolve(), error: null, bytes: 0,
+    });
+    return { id, path: target, folder: kind === 'recording' ? path.dirname(target) : undefined };
+  } catch (err) {
+    return { error: String((err && err.message) || err) };
+  }
+});
+
+ipcMain.on('stream:write', (e, payload) => {
+  const st = streams.get(payload && payload.id);
+  // Akış kimliği, onu açan pencereye bağlı.
+  if (!st || st.wcId !== e.sender.id) return;
+  const chunk = payload.chunk;
+  if (!chunk) return;
+  queueWrite(st, Buffer.from(chunk));
+});
+
+ipcMain.handle('stream:end', async (e, id) => {
+  const st = streams.get(id);
+  if (!st || st.wcId !== e.sender.id) return { ok: false, error: 'Akis bulunamadi' };
+  return closeStream(id);
+});
+
+ipcMain.handle('stream:abort', async (e, id) => {
+  const st = streams.get(id);
+  if (!st || st.wcId !== e.sender.id) return { ok: false };
+  return closeStream(id, { discard: true });
+});
+
 // -- Alinan dosyayi diske yaz --------------------------------------------------
 // GUVENLIK: dosya adini KARSI TARAF belirler. path.basename ile yol
 // ayiricilari temizlenmezse "../../Startup/x.exe" gibi bir ad varsayilan
@@ -656,6 +785,39 @@ ipcMain.handle('screens:select', async (e, sourceId) => {
     });
     const match = sources.find((x) => x.id === sourceId);
     if (!match) return false;
+
+    // ── RIZA KAPSAMI GENİŞLİYORSA YENİDEN SOR ────────────────────────────
+    // Kullanıcı yalnızca BİR PENCERE paylaştıysa, o pencerenin dışındaki
+    // hiçbir şeye rıza vermemiştir. Kontrol izni "klavyemi kullanabilirsin"
+    // demek; "tüm masaüstümü paylaşabilirsin" demek değil.
+    //
+    // Eskiden bu geçiş sessizce yapılıyordu: karşı taraf kontrol iznini
+    // aldıktan sonra tek bir mesajla tüm ekrana geçebiliyor, yerel kullanıcı
+    // yalnızca bir günlük satırı görüyordu. (replaceTrack yeniden pazarlık
+    // gerektirmediği için ekran seçici penceresi de açılmıyor.)
+    //
+    // Ekran -> ekran geçişi kapsamı GENİŞLETMEZ (kullanıcı zaten bir ekranın
+    // tamamını paylaşıyor) ve çoklu monitör akışının asıl amacı o; orada
+    // sormuyoruz, renderer kullanıcıya günlük satırı düşüyor.
+    const current = captureTargets.get(e.sender.id);
+    if (current && current.kind === 'window') {
+      const win = BrowserWindow.fromWebContents(e.sender);
+      const { response } = await dialog.showMessageBox(win, {
+        type: 'warning',
+        title: 'Tüm ekranı paylaşmaya geçilsin mi?',
+        message: 'Karşı taraf, paylaşımı tek pencereden TÜM EKRANA geçirmek istiyor.',
+        detail: 'Şu anda yalnızca seçtiğiniz pencere görünüyor. Kabul ederseniz '
+          + 'masaüstünüzün tamamı — diğer pencereler, bildirimler ve açık '
+          + 'belgeler dahil — karşı tarafa görünür olur.\n\n'
+          + 'Yalnızca gerçekten gerekliyse ve güvendiğiniz kişiye izin verin.',
+        buttons: ['Tüm Ekranı Paylaş', 'Vazgeç'],
+        defaultId: 1,
+        cancelId: 1,
+        noLink: true,
+      });
+      if (response !== 0) return false;
+    }
+
     rememberCaptureTarget(e.sender.id, match);
     return true;
   } catch { return false; }

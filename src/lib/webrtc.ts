@@ -66,7 +66,9 @@ export type FileEvent =
   | { t: 'accepted'; id: string }
   | { t: 'rejected'; id: string }
   | { t: 'progress'; id: string; done: number; total: number; dir: 'in' | 'out' }
-  | { t: 'complete'; id: string; name: string; blob: Blob }
+  // blob === null: dosya AKIŞ HALİNDE diske yazıldı (masaüstü), bellekte
+  // birleştirilmedi. Arayüz o durumda kaydetme adımını atlar.
+  | { t: 'complete'; id: string; name: string; blob: Blob | null }
   | { t: 'cancelled'; id: string; reason?: string };
 
 /**
@@ -76,7 +78,9 @@ export type FileEvent =
  * büyüğü bazı tarayıcılarda kanalı kapatır.
  * BUFFER: geri basınç eşiği — bufferedAmount bunu aşarsa gönderim
  * duraklar. Olmadan büyük dosya belleği şişirip kanalı düşürür.
- * MAX_SIZE: alıcı tarafta dosya bellekte birleştirildiği için üst sınır.
+ * MAX_SIZE: üst sınır. Masaüstünde parçalar artık diske akıtıldığı için
+ * bellek kısıtı değil, makul bir kötüye kullanım tavanıdır; WEB sürümünde
+ * ise dosya hâlâ bellekte birleştirildiği için gerçek bir kısıt.
  */
 const FILE_CHUNK_SIZE = 16 * 1024;
 const FILE_BUFFER_THRESHOLD = 1 * 1024 * 1024;
@@ -174,7 +178,7 @@ export class WebRTCManager {
   /** Giden transfer (tek seferde bir tane). */
   private outgoingFile: { id: string; file: File; cancelled: boolean } | null = null;
   /** Gelen transfer — ikili parçalar buna aittir (tek seferde bir tane). */
-  private incomingFile: { id: string; name: string; size: number; parts: ArrayBuffer[]; received: number } | null = null;
+  private incomingFile: { id: string; name: string; size: number; parts: ArrayBuffer[] | null; received: number } | null = null;
   /** Bit hızı/kayıp farkını hesaplamak için bir önceki ölçüm. */
   private lastStatsSample: { at: number; bytes: number; lost: number; packets: number } | null = null;
 
@@ -189,6 +193,14 @@ export class WebRTCManager {
   onControl?: (msg: ControlMsg) => void;
   /** Dosya transferi olaylari. */
   onFile?: (ev: FileEvent) => void;
+  /**
+   * Gelen dosya parcalarini BELLEKTE BIRIKTIRMEK YERINE disa akitir.
+   *
+   * Arayuz bunu masaustunde ayarlar (parcalar ana surece gonderilip dosyaya
+   * append edilir). Ayarlanmissa manager hicbir sey biriktirmez ve 'complete'
+   * olayinda blob null gelir. Ayarlanmamissa (web) eski davranis surer.
+   */
+  onFileSink?: (buf: ArrayBuffer) => void;
   /** Baglanti dogrulama kodu (SAS). Baglanti kurulunca bir kez gelir. */
   onVerification?: (code: string | null) => void;
 
@@ -722,7 +734,21 @@ export class WebRTCManager {
         this.log('Aynı offer tekrar geldi, yok sayıldı.', 'info');
         return;
       }
-      // ICE restart offer from caller (receiver handles this)
+      // ROL KONTROLU SART. ICE restart offer'ini YALNIZCA arayan gonderir
+      // (attemptIceRestart, isReceiver ise erken doner), dolayisiyla bunu
+      // yalnizca ALICI islemelidir.
+      //
+      // Eskiden rol bakilmiyordu: cagri cakismasinda (iki taraf ayni anda
+      // birbirini ariyor) ARAYAN tarafta `have-local-offer` durumunda
+      // setRemoteDescription(offer) cagriliyor ve tarayici InvalidStateError
+      // firlatiyordu. Realtime geri cagrisinda try/catch olmadigi icin bu
+      // yakalanmamis bir promise reddine donusuyor, polling yolunda ise
+      // yutulup ayni turdaki kalan sinyalleri dusuruyordu.
+      // Cakismanin kendisi App seviyesinde (decideIncomingOffer) cozuluyor.
+      if (!this.isReceiver) {
+        this.log('Arayan rolundeyiz, gelen offer yok sayildi (cagri cakismasi).', 'warn');
+        return;
+      }
       this.log('ICE restart teklifi alındı.', 'warn');
       await this.pc.setRemoteDescription(new RTCSessionDescription(this.sanitizeDescription(sig.payload)));
       await this.applyPendingCandidates();
@@ -789,6 +815,9 @@ export class WebRTCManager {
         if (this.processedSignalIds.has(row.id)) continue;
         this.markProcessed(row.id);
         this.pollSince = row.created_at;
+        // Her satir ayri korunuyor: eskiden tek bir hata disaridaki catch'e
+        // dusup AYNI TURDAKI KALAN SINYALLERI de dusuruyordu.
+        try {
         await this.handleSignal({
           id: row.id,
           type: row.type as SignalType,
@@ -796,6 +825,9 @@ export class WebRTCManager {
           payload: row.payload as Record<string, unknown>,
           session_id: (row as { session_id?: string | null }).session_id ?? null,
         });
+        } catch (err) {
+          this.log(`Sinyal islenemedi (${row.type}): ${String(err)}`, 'warn');
+        }
       }
     } catch {
       // Silently ignore to avoid log spam during brief network hiccups
@@ -828,15 +860,27 @@ export class WebRTCManager {
           const sig = payload.new as IncomingSignal & { id: string };
           if (this.processedSignalIds.has(sig.id)) return;
           this.markProcessed(sig.id);
-          await this.handleSignal(sig);
+          // try/catch SART: handleSignal icindeki bir istisna (orn. yanlis
+          // sinyalleşme durumunda setRemoteDescription) burada yakalanmamis
+          // promise reddine donusuyordu.
+          try { await this.handleSignal(sig); }
+          catch (err) { this.log(`Sinyal islenemedi (${sig.type}): ${String(err)}`, 'warn'); }
         }
       );
 
-    // Attempt WebSocket subscription with a 5-second timeout.
-    // If it fails or times out, polling (started below) will take over.
+    // WebSocket aboneliğini 5 saniyelik bir zaman aşımıyla dene.
+    //
+    // POLLING ARTIK YEDEK — HER ZAMAN ÇALIŞMIYOR.
+    // Eskiden WebSocket sağlıklı olsa bile 1,5 saniyede bir HTTP sorgusu
+    // atılıyordu. Emniyet ağı olarak eklenmişti (kurumsal proxy'ler WebSocket'i
+    // düşürüyor) ama bedeli boştaki her istemcinin saniyede ~1 REST isteği
+    // üretmesiydi; bin kurulum saniyede bin istek demek. Artık kanal
+    // SUBSCRIBED olduğunda polling durduruluyor, kanal hata verdiğinde ya da
+    // kapandığında geri açılıyor.
     await new Promise<void>((resolve) => {
       const timeout = setTimeout(() => {
         this.log('WebSocket zaman aşımı — polling modu aktif.', 'warn');
+        this.startPolling();
         resolve();
       }, 5000);
 
@@ -844,19 +888,21 @@ export class WebRTCManager {
         if (status === 'SUBSCRIBED') {
           clearTimeout(timeout);
           this.log('Signal kanalı hazır (WebSocket).', 'sys');
+          // Kanal sağlıklı: yedek sorguya gerek yok.
+          this.stopPolling();
           resolve();
+          return;
         }
-        if (status === 'CHANNEL_ERROR' || status === 'ERROR' || status === 'TIMED_OUT') {
+        if (status === 'CHANNEL_ERROR' || status === 'ERROR' || status === 'TIMED_OUT'
+            || status === 'CLOSED') {
           clearTimeout(timeout);
+          // Kanal SONRADAN da düşebilir; o anda yedeği geri açıyoruz.
           this.log(`WebSocket hatası (${status}) — polling devreye girdi.`, 'warn');
+          this.startPolling();
           resolve(); // Don't throw — polling covers this
         }
       });
     });
-
-    // Always run polling alongside WebSocket as a safety net.
-    // processedSignalIds prevents double-processing.
-    this.startPolling();
   }
 
   // CALLER – sends offer, waits for receiver's screen
@@ -1016,7 +1062,8 @@ export class WebRTCManager {
   private onFileChunk(buf: ArrayBuffer): void {
     const inc = this.incomingFile;
     if (!inc) return; // kabul edilmemis transferden gelen veri - yok say
-    inc.parts.push(buf);
+    // Akis modunda parca diske gider, bellekte tutulmaz.
+    if (inc.parts) inc.parts.push(buf); else this.onFileSink?.(buf);
     inc.received += buf.byteLength;
     // Beyan edilenden fazlasini gondermeye calisan esi kes.
     if (inc.received > inc.size) {
@@ -1052,7 +1099,11 @@ export class WebRTCManager {
   /** Gelen teklifi kabul eder (arayuz kullaniciya sorduktan SONRA cagirir). */
   acceptIncomingFile(offer: FileOffer): void {
     if (offer.size > MAX_FILE_BYTES) { this.rejectIncomingFile(offer.id); return; }
-    this.incomingFile = { id: offer.id, name: offer.name, size: offer.size, parts: [], received: 0 };
+    this.incomingFile = {
+      id: offer.id, name: offer.name, size: offer.size,
+      // Akis modunda (onFileSink ayarli) bellekte birikme YOK.
+      parts: this.onFileSink ? null : [], received: 0,
+    };
     this.sendControl({ k: 'file-accept', id: offer.id });
   }
 
@@ -1132,7 +1183,10 @@ export class WebRTCManager {
         this.onFile?.({ t: 'cancelled', id: inc.id, reason: 'incomplete' });
         return true;
       }
-      this.onFile?.({ t: 'complete', id: inc.id, name: inc.name, blob: new Blob(inc.parts) });
+      this.onFile?.({
+        t: 'complete', id: inc.id, name: inc.name,
+        blob: inc.parts ? new Blob(inc.parts) : null,
+      });
       return true;
     }
     if (msg.k === 'file-cancel') {
