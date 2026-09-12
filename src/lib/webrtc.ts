@@ -1,6 +1,6 @@
 import { supabase } from './supabase';
 import { getIceConfig, describeIce } from './ice';
-import { fingerprintFromSdp, deriveVerificationCode } from './verify';
+import { fingerprintFromSdp, deriveVerificationCode, derivePasswordProof } from './verify';
 import type { IceConfig } from './ice';
 
 export type ConnectionState = 'idle' | 'connecting' | 'connected' | 'disconnected';
@@ -30,8 +30,12 @@ export type InputEventMsg =
 export type RemoteScreen = { id: string; name: string };
 
 export type ControlMsg =
-  | { k: 'clip-req' }                 // "panonu bana gönder"
-  | { k: 'clip-set'; text: string }   // "bunu panona yaz"
+  // "panonu bana gönder". `id`: bu isteğin kimliği; yanıt onu geri taşır.
+  // Olmadan, gelen her clip-set "benim istediğim yanıt" sanılıyordu ve karşı
+  // taraf oturum boyunca istediği an operatörün panosuna yazabiliyordu.
+  | { k: 'clip-req'; id?: string }
+  // "bunu panona yaz". `id` doluysa bir clip-req'in yanıtıdır.
+  | { k: 'clip-set'; text: string; id?: string }
   | { k: 'screens-req' }              // "hangi ekranların var?"
   | { k: 'screens'; list: RemoteScreen[]; current?: string }
   | { k: 'screen-select'; id: string } // "şu ekrana geç"
@@ -83,6 +87,8 @@ interface IncomingSignal {
   type: SignalType;
   from_id: string;
   payload: Record<string, unknown>;
+  /** Arayanın ürettiği oturum kimliği. Yanıtın sahipliğini doğrulamak için şart. */
+  session_id?: string | null;
 }
 
 /**
@@ -154,8 +160,14 @@ export class WebRTCManager {
   private statsTimer: ReturnType<typeof setInterval> | null = null;
   /** Karşı taraf sessizce gittiğinde bağlantıyı düşüren zamanlayıcı. */
   private disconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  /** Bu oturumun parolasi — dogrulama kodu turetmesine karisir. */
-  private sessionPassword = '';
+  /**
+   * Arayanin urettigi tek kullanimlik oturum nonce'u.
+   *
+   * Offer payload'inda `n` olarak gider, mesru alici yanitinda geri tasir.
+   * Tanimadigimiz bir kimlikten gelen `answer`i benimsemeden once aradigimiz
+   * iki kanittan biri (digeri session_id). Bkz. handleSignal.
+   */
+  private sessionNonce = '';
   /** connections satirinin id'si — oturum bitince suresi yazilir. */
   private connectionRowId: string | null = null;
   private connectedAt: number | null = null;
@@ -210,6 +222,16 @@ export class WebRTCManager {
 
   private generateSessionId(): string {
     return `${this.myId}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  }
+
+  /**
+   * Tahmin edilemez oturum nonce'u. Math.random YETMEZ — bu deger bir
+   * kimlik dogrulama kaniti olarak kullaniliyor.
+   */
+  private static generateNonce(): string {
+    const b = new Uint8Array(16);
+    globalThis.crypto.getRandomValues(b);
+    return Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
   }
 
   private async send(type: SignalType, payload: unknown) {
@@ -437,7 +459,7 @@ export class WebRTCManager {
     const local = fingerprintFromSdp(this.pc?.localDescription?.sdp);
     const remote = fingerprintFromSdp(this.pc?.remoteDescription?.sdp);
     if (!local || !remote) { this.onVerification?.(null); return; }
-    const code = await deriveVerificationCode(local, remote, this.sessionPassword);
+    const code = await deriveVerificationCode(local, remote);
     this.onVerification?.(code);
     if (code) this.log(`Bağlantı doğrulama kodu: ${code}`, 'sys');
   }
@@ -643,7 +665,25 @@ export class WebRTCManager {
       // sebebi neredeyse her zaman şu: karşı tarafa profil kimliğiyle (123-456-789)
       // ulaştık, o ise UUID'siyle cevap veriyor. Beklediğimiz answer'ı bu yüzden
       // atmak yerine kimliği benimseyip eş anlamlı olarak kaydediyoruz.
-      const isAwaitedAnswer = sig.type === 'answer' && !this.isReceiver && !this.pc.remoteDescription;
+      //
+      // AMA SAHİPLİK DOĞRULANMADAN DEĞİL. Eskiden tek koşul "henüz remote
+      // description yok"tu: kimliğimizi bilen biri kendi kimliğinden bize bir
+      // `answer` yazıp meşru alıcıyı yarışta geçebiliyordu (alıcı tarafta insan
+      // "Kabul Et"e basıp ekran seçmek zorunda olduğu için yarışı kazanmak
+      // kolaydı). O noktadan sonra operatör, müşterisinin ekranı yerine
+      // saldırganın gösterdiği taklit ekranı izliyordu.
+      //
+      // İki bağımsız kanıt arıyoruz; biri yeterli:
+      //   1. session_id — arayanın ürettiği, tahmin edilemez kimlik. Meşru alıcı
+      //      onu offer'dan okuyup yanıtına yazar (v1.4.0 istemciler de yazıyor,
+      //      bu yüzden geriye dönük uyumlu). Saldırgan offer satırını RLS
+      //      yüzünden OKUYAMAZ, dolayısıyla üretemez.
+      //   2. nonce — offer payload'ındaki `n`. v1.5.0+ alıcılar geri taşır.
+      const claimsSession = !!sig.session_id && sig.session_id === this.sessionId;
+      const claimsNonce = !!this.sessionNonce
+        && (sig.payload as { n?: unknown } | null)?.n === this.sessionNonce;
+      const isAwaitedAnswer = sig.type === 'answer' && !this.isReceiver
+        && !this.pc.remoteDescription && (claimsSession || claimsNonce);
       if (isAwaitedAnswer) {
         this.log(`Karşı taraf farklı kimlikle yanıtladı, eşleştirildi: ${sig.from_id.slice(0, 8)}...`, 'sys');
         this.peerAliases.add(sig.from_id);
@@ -657,6 +697,14 @@ export class WebRTCManager {
         }
         return;
       } else {
+        // Doğrulanmayan yanıt = ya gecikmiş bir eski oturumun sinyali ya da
+        // çağrıyı kaçırma denemesi. İkisi de atılır, ama ikincisi görünsün.
+        if (sig.type === 'answer' && !this.isReceiver) {
+          this.log(
+            `Sahipligi dogrulanamayan yanit reddedildi (${sig.from_id.slice(0, 8)}...).`,
+            'warn',
+          );
+        }
         return;
       }
     }
@@ -715,7 +763,11 @@ export class WebRTCManager {
     try {
       const { data } = await supabase
         .from('signals')
-        .select('id, type, from_id, payload, created_at')
+        // session_id ŞART: tanımadığımız bir kimlikten gelen `answer`ın
+        // sahipliği onunla doğrulanıyor (bkz. handleSignal). Eskiden
+        // seçilmediği için polling yolundan gelen yanıtlar bu kanıtı
+        // taşımıyordu.
+        .select('id, type, from_id, payload, session_id, created_at')
         .eq('to_id', this.myId)
         // DİKKAT: burada from_id'ye göre FİLTRELEME YOK ve bu kasıtlı.
         // Karşı taraf bize çevirdiğimizden BAŞKA bir kimlikle cevap verebilir
@@ -742,6 +794,7 @@ export class WebRTCManager {
           type: row.type as SignalType,
           from_id: row.from_id,
           payload: row.payload as Record<string, unknown>,
+          session_id: (row as { session_id?: string | null }).session_id ?? null,
         });
       }
     } catch {
@@ -813,11 +866,11 @@ export class WebRTCManager {
   // Böylece kimliği bilen/tahmin eden herkesin karşı tarafı çaldırması biter.
   async call(peerId: string, opts: { password?: string } = {}): Promise<void> {
     if (peerId === this.myId) throw new Error('Kendi cihazınıza bağlanamazsınız.');
-    this.sessionPassword = opts.password ?? '';
 
     this.isReceiver = false;
     this.setPeer(peerId);
     this.sessionId = this.generateSessionId();
+    this.sessionNonce = WebRTCManager.generateNonce();
     this.pendingRemoteCandidates = [];
     this.onStateChange?.('connecting');
     this.log(`${peerId} adresine bağlantı isteği gönderiliyor...`, 'warn');
@@ -844,11 +897,22 @@ export class WebRTCManager {
 
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
-    // Parola offer ile birlikte gider. Alıcı, sanitizeDescription ile yalnızca
-    // {type, sdp} alanlarını setRemoteDescription'a verdiği için ek alan zararsızdır.
+    // Offer'a iki ek alan biner. Alıcı, sanitizeDescription ile yalnızca
+    // {type, sdp} alanlarını setRemoteDescription'a verdiği için zararsızdır.
+    //
+    //   pwh — oturum parolasının HMAC kanıtı. Parola artık DÜZ METİN GİTMEZ:
+    //         eskiden `pw` olarak gidiyor ve `signals` tablosunda 5 dakikaya
+    //         kadar duruyordu; veritabanına erişen biri hem araya girebiliyor
+    //         hem parolayı öğrenebiliyordu. Kanıt oturum kimliğine bağlı
+    //         olduğu için tekrar oynatılamaz.
+    //   n   — oturum nonce'u. Meşru alıcı yanıtında geri taşır; tanımadığımız
+    //         bir kimlikten gelen `answer`ı benimsemeden önce aradığımız
+    //         kanıtlardan biri (bkz. handleSignal).
+    const proof = opts.password ? await derivePasswordProof(opts.password, this.sessionId) : null;
     await this.send('offer', {
       type: offer.type, sdp: offer.sdp,
-      ...(opts.password ? { pw: opts.password } : {}),
+      n: this.sessionNonce,
+      ...(proof ? { pwh: proof } : {}),
     });
 
     this.log('Bağlantı isteği gönderildi, yanıt bekleniyor...');
@@ -870,11 +934,14 @@ export class WebRTCManager {
     fromId: string,
     offerPayload: Record<string, unknown>,
     screenStream: MediaStream,
-    opts: { sessionId?: string; addressedAs?: string; offerSignalId?: string; password?: string } = {},
+    opts: { sessionId?: string; addressedAs?: string; offerSignalId?: string } = {},
   ): Promise<void> {
     const { sessionId, addressedAs, offerSignalId } = opts;
-    this.sessionPassword = opts.password ?? '';
     this.isReceiver = true;
+    // Arayanın nonce'unu yanıta geri taşıyacağız: karşı taraf bizi böyle
+    // doğruluyor. Yoksa (v1.4.0 arayan) session_id eşleşmesi yeterli.
+    const offerNonce = typeof (offerPayload as { n?: unknown })?.n === 'string'
+      ? String((offerPayload as { n?: unknown }).n) : '';
     if (addressedAs && addressedAs.trim()) this.myId = addressedAs.trim();
     this.setPeer(fromId);
     // session_id yalnızca offer ile geldiyse güvenilir. Kendi ürettiğimiz bir id
@@ -934,7 +1001,10 @@ export class WebRTCManager {
     await this.applyPendingCandidates();
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
-    await this.send('answer', answer);
+    await this.send('answer', {
+      type: answer.type, sdp: answer.sdp,
+      ...(offerNonce ? { n: offerNonce } : {}),
+    });
 
     this.log('Yanıt gönderildi, bağlantı kuruluyor...');
     this.cleanupTimer = setInterval(() => this.cleanSignals(), 30000);
@@ -1143,7 +1213,7 @@ export class WebRTCManager {
     if (this.outgoingFile) this.outgoingFile.cancelled = true;
     this.outgoingFile = null;
     this.incomingFile = null;
-    this.sessionPassword = '';
+    this.sessionNonce = '';
     this.onVerification?.(null);
     // Oturum suresi ve bitis zamani geceye yazilir (beklenmez).
     this.finishConnectionRecord();

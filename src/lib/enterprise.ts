@@ -58,6 +58,20 @@ export async function listMyOrganizations(): Promise<Organization[]> {
   return (data as Organization[]) ?? [];
 }
 
+/**
+ * Firma oluşturur.
+ *
+ * KURUCU ÜYELİĞİNİ SUNUCU YAZAR (trg_org_add_founder). Eskiden bunu istemci
+ * yapıyordu ve RLS reddediyordu: organization_members ekleme politikası var
+ * olan bir owner/admin ÜYELİĞİ arıyor, yeni firmada ise hiç üye yok. Dönen
+ * hata da kontrol edilmediği için firma üyesiz kalıyor, owner bir daha hiç
+ * üye ekleyemiyordu (açılış kilidi).
+ * Gerekçe ve geri alma: supabase/migrations/20260912_org_owner_bootstrap.sql
+ *
+ * Migration henüz uygulanmadıysa kurucu üyeliği oluşmaz; bunu sessizce
+ * geçmek yerine SÖYLÜYORUZ — aksi halde kullanıcı üye ekleyemediğinde
+ * sebebini bulamıyor.
+ */
 export async function createOrganization(name: string, slug: string): Promise<{ org?: Organization; error?: string }> {
   const { data: { user } } = await supabase.auth.getUser();
   if (!user) return { error: 'Oturum gerekli' };
@@ -65,10 +79,19 @@ export async function createOrganization(name: string, slug: string): Promise<{ 
   const { data, error } = await supabase.from('organizations')
     .insert({ owner_id: user.id, name, slug }).select().single();
   if (error) return { error: error.code === '23505' ? 'Bu slug zaten kullanımda.' : error.message };
-  // Kurucuyu owner üye olarak ekle
-  await supabase.from('organization_members')
-    .insert({ org_id: data.id, user_id: user.id, role: 'owner', status: 'active' });
-  return { org: data as Organization };
+
+  const org = data as Organization;
+  // Trigger kurucuyu eklemiş olmalı. Doğrula: eklenmemişse eski şema demektir.
+  const { data: founder } = await supabase.from('organization_members')
+    .select('id').eq('org_id', org.id).eq('user_id', user.id).maybeSingle();
+  if (!founder) {
+    return {
+      org,
+      error: 'Firma açıldı ancak kurucu üyeliği oluşturulamadı; üye ekleyemezsiniz. '
+        + 'Veritabanı güncellemesi (20260912_org_owner_bootstrap.sql) uygulanmalı.',
+    };
+  }
+  return { org };
 }
 
 export async function updateOrganization(id: string, patch: Partial<Pick<Organization, 'name' | 'slug' | 'logo_url'>>): Promise<{ error?: string }> {

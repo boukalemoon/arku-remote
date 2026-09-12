@@ -17,6 +17,7 @@ import type { ConnectionState, InputEventMsg, RtcQuality, ControlMsg, RemoteScre
 import { EMBED, postSessionEvent, resetSessionEvents } from './lib/embed';
 import { resetIceCache } from './lib/ice';
 import { recordAudit, listAudit, verifyAuditChain } from './lib/audit';
+import { verifyOfferPassword } from './lib/verify';
 import type { AuditRow, AuditVerifyResult } from './lib/audit';
 
 type Theme = 'otuken' | 'umay' | 'gok' | 'gece';
@@ -118,6 +119,47 @@ const resolveMyConnectionId = async (uid: string): Promise<{ id: string; fromSer
   } catch { /* fonksiyon yok / ağ hatası — yedek yola düş */ }
   return { id: generateProfileId(uid), fromServer: false };
 };
+/**
+ * Kimliği sunucuya bağlar ve GERÇEKTEN bağlanıp bağlanmadığını söyler.
+ *
+ * Hem oturum açıldığında hem "Tekrar Dene" düğmesinden çağrılır; ikisinin
+ * aynı kodu kullanması şart, aksi halde tekrar deneme yalnızca oturumu
+ * yeniliyor ama kimliği yeniden istemiyordu (oturum geçerliyse hiçbir şey
+ * olmuyordu).
+ *
+ * React durumuna DOKUNMAZ: çağıran taraf sonucu kendi state'ine yazar.
+ * Böylece useEffect içinden bayat closure riski olmadan çağrılabilir.
+ */
+const bindServerIdentity = async (
+  user: SupabaseUser,
+  fingerprint: string,
+): Promise<{ id: string; ready: boolean; error: string }> => {
+  const { id: pid, fromServer } = await resolveMyConnectionId(user.id);
+  const profileRow: Record<string, unknown> = {
+    id: user.id, email: user.email ?? null,
+    device_fingerprint: fingerprint, last_seen: new Date().toISOString(),
+  };
+  // Sunucu atadıysa kimliği tekrar yazmayız (RPC zaten yazdı).
+  if (!fromServer) profileRow.connection_id = pid;
+  const { error } = await supabase.from('users').upsert(profileRow, { onConflict: 'id' });
+
+  // Eskiden bayrak koşulsuz true yapılıyordu. Oysa arku_ensure_connection_id
+  // başarısız olup istemci eski 32-bit hash yedeğine düştüğünde kimlik
+  // yalnızca yerelde var olabiliyordu: unique çakışmasında upsert sessizce
+  // düşüyor, kontrol edilmeyen hatası yutuluyor ve kullanıcı ekranda geçerli
+  // görünen bir numarayı karşı tarafa okuyordu. signals RLS'i
+  // arku_owns_identity(to_id) istediği için o kimliğe gelen HİÇBİR sinyal
+  // okunamıyor; iki taraf da sebebini öğrenemiyordu.
+  if (fromServer && !error) return { id: pid, ready: true, error: '' };
+  return {
+    id: pid,
+    ready: false,
+    error: error
+      ? `Kimlik sunucuya baglanamadi: ${error.message}`
+      : 'Sunucu kimlik atayamadi (arku_ensure_connection_id yanit vermedi).',
+  };
+};
+
 /**
  * Oturumsuz misafir kimliği.
  *
@@ -534,8 +576,13 @@ export default function App() {
     // verebilir ne de cagri cakismasi uydurup bizi geri cekilmeye zorlayabilir.
     // Kimligi bilmek artik tek basina yetmiyor.
     if (requirePasswordRef.current) {
-      const given = String((sig.payload as { pw?: unknown } | null)?.pw ?? '').trim().toUpperCase();
-      if (given !== sessionPasswordRef.current) {
+      // Parola artik DUZ METIN gelmiyor: arayan HMAC(parola, oturum_kimligi)
+      // kaniti gonderiyor ve biz ayni kaniti kendi parolamizla uretip
+      // sabit surede karsilastiriyoruz. Boylece parola `signals` tablosuna
+      // hic yazilmiyor. v1.4.0 arayanlarin duz metin `pw` alani geriye
+      // donuk uyumluluk icin hala kabul ediliyor (bkz. lib/verify.ts).
+      const ok = await verifyOfferPassword(sig.payload, sig.session_id, sessionPasswordRef.current);
+      if (!ok) {
         const tries = (badPasswordTriesRef.current.get(sig.from_id) ?? 0) + 1;
         badPasswordTriesRef.current.set(sig.from_id, tries);
         addLocalLog(`${sig.from_id} yanlis parola ile baglanmak istedi (${tries}. deneme).`, 'warn');
@@ -674,21 +721,10 @@ export default function App() {
         // eder ve mevcut kimlik asla değişmez. Eski istemci üretimi 32-bit
         // hash'ti; çakışan kullanıcının upsert'ü sessizce başarısız oluyor ve
         // o kullanıcı kimliksiz — yani ulaşılamaz — kalıyordu.
-        const { id: pid, fromServer } = await resolveMyConnectionId(user.id);
-        setConnectionId(pid);
-        // Kimlik sunucuda kayitli: artik bu kimlige sinyal gelebilir.
-        setIdentityReady(true);
-        setIdentityError('');
-        // Kimlik bağlama: bu satır, display kimliğini (123-456-789) auth.uid()'e
-        // bağlar. signals RLS'ini kimliğe dayandırmanın ön koşulu budur —
-        // misafirler dahil herkes için yazılır.
-        const profileRow: Record<string, unknown> = {
-          id: user.id, email: user.email ?? null,
-          device_fingerprint: fp, last_seen: new Date().toISOString(),
-        };
-        // Sunucu atadıysa kimliği tekrar yazmayız (RPC zaten yazdı).
-        if (!fromServer) profileRow.connection_id = pid;
-        await supabase.from('users').upsert(profileRow, { onConflict: 'id' });
+        const bound = await bindServerIdentity(user, fp);
+        setConnectionId(bound.id);
+        setIdentityReady(bound.ready);
+        setIdentityError(bound.error);
         if (anon) {
           // Misafir: profil/geçmiş/abonelik yüklenmez, kayıt tutulmaz.
           setUserProfile(null);
@@ -791,12 +827,25 @@ export default function App() {
     return () => { cancelled = true; };
   }, [ensureSession]);
 
-  /** Arayuzdeki "Tekrar Dene" dugmesi. */
+  /**
+   * Arayuzdeki "Tekrar Dene" dugmesi.
+   *
+   * Iki asamali: once oturum (yoksa anonim acilir), sonra KIMLIK. Ikincisi
+   * eskiden yoktu — oturum zaten gecerliyse ensureSession true donuyor,
+   * onAuthStateChange tetiklenmiyor ve dugme hicbir sey yapmiyordu.
+   */
   const retryIdentity = async () => {
     setIdentityError('');
     addLocalLog('Kimlik yeniden alinmaya calisiliyor...', 'info');
     anonBootstrapRef.current = true;
-    if (!(await ensureSession())) anonBootstrapRef.current = false;
+    if (!(await ensureSession())) { anonBootstrapRef.current = false; return; }
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) return; // signInAnonymously onAuthStateChange'i tetikleyecek
+    const bound = await bindServerIdentity(user, deviceFingerprint || generateDeviceFingerprint());
+    setConnectionId(bound.id);
+    setIdentityReady(bound.ready);
+    setIdentityError(bound.error);
+    addLocalLog(bound.ready ? 'Kimlik alindi.' : `Kimlik alinamadi: ${bound.error}`, bound.ready ? 'sys' : 'error');
   };
 
   // QRtım'den ?qrtim_token=... ile dönüşte tek noktadan işle:
@@ -1147,10 +1196,13 @@ export default function App() {
   const handleCreateOrg = async () => {
     setEntError('');
     const { org, error } = await createOrganization(newOrgName.trim(), newOrgSlug.trim().toLowerCase());
-    if (error) { setEntError(error); return; }
+    // Firma açılmış ama kurucu üyeliği oluşmamış olabilir (eski şema): o durumda
+    // HEM uyarıyı göster HEM listeyi yenile — firma gerçekten var.
+    if (error) setEntError(error);
+    if (!org) return;
     setNewOrgName(''); setNewOrgSlug('');
     await refreshOrganizations();
-    if (org) setActiveOrgId(org.id);
+    setActiveOrgId(org.id);
   };
   const handleSaveOrg = async () => {
     if (!activeOrgId) return;
@@ -1311,9 +1363,26 @@ export default function App() {
     addLocalLog(`Pano karsi tarafa gonderildi (${text.length} karakter).`, 'sys');
   };
 
+  /**
+   * Bekleyen uzak pano isteği. Karşı taraftan gelen `clip-set` YALNIZCA bunun
+   * karşılığıysa panoya yazılır.
+   *
+   * NEDEN: eskiden operatör tarafında hiçbir kapı yoktu — gelen her `clip-set`
+   * "benim istediğim yanıt" sayılıyor ve doğrudan panoya yazılıyordu. Kötü
+   * niyetli bir eş, oturum boyunca istediği an operatörün panosundaki IBAN'ı,
+   * parolayı veya komutu kendi metniyle değiştirebiliyordu. Ana süreçteki
+   * kontrol izni de devreye girmiyordu, çünkü bu yol `fromRemote: false`
+   * ile çağrılıyor (operatörün kendi isteği varsayımı).
+   */
+  const clipReqRef = React.useRef<{ id: string; at: number } | null>(null);
+  /** İsteğin yanıtı için tanınan süre. Uzak pano okuma saniyeler sürer. */
+  const CLIP_REPLY_WINDOW_MS = 20000;
+
   const requestRemoteClipboard = () => {
     if (!webrtc || rtcState !== 'connected') return;
-    webrtc.sendControl({ k: 'clip-req' });
+    const id = 'c' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    clipReqRef.current = { id, at: Date.now() };
+    webrtc.sendControl({ k: 'clip-req', id });
     addLocalLog('Uzak pano istendi...', 'info');
   };
 
@@ -1642,7 +1711,9 @@ export default function App() {
         if (role !== 'receiver' || !remoteControlAllowedRef.current) return;
         const text = await readLocalClipboard(true);
         if (!text) return;
-        m.sendControl({ k: 'clip-set', text });
+        // İstek kimliğini geri taşı: operatör yanıtın kendi isteğine ait
+        // olduğunu böyle doğruluyor.
+        m.sendControl({ k: 'clip-set', text, id: msg.id });
         addLocalLog('Panonuz karsi tarafa gonderildi.', 'warn');
         return;
       }
@@ -1655,7 +1726,18 @@ export default function App() {
           const ok = await writeLocalClipboard(text, true);
           if (ok) addLocalLog('Karsi taraf panonuza metin yazdi.', 'warn');
         } else {
-          // Operator: kendi istedigi uzak panonun yaniti.
+          // Operator tarafi: YALNIZCA bekleyen bir istegin yaniti kabul edilir.
+          // Istenmemis pano yazimi reddedilir ve gunluge dusurulur.
+          const pending = clipReqRef.current;
+          const expired = !pending || Date.now() - pending.at > CLIP_REPLY_WINDOW_MS;
+          // `id` tasiyan yanit (v1.5.0+ es) isteğin kimliğiyle eşleşmeli.
+          // Tasimayan yanit (eski es) yalnizca bekleyen istek varsa kabul edilir.
+          const idMismatch = typeof msg.id === 'string' && msg.id !== pending?.id;
+          if (expired || idMismatch) {
+            addLocalLog('Istenmemis pano yazimi reddedildi (karsi taraf panonuza yazmaya calisti).', 'warn');
+            return;
+          }
+          clipReqRef.current = null; // tek kullanimlik
           const ok = await writeLocalClipboard(text, false);
           addLocalLog(ok ? `Uzak pano alindi (${text.length} karakter).` : 'Pano yazilamadi.', ok ? 'sys' : 'warn');
         }
@@ -1793,6 +1875,7 @@ export default function App() {
         setPeerLabel('');
         setRemoteScreens([]);
         setInputEnabled(false);
+        clipReqRef.current = null; // bekleyen pano istegi oturumla birlikte duser
         disableRemoteControl();
         postSessionEvent('ended', targetId, EMBED.mode);
         if (localVideoRef.current?.srcObject) {
@@ -1943,12 +2026,11 @@ export default function App() {
       };
     });
 
-    // DIKKAT: turetmede ARAYANIN gonderdigi parola kullanilir, bizimki degil.
-    // Parola zorunlu degilken arayan bos ya da baska bir sey gondermis
-    // olabilir; kendi parolamizi kullanirsak kodlar tutmaz ve kullaniciya
-    // sahte bir 'araya girme' uyarisi gostermis oluruz.
-    const offeredPw = String((offerPayload as { pw?: unknown })?.pw ?? '');
-    try { await m.accept(fromId, offerPayload, screen, { sessionId, addressedAs: toId, offerSignalId: signalId, password: offeredPw }); }
+    // Dogrulama kodu (SAS) artik YALNIZCA DTLS parmak izlerinden turetiliyor;
+    // parola turetmeye karismiyor. Gerekce: lib/verify.ts. Ozetle parola aynı
+    // kanaldan gittigi icin ek koruma saglamiyordu, ustune iki taraf parola
+    // konusunda anlasmadiginda sahte 'araya girme' uyarisi ureti(yordu).
+    try { await m.accept(fromId, offerPayload, screen, { sessionId, addressedAs: toId, offerSignalId: signalId }); }
     catch (err) {
       screen?.getTracks().forEach(t => { t.onended = null; t.stop(); });
       addLog(`Baglaniti kabul edilemedi: ${String(err)}`, 'error');
