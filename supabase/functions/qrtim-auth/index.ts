@@ -59,6 +59,14 @@ function mapQrtimPlan(p: string | null): "free" | "pro" | "business" {
 // QRtım kaynaklı Arku aboneliği ver/güncelle.
 // Kurallar: ücretsiz plan için abonelik oluşturma; satın alınmış (source=direct,
 // active) aboneliği ezme; yalnızca qrtim kaynaklı satırı güncelle.
+//
+// ⚠ BİLİNEN EKSİK: buradaki plan, BAĞLAMA ANININ fotoğrafıdır ve eskir.
+// Yazılan satırın süresi dolmuyor (current_period_end boş kalıyor), plan
+// kontrolü de yalnızca status='active' diyor. Yani QRtım aboneliği biten
+// kullanıcı, tekrar QRtım ile giriş yapmadıkça ücretli kademede kalır.
+// Kapatan iş: QRtım'in `partner-plan` ucuyla periyodik tazeleme — sır artık
+// saklanıyor (20260922_qrtim_link_secrets), tazeleme yolu ve ağ erişilemezken
+// uygulanacak politika Burak'ın kararını bekliyor.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 async function grantQrtimSubscription(admin: any, userId: string, qrtimPlan: string | null) {
   const arkuPlan = mapQrtimPlan(qrtimPlan);
@@ -133,7 +141,13 @@ Deno.serve(async (req: Request) => {
     });
     const vd = await vr.json().catch(() => ({ valid: false }));
     if (!vr.ok || !vd.valid || !vd.user) {
-      return json({ error: vd.error || "Geçersiz QRtım token" }, 401);
+      // `code` makine tarafından okunabilir (token_already_used, token_expired,
+      // email_not_verified …); istemci mesajı ona göre seçiyor. `error` metni
+      // insan içindir ve değişebilir — ona göre dallanılmaz.
+      return json({
+        error: vd.error || "Geçersiz QRtım token",
+        code: typeof vd.code === "string" ? vd.code : "token_invalid",
+      }, 401);
     }
 
     const q = vd.user as {
@@ -236,7 +250,24 @@ Deno.serve(async (req: Request) => {
       return json({ error: "QRtım kimliği bu hesaba bağlanamadı." }, 409);
     }
 
-    // 6) Şifresiz oturum için magic-link token üret (e-posta gönderilmez)
+    // 6) Plan tazeleme sırrını sakla (QRtım `partner-plan` ucu için).
+    //
+    // Sır YALNIZCA bağlama anında dönüyor; şimdi yakalanmazsa sonradan almanın
+    // yolu yok. İstemciye hiç gönderilmiyor, politikası olmayan ayrı bir
+    // tabloda duruyor (20260922_qrtim_link_secrets).
+    //
+    // Hata girişi DÜŞÜRMEZ: oturum geçerli, yalnızca planı sonradan doğrulama
+    // yeteneğini kaybederiz. Plan tazeleme yolu "sır yok" durumunu
+    // "doğrulanamadı" olarak ele alır.
+    if (typeof vd.link_secret === "string" && vd.link_secret) {
+      await admin.from("qrtim_link_secrets").upsert({
+        user_id: userId,
+        qrtim_uid: q.qrtim_uid,
+        link_secret: vd.link_secret,
+      }, { onConflict: "user_id" });
+    }
+
+    // 7) Şifresiz oturum için magic-link token üret (e-posta gönderilmez)
     const { data: linkData, error: linkErr } = await admin.auth.admin.generateLink({
       type: "magiclink",
       email: loginEmail,
@@ -251,7 +282,7 @@ Deno.serve(async (req: Request) => {
       return json({ error: "Oturum oluşturulamadı" }, 500);
     }
 
-    // 7) QRtım aboneliğini Arku'ya senkronla — ücretli QRtım planları ücretsiz
+    // 8) QRtım aboneliğini Arku'ya senkronla — ücretli QRtım planları ücretsiz
     //    Arku aboneliği verir. Mevcut satın alınmış (direct) abonelik ezilmez.
     await grantQrtimSubscription(admin, userId, q.plan ?? null);
 

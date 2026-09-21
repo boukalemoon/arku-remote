@@ -1434,7 +1434,11 @@ export default function App() {
       });
       const data = await res.json();
       if (!res.ok || !data.valid) {
-        addLocalLog(`QRtım bağlantısı başarısız: ${data.error || 'Bilinmeyen hata'}`, 'error');
+        if (data.code === 'token_already_used') {
+          addLocalLog('QRtım bağlantısı zaten tamamlandı.', 'warn');
+        } else {
+          addLocalLog(`QRtım bağlantısı başarısız: ${qrtimErrorText(data.code, data.error)}`, 'error');
+        }
         return;
       }
       if (data.user.name && !displayName) setDisplayName(data.user.name);
@@ -1455,6 +1459,23 @@ export default function App() {
   // yönlendirme tarayıcıca engellenir). Bu yüzden Electron'da callback olarak
   // güvenilen web adresi kullanılır; dönüş electron/main.cjs tarafından
   // yakalanıp token yerel uygulamaya aktarılır.
+  // QRtim hata KODUNU kullanici diline cevirir.
+  // Kod uzerinden dalllaniyoruz, metin uzerinden degil: QRtim tarafindaki
+  // insan okunur `error` metinleri degisebilir, `code` sabittir.
+  const qrtimErrorText = (code?: string, fallback?: string): string => {
+    switch (code) {
+      case 'token_expired':
+        return 'QRtim baglantisinin suresi doldu. Lutfen tekrar deneyin.';
+      case 'email_not_verified':
+        return 'QRtim hesabinizin e-postasi dogrulanmamis. QRtim\'de dogrulayip tekrar deneyin.';
+      case 'token_invalid':
+      case 'token_missing':
+        return 'QRtim baglantisi gecersiz. Lutfen tekrar deneyin.';
+      default:
+        return fallback || 'Bilinmeyen hata';
+    }
+  };
+
   const qrtimCallbackUrl = () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     if ((window as any).electronAPI?.isElectron) return 'https://arku-remote.vercel.app';
@@ -1488,7 +1509,14 @@ export default function App() {
       });
       const data = await res.json();
       if (!res.ok || !data.token_hash) {
-        addLocalLog(`QRtım ile giriş başarısız: ${data.error || 'Bilinmeyen hata'}`, 'error');
+        // Belirtec tek kullanimlik: ikinci kez gonderilirse QRtim
+        // `token_already_used` doner. Bu bir HATA DEGIL — ilk istek basarili
+        // olmustur; kullaniciya basarisizlik gostermek yanlis olur.
+        if (data.code === 'token_already_used') {
+          addLocalLog('QRtım bağlantısı zaten tamamlandı.', 'warn');
+        } else {
+          addLocalLog(`QRtım ile giriş başarısız: ${qrtimErrorText(data.code, data.error)}`, 'error');
+        }
         return;
       }
       const { error } = await supabase.auth.verifyOtp({ token_hash: data.token_hash, type: 'magiclink' });

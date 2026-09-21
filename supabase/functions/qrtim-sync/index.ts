@@ -118,7 +118,11 @@ Deno.serve(async (req: Request) => {
     });
     const vd = await vr.json().catch(() => ({ valid: false }));
     if (!vr.ok || !vd.valid || !vd.user) {
-      return json({ error: vd.error || "Geçersiz QRtım token" }, 401);
+      // `code` makine tarafından okunabilir; istemci mesajı ona göre seçer.
+      return json({
+        error: vd.error || "Geçersiz QRtım token",
+        code: typeof vd.code === "string" ? vd.code : "token_invalid",
+      }, 401);
     }
     const q = vd.user as {
       qrtim_uid?: string | null;
@@ -161,6 +165,17 @@ Deno.serve(async (req: Request) => {
       return json({
         error: "Bu QRtım hesabı başka bir Arku hesabına bağlı. Önce oradan bağlantıyı kesin.",
       }, 409);
+    }
+
+    // Plan tazeleme sırrını sakla — qrtim-auth ile aynı gerekçe: sır yalnızca
+    // bağlama anında dönüyor, istemciye hiç gitmiyor, politikası olmayan ayrı
+    // tabloda duruyor. Hata bağlamayı düşürmez.
+    if (typeof vd.link_secret === "string" && vd.link_secret) {
+      await admin.from("qrtim_link_secrets").upsert({
+        user_id: userId,
+        qrtim_uid: q.qrtim_uid,
+        link_secret: vd.link_secret,
+      }, { onConflict: "user_id" });
     }
 
     const arkuPlan = await grantQrtimSubscription(admin, userId, q.plan ?? null);

@@ -96,11 +96,15 @@ Diğer üçü bağımsızdır.
 20260921_org_invite_verified_email.sql Kurum daveti yalnızca doğrulanmış e-postaya
 20260921_turn_rate_limit.sql          TURN kimlik bilgisi için kişi başı hız sınırı
 20260921_ilgezdi_device_links.sql     İlgezdi cihazları arası sinyal (aynı hesap)
+20260922_qrtim_link_secrets.sql       QRtım plan tazeleme sırrı (kullanıcı başına)
 ```
 
-Dördü de bağımsız ve mevcut satırlara dokunmaz. İlk ikisi QRtım girişi
-açılmadan **önce** uygulanmalıdır. Üçüncüsü `turn-credentials`'ın yeni
-sürümüyle birlikte gider (fonksiyon bu tabloyu çağırır). Dördüncüsü yalnızca
+Beşi de bağımsız ve mevcut satırlara dokunmaz. QRtım girişi açılmadan **önce**
+`20260921_qrtim_uid_identity`, `20260921_org_invite_verified_email` ve
+`20260922_qrtim_link_secrets` uygulanmış olmalıdır — sonuncusu olmadan plan
+tazeleme sırrı yakalanamaz ve sır yalnızca bağlama anında dönüyor.
+`20260921_turn_rate_limit`, `turn-credentials`'ın yeni sürümüyle birlikte gider
+(fonksiyon bu tabloyu çağırır). `20260921_ilgezdi_device_links` yalnızca
 İlgezdi entegrasyonu için gerekir; Arku istemcisi bu tabloları kullanmaz.
 
 ---

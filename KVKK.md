@@ -38,6 +38,7 @@ TURN (relay) devreye girdiğinde trafik sunucu üzerinden **aktarılır** ama
 | Bağlantı geçmişi (kim, kime, süre) | `public.connections` | Kullanıcıya gösterilen oturum listesi | Kullanıcı silene kadar |
 | Uygulama günlüğü | `public.logs` | Destek/teşhis | **90 gün** (pg_cron) |
 | TURN istek sayacı (kullanıcı kimliği + zaman) | `public.turn_issue_log` | Kötüye kullanım sınırı; içerik taşımaz | **1 saat** (pg_cron) |
+| QRtım plan sorgulama sırrı | `public.qrtim_link_secrets` | Aboneliğin hâlâ geçerli olduğunu QRtım'den doğrulamak. İstemciye hiç verilmez | QRtım bağlantısı kesilene kadar |
 | Denetim izi (olay, taraflar, rıza sürümü) | `public.session_audit` | İspat — aşağıda ayrı başlık | **Silinmez** (append-only) |
 | Cihaz adı ve platform (İlgezdi) | `public.user_devices` | Hesabın cihazlarını birbirine bağlamak | Kullanıcı cihazı silene kadar |
 | Cihazlar arası sinyal (SDP + ICE) | `public.device_links` | Aynı hesabın cihazları arasında bağlantı kurulumu. **ICE adayları IP adresi içerir** | **5 dakika** (pg_cron) |
