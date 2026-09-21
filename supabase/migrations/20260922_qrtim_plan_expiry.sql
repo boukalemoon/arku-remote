@@ -127,9 +127,29 @@ grant  execute on function public.arku_effective_subscription(uuid) to authentic
 --     mevcut qrtim satırı free'ye çekilir.
 --   * Ücretli plan qrtim kaynaklı yazılır ve ufku 72 saat ileri itilir.
 -- ---------------------------------------------------------
+-- ÜCRETLİ Mİ SORUSUNU BİZ CEVAPLAMIYORUZ
+-- Eskiden plan ADINDAN çıkarılıyordu ve bilinmeyen her ad ÜCRETLİ sayılıyordu:
+-- QRtım'de "deneme" gibi ücretsiz bir kademe çıksa sessizce ücretli lisans
+-- dağıtırdık. QRtım artık cevabında `paid` (boolean) döndürüyor; karar orada
+-- üretiliyor ve tanımsız plan `paid: false` dönüyor. Yeni kademe eklendiğinde
+-- ne bizim kod değişiyor ne de haber verilmesi gerekiyor.
+--
+-- p_paid NULL ise (henüz `paid` göndermeyen bir çağıran — bağlama anındaki
+-- arku-link yanıtı) BİLİNEN ad listesine düşülür ve bilinmeyen ad artık
+-- ÜCRETSİZ sayılır. Bu geçici köprü, arku-link de `paid` döndürmeye
+-- başlayınca kaldırılabilir; o zamana kadar ilk giriş adla, hemen ardından
+-- gelen ilk tazeleme `paid` ile doğruluyor.
+--
+-- KADEME ADI hâlâ bizde: hangi ÜCRETLİ kademenin Arku business'ına denk
+-- geldiği bizim ürün kararımız. Bilinmeyen ücretli ad `pro` olur — yani
+-- yanlış tarafa düşse bile DAHA DÜŞÜK kademeye düşer.
+-- (QRtım `max_sync_devices` / `password_sync` alanlarına bağlamayı önerdi;
+--  bağlamadık: Arku'nun business kademesi CİHAZ sayısı değil, bir firmadaki
+--  OPERATÖR koltuğu demek — farklı bir eksen.)
 create or replace function public.arku_qrtim_apply_plan(
   p_user_id    uuid,
-  p_qrtim_plan text
+  p_qrtim_plan text,
+  p_paid       boolean default null
 )
 returns text
 language plpgsql
@@ -138,6 +158,8 @@ set search_path = public
 as $$
 declare
   v_plan   text;
+  v_paid   boolean;
+  v_ad     text;
   v_src    text;
   v_status text;
   c_ttl    constant interval := interval '72 hours';
@@ -146,15 +168,21 @@ begin
     raise exception 'user_id zorunlu';
   end if;
 
-  -- QRtım planı -> Arku planı
-  v_plan := case lower(coalesce(p_qrtim_plan, ''))
-    when 'business'   then 'business'
-    when 'kurumsal'   then 'business'
-    when 'stk'        then 'business'
-    when 'enterprise' then 'business'
-    when ''           then 'free'
-    when 'free'       then 'free'
-    else 'pro'  -- student, professional ve diğer tüm ücretli planlar
+  v_ad := lower(trim(coalesce(p_qrtim_plan, '')));
+
+  -- Ücretli mi? Önce QRtım'in cevabı; yoksa bilinen ad listesi (köprü).
+  v_paid := coalesce(
+    p_paid,
+    v_ad in ('student', 'professional', 'stk', 'business', 'corporate',
+             'kurumsal', 'enterprise')
+  );
+
+  -- Hangi kademe? Yalnızca ücretliyse sorulur.
+  v_plan := case
+    when not v_paid then 'free'
+    when v_ad in ('stk', 'business', 'corporate', 'kurumsal', 'enterprise')
+      then 'business'
+    else 'pro'
   end;
 
   select s.source, s.status into v_src, v_status
@@ -191,9 +219,13 @@ begin
   return v_plan;
 end $$;
 
-revoke all     on function public.arku_qrtim_apply_plan(uuid, text) from public;
-revoke execute on function public.arku_qrtim_apply_plan(uuid, text) from anon, authenticated;
-grant  execute on function public.arku_qrtim_apply_plan(uuid, text) to service_role;
+-- İki parametreli bir sürümü uygulanmışsa düşür: aksi halde iki imza yan yana
+-- kalır ve `paid` göndermeyen çağrı sessizce eski davranışa düşerdi.
+drop function if exists public.arku_qrtim_apply_plan(uuid, text);
+
+revoke all     on function public.arku_qrtim_apply_plan(uuid, text, boolean) from public;
+revoke execute on function public.arku_qrtim_apply_plan(uuid, text, boolean) from anon, authenticated;
+grant  execute on function public.arku_qrtim_apply_plan(uuid, text, boolean) to service_role;
 
 -- ---------------------------------------------------------
 -- 3) Bağ koparıldığında / hesap silindiğinde yetkiyi HEMEN düşür
@@ -245,14 +277,21 @@ commit;
 --      select public.arku_plan_at_least('<uuid>', 'pro');   -- false dönmeli
 --
 -- 3) Uygulama ve geri alma:
---      select public.arku_qrtim_apply_plan('<uuid>', 'professional'); -- 'pro'
+--      select public.arku_qrtim_apply_plan('<uuid>', 'professional', true);  -- 'pro'
+--      select public.arku_qrtim_apply_plan('<uuid>', 'corporate', true);     -- 'business'
 --      select plan, current_period_end from public.subscriptions where owner_id='<uuid>';
 --      select public.arku_qrtim_revoke_link('<uuid>');
 --      select plan, current_period_end from public.subscriptions where owner_id='<uuid>'; -- free / null
 --
--- 4) Satın alınmış abonelik EZİLMEMELİ:
+-- 4) `paid` YETKİLİDİR — ad ne olursa olsun:
+--      select public.arku_qrtim_apply_plan('<uuid>', 'professional', false); -- 'free'
+--      select public.arku_qrtim_apply_plan('<uuid>', 'deneme', true);        -- 'pro'
+--    Köprü (paid bilinmiyor): bilinmeyen ad artık ÜCRETSİZ:
+--      select public.arku_qrtim_apply_plan('<uuid>', 'deneme', null);        -- 'free'
+--
+-- 5) Satın alınmış abonelik EZİLMEMELİ:
 --      -- source='direct', status='active' bir satırda
---      select public.arku_qrtim_apply_plan('<uuid>', 'professional');
+--      select public.arku_qrtim_apply_plan('<uuid>', 'professional', true);
 --      -- satır değişmemeli
 --
 -- GERİ ALMA

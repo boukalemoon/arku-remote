@@ -132,17 +132,21 @@ Deno.serve(async (req: Request) => {
     }
 
     const body = await res.json().catch(() => null) as
-      { ok?: boolean; plan?: string | null } | null;
+      { ok?: boolean; plan?: string | null; paid?: boolean } | null;
 
     if (!body?.ok || typeof body.plan !== "string") {
       return json({ status: "unreachable", plan: null });
     }
 
-    // Yetki kararı YALNIZCA `plan` alanına dayanır. `expires_at`'in boş olması
-    // "süresiz" demek DEĞİL; abonelik yoksa QRtım zaten plan: "free" döndürür.
+    // ÜCRETLİ Mİ kararını QRtım veriyor (`paid`), biz plan ADINDAN çıkarmıyoruz:
+    // tanımsız bir kademe onların tarafında `paid: false` döner, yani yeni bir
+    // plan eklendiğinde bizde sessizce bedava lisans dağıtılmaz.
+    // `expires_at`'in boş olması "süresiz" DEMEK DEĞİL; aboneliği olmayan
+    // kullanıcıya QRtım zaten plan: "free", paid: false döndürür.
     const { data: applied, error: applyErr } = await admin.rpc("arku_qrtim_apply_plan", {
       p_user_id: userId,
       p_qrtim_plan: body.plan,
+      p_paid: typeof body.paid === "boolean" ? body.paid : null,
     });
     if (applyErr) return json({ status: "apply_failed", plan: null }, 500);
 

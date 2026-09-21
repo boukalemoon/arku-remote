@@ -110,7 +110,10 @@ Deno.serve(async (req: Request) => {
       qrtim_uid?: string | null;
       qrtim_id: string; email: string; email_verified?: boolean;
       name: string; username: string; phone: string | null;
-      plan?: string | null;
+      // `paid` QRtım'in `partner-plan` cevabında var; arku-link de göndermeye
+      // başlarsa buradan otomatik kullanılır. Yoksa null geçiyoruz ve SQL
+      // tarafındaki köprü bilinen ad listesine düşüyor (bilinmeyen = ücretsiz).
+      plan?: string | null; paid?: boolean;
     };
 
     // 2) Savunma katmanı. QRtım doğrulanmamış hesaba belirteç vermiyor, ama
@@ -247,6 +250,7 @@ Deno.serve(async (req: Request) => {
     await admin.rpc("arku_qrtim_apply_plan", {
       p_user_id: userId,
       p_qrtim_plan: q.plan ?? null,
+      p_paid: typeof q.paid === "boolean" ? q.paid : null,
     });
 
     return json({

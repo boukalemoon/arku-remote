@@ -104,7 +104,8 @@ Deno.serve(async (req: Request) => {
       qrtim_uid?: string | null;
       qrtim_id: string; email: string; email_verified?: boolean;
       name: string; username: string;
-      phone: string | null; plan?: string | null;
+      // `paid` için qrtim-auth'taki nota bakın.
+      phone: string | null; plan?: string | null; paid?: boolean;
     };
 
     // qrtim-auth ile aynı iki şart: doğrulanmamış e-posta bağlanmaz ve
@@ -159,6 +160,7 @@ Deno.serve(async (req: Request) => {
     const { data: arkuPlan } = await admin.rpc("arku_qrtim_apply_plan", {
       p_user_id: userId,
       p_qrtim_plan: q.plan ?? null,
+      p_paid: typeof q.paid === "boolean" ? q.paid : null,
     });
 
     return json({
