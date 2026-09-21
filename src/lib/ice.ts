@@ -69,17 +69,36 @@ function staticTurn(): IceConfig {
   };
 }
 
-/** Edge fonksiyonundan süreli kimlik bilgisi çeker. Başarısızsa null döner. */
-async function fetchFromEdge(): Promise<CachedIce | null> {
-  let accessToken: string | null = null;
+/**
+ * Oturum belirtecini döndürür; oturum yoksa anonim oturum açmayı dener.
+ *
+ * NEDEN (B1, 2026-09-21): `turn-credentials` artık GERÇEK bir oturum istiyor.
+ * Eskiden oturum yokken herkese açık anon anahtarıyla çağrılıyordu ve fonksiyon
+ * çağıranın kimliğini "anon" diye yazıyordu — relay'i oturumu olmayan herkese
+ * açan yol buydu, kapandı. Artık anon anahtarla denemenin faydası yok: istek
+ * 401 döner ve yalnızca bağlantı kurulumunu geciktirir.
+ *
+ * Anonim giriş kapalıysa null döner ve çağıran STUN'a düşer — kısıtlı ağda
+ * bağlantı kurulamaz ama uygulama çalışmaya devam eder.
+ */
+async function sessionToken(): Promise<string | null> {
   try {
     const { data: { session } } = await supabase.auth.getSession();
-    accessToken = session?.access_token ?? null;
-  } catch { /* oturum okunamadı — anon key ile deneriz */ }
+    if (session?.access_token) return session.access_token;
+  } catch { /* okunamadı — aşağıda oturum açmayı deneriz */ }
+  try {
+    await supabase.auth.signInAnonymously();
+    const { data: { session } } = await supabase.auth.getSession();
+    return session?.access_token ?? null;
+  } catch {
+    return null;
+  }
+}
 
-  // Fonksiyon verify_jwt ile korunuyor; oturumsuz istemci anon key ile de
-  // gateway'i geçebilir ama kimliği "anon" olur. İkisi de kabul edilebilir.
-  const bearer = accessToken || ARKU_ANON_KEY;
+/** Edge fonksiyonundan süreli kimlik bilgisi çeker. Başarısızsa null döner. */
+async function fetchFromEdge(): Promise<CachedIce | null> {
+  const bearer = await sessionToken();
+  if (!bearer) return null;
 
   const ctrl = new AbortController();
   // ICE alımı bağlantı kurulumunu bloke eder — 5 sn'den fazla beklemeyiz.

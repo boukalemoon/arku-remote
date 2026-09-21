@@ -12,9 +12,32 @@
 // coturn aynı hesabı kendi sırrıyla yeniden üretip doğrular; kullanıcı
 // veritabanı gerekmez.
 //
-// YETKİ: verify_jwt AÇIK kalmalı (varsayılan). Her Arku istemcisinin bir
-// oturumu vardır (misafirler dahil anonim oturum), dolayısıyla bu kısıt
-// kimseyi dışarıda bırakmaz ama oturumsuz kazıyıcıları engeller.
+// YETKİ (B1 — 2026-09-21'de sertleştirildi)
+//
+// verify_jwt AÇIK kalmalı (varsayılan) AMA TEK BAŞINA YETMEZ: projenin
+// herkese açık anon anahtarı da geçerli bir JWT'dir ve her kuruluma gömülüdür.
+// Gateway onu kabul ettiği için, eskiden oturumu olmayan herkes relay kimliği
+// alabiliyordu ("bir ucun JWT istemesi, kullanıcı istemesi demek değildir").
+//
+// Bu yüzden fonksiyon kendi kapısını kuruyor:
+//   1) `role` = authenticated ve dolu `sub` şartı. Misafirler de anonim
+//      oturumla geldiği için bu kimseyi dışarıda bırakmaz; yalnızca
+//      oturumsuz çağrıyı eler.
+//   2) Belirteç ayrıca auth sunucusuna doğrulatılır. Gateway'e ek olarak:
+//      fonksiyon bir gün --no-verify-jwt ile yayımlanırsa 1. adım tek başına
+//      sahte bir JWT'yi ayırt edemez. Auth sunucusuna ULAŞILAMAZSA istek
+//      reddedilmez — imzayı gateway zaten doğruladı, geçici bir arıza
+//      yüzünden bağlantıları kesmek doğru olmaz.
+//   3) Kişi başı hız sınırı (arku_turn_rate_limit, 20260921_turn_rate_limit).
+//
+// KAPSAM: anonim girişler açık olduğu için saldırgan yeni oturum açıp yeni
+// `sub` alabilir. Kitlesel hesap üretimini durduracak olan Supabase Auth'un
+// IP başına sınırı ve CAPTCHA'sıdır; üçüncü katman coturn kotalarıdır.
+//
+// TTL NEDEN 12 SAAT: kısaltmak cazip görünüyor ama coturn, ayırma (allocation)
+// yenilemelerinde kimliği yeniden doğrular; süresi dolmuş bir kimlik UZUN
+// SÜREN bir oturumu ortasından koparabilir. Gözetimsiz erişimde oturumlar
+// saatlerce sürüyor. Kısaltmadan önce canlıda uzun oturum testi gerekir.
 //
 // ÜÇ ÇALIŞMA MODU
 //
@@ -46,6 +69,7 @@
 //   STUN_URLS                opsiyonel, virgülle ayrılmış STUN listesi
 
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+import { createClient } from "jsr:@supabase/supabase-js@2";
 
 const cors = {
   "Access-Control-Allow-Origin": "*",
@@ -102,24 +126,57 @@ async function hmacSha1Base64(secret: string, message: string): Promise<string> 
   return btoa(bin);
 }
 
-/**
- * Çağıranın kimliğini JWT'nin `sub` alanından okur. İmza doğrulamasını
- * Supabase gateway zaten yapmıştır (verify_jwt); burada yalnızca kimliği
- * TURN kullanıcı adına yazmak için ayrıştırıyoruz. Ayrıştırılamazsa
- * "anon" kullanılır — kimlik bilgisi yine süreli ve geçerlidir.
- */
-function callerId(req: Request): string {
-  const auth = req.headers.get("Authorization") ?? "";
-  const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+/** JWT gövdesini ayrıştırır (imzayı DOĞRULAMAZ — bkz. yukarıdaki YETKİ notu). */
+function decodeClaims(token: string): Record<string, unknown> | null {
   const part = token.split(".")[1];
-  if (!part) return "anon";
+  if (!part) return null;
   try {
     const padded = part.replace(/-/g, "+").replace(/_/g, "/");
-    const claims = JSON.parse(atob(padded + "=".repeat((4 - padded.length % 4) % 4)));
-    return typeof claims.sub === "string" && claims.sub ? claims.sub : "anon";
+    return JSON.parse(atob(padded + "=".repeat((4 - padded.length % 4) % 4)));
   } catch {
-    return "anon";
+    return null;
   }
+}
+
+type AuthResult =
+  | { ok: true; sub: string; token: string }
+  | { ok: false; status: number; error: string };
+
+/**
+ * Çağıranın gerçekten bir KULLANICI olduğunu doğrular ve kimliğini döndürür.
+ * Kimlik, TURN kullanıcı adına yazılır ve hız sınırının anahtarıdır.
+ */
+async function authorize(req: Request): Promise<AuthResult> {
+  const header = req.headers.get("Authorization") ?? "";
+  const token = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
+  if (!token) return { ok: false, status: 401, error: "Oturum gerekli" };
+
+  const claims = decodeClaims(token);
+  if (!claims) return { ok: false, status: 401, error: "Oturum gerekli" };
+
+  // Anon anahtarın rolü "anon"; gerçek oturumlarınki (misafir dahil)
+  // "authenticated". Ayrım tam olarak burada.
+  if (claims.role !== "authenticated") {
+    return { ok: false, status: 401, error: "Bu islem icin oturum gerekli" };
+  }
+  const sub = typeof claims.sub === "string" ? claims.sub.trim() : "";
+  if (!sub) return { ok: false, status: 401, error: "Oturum gerekli" };
+
+  const exp = typeof claims.exp === "number" ? claims.exp : 0;
+  if (exp && exp * 1000 < Date.now()) {
+    return { ok: false, status: 401, error: "Oturumun suresi dolmus" };
+  }
+
+  return { ok: true, sub, token };
+}
+
+/** service_role istemcisi — belirteç doğrulaması ve hız sınırı için. */
+function adminClient() {
+  return createClient(
+    Deno.env.get("SUPABASE_URL")!,
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
+    { auth: { persistSession: false } },
+  );
 }
 
 Deno.serve(async (req: Request) => {
@@ -127,6 +184,42 @@ Deno.serve(async (req: Request) => {
   if (req.method !== "POST" && req.method !== "GET") {
     return json({ error: "Yalnızca GET/POST desteklenir" }, 405);
   }
+
+  // ── KAPI (B1) ──────────────────────────────────────────────────────────────
+  // Mod dallanmasından ÖNCE duruyor. Sabit kimlik (B) ve sağlayıcı (C)
+  // modlarında kimlik bilgisi çağıranın kim olduğuna bakılmadan dönüyor;
+  // kapının orada da geçerli olması gerekiyor. Üstelik B modundaki kimliğin
+  // süresi hiç dolmuyor, C modundaki kullanım doğrudan faturaya yazıyor.
+  const auth = await authorize(req);
+  if (!auth.ok) return json({ error: auth.error }, auth.status);
+
+  const admin = adminClient();
+
+  // Belirteci auth sunucusuna doğrulat. KESİN bir ret gelirse istek düşer;
+  // geçici arızada (ağ/zaman aşımı) devam edilir — imzayı gateway doğruladı,
+  // geçici bir aksaklık yüzünden bağlantıları kesmek doğru olmaz.
+  try {
+    const { data, error } = await admin.auth.getUser(auth.token);
+    if (error) {
+      const status = (error as { status?: number }).status ?? 0;
+      if (status === 401 || status === 403) {
+        return json({ error: "Oturum gecersiz" }, 401);
+      }
+    } else if (data?.user?.id && data.user.id !== auth.sub) {
+      return json({ error: "Oturum gecersiz" }, 401);
+    }
+  } catch { /* geçici arıza — aşağıda devam */ }
+
+  // Kişi başı hız sınırı. Fonksiyon yoksa (migration henüz uygulanmadıysa)
+  // istek ENGELLENMEZ: asıl koruma yukarıdaki kapıdır, sınır onun üstüne gelir.
+  try {
+    const { data: allowed, error } = await admin.rpc("arku_turn_rate_limit", {
+      p_caller: auth.sub,
+    });
+    if (!error && allowed === false) {
+      return json({ error: "Cok fazla istek. Lutfen biraz bekleyin." }, 429);
+    }
+  } catch { /* sınır uygulanamadı — kapı yerinde */ }
 
   const stunUrls = splitList(Deno.env.get("STUN_URLS"));
   const stunServers = (stunUrls.length ? stunUrls : DEFAULT_STUN).map((urls) => ({ urls }));
@@ -214,7 +307,7 @@ Deno.serve(async (req: Request) => {
   const ttl = Number.isFinite(ttlRaw) && ttlRaw > 0 ? Math.floor(ttlRaw) : DEFAULT_TTL;
 
   const expiry = Math.floor(Date.now() / 1000) + ttl;
-  const username = `${expiry}:${callerId(req)}`;
+  const username = `${expiry}:${auth.sub}`;
 
   let credential: string;
   try {
