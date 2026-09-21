@@ -14,7 +14,7 @@ geliştiriciyi yanlış yönlendiriyordu.
 | Web uygulaması | Vercel — `arku-remote` | React/Vite arayüzü (`dist/`) |
 | Tanıtım sitesi | Vercel — `arku-remote-website` (kök: `website/`) | Statik sayfa + `/api/track`, `/api/reviews` |
 | Veritabanı + kimlik | Supabase `jpmbttlxyxrqmpghymbq` | Auth, sinyalleşme, denetim izi, RLS |
-| Edge fonksiyonları | Supabase Functions | `turn-credentials`, `qrtim-auth`, `qrtim-sync` |
+| Edge fonksiyonları | Supabase Functions | `turn-credentials`, `qrtim-auth`, `qrtim-sync`, `qrtim-plan-refresh` |
 | TURN relay | Kendi sunucunuz (coturn, Docker) | Kısıtlı ağlarda bağlantı — bkz. `TURN_SETUP.md` |
 | Masaüstü paketleri | GitHub Releases | Etiket push'unda GitHub Actions üretir |
 
@@ -97,12 +97,19 @@ Diğer üçü bağımsızdır.
 20260921_turn_rate_limit.sql          TURN kimlik bilgisi için kişi başı hız sınırı
 20260921_ilgezdi_device_links.sql     İlgezdi cihazları arası sinyal (aynı hesap)
 20260922_qrtim_link_secrets.sql       QRtım plan tazeleme sırrı (kullanıcı başına)
+20260922_qrtim_plan_expiry.sql        QRtım planına 72 saatlik geçerlilik ufku
 ```
 
-Beşi de bağımsız ve mevcut satırlara dokunmaz. QRtım girişi açılmadan **önce**
-`20260921_qrtim_uid_identity`, `20260921_org_invite_verified_email` ve
-`20260922_qrtim_link_secrets` uygulanmış olmalıdır — sonuncusu olmadan plan
-tazeleme sırrı yakalanamaz ve sır yalnızca bağlama anında dönüyor.
+Altısı da bağımsız ve mevcut satırlara dokunmaz. QRtım girişi açılmadan
+**önce** `20260921_qrtim_uid_identity`, `20260921_org_invite_verified_email`,
+`20260922_qrtim_link_secrets` ve `20260922_qrtim_plan_expiry` uygulanmış
+olmalıdır — sır yalnızca bağlama anında döndüğü için, tablo yoksa bir daha
+yakalanamaz.
+
+`20260922_qrtim_plan_expiry` yalnızca QRtım kaynaklı aboneliklere süre koyar;
+satın alınmış (`direct`) ve elle verilen (`manual`) aboneliklerde
+`current_period_end` NULL kalır ve "süresiz" anlamına gelir. Mevcut ödeme
+akışları etkilenmez.
 `20260921_turn_rate_limit`, `turn-credentials`'ın yeni sürümüyle birlikte gider
 (fonksiyon bu tabloyu çağırır). `20260921_ilgezdi_device_links` yalnızca
 İlgezdi entegrasyonu için gerekir; Arku istemcisi bu tabloları kullanmaz.

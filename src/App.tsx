@@ -58,6 +58,8 @@ const QRTIM_BASE_URL = import.meta.env.VITE_QRTIM_URL ?? 'https://qartim.com';
 // client'ın QRtım anon key'ini tutmasına gerek kalmadı.
 const QRTIM_AUTH_URL = 'https://jpmbttlxyxrqmpghymbq.supabase.co/functions/v1/qrtim-auth';
 const QRTIM_SYNC_URL = 'https://jpmbttlxyxrqmpghymbq.supabase.co/functions/v1/qrtim-sync';
+// Plan tazeleme: QRtım aboneliğinin hâlâ geçerli olduğunu sunucudan doğrular.
+const QRTIM_PLAN_REFRESH_URL = 'https://jpmbttlxyxrqmpghymbq.supabase.co/functions/v1/qrtim-plan-refresh';
 
 const generateDeviceFingerprint = (): string => {
   const nav = window.navigator;
@@ -1233,6 +1235,54 @@ export default function App() {
     try { setEntitlements(await fetchEntitlements()); }
     catch { setEntitlements(FREE_ENTITLEMENTS); }
   };
+
+  // QRtim planini periyodik tazele.
+  //
+  // NEDEN: QRtim kaynakli Arku planinin 72 saatlik bir gecerlilik ufku var
+  // (20260922_qrtim_plan_expiry). Tazelenmezse yetki kendiliginden duser —
+  // bilincli bir guvenli varsayilan: QRtim aboneligi biten kullanici Arku'da
+  // ucretli kalmasin. Musteri magdur olmasin diye uygulama acikken duzenli
+  // tazeliyoruz.
+  //
+  // Sir ISTEMCIDE DEGIL: edge fonksiyonu onu sunucuda okuyor, buradan yalnizca
+  // "benim planimi tazele" deniyor. Yanit 'no_link' / 'unreachable' /
+  // 'unauthorized' olabilir; hicbiri kullaniciyi dusurmez.
+  React.useEffect(() => {
+    if (!QRTIM_ENABLED) return;
+    if (!currentUser || currentUser.is_anonymous) return;
+    let iptal = false;
+
+    const tazele = async () => {
+      try {
+        const { data: { session } } = await supabase.auth.getSession();
+        if (!session || iptal) return;
+        const res = await fetch(QRTIM_PLAN_REFRESH_URL, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            apikey: ARKU_ANON_KEY,
+            Authorization: `Bearer ${session.access_token}`,
+          },
+          body: '{}',
+        });
+        if (iptal) return;
+        const data = await res.json().catch(() => null);
+        // Yalnizca plan gercekten degismis olabilecek durumlarda yeniden oku.
+        if (data?.status === 'ok' || data?.status === 'revoked') {
+          await refreshEntitlements();
+        }
+        if (data?.status === 'revoked') {
+          setQrtimUser(null);
+          addLocalLog('QRtım bağlantısı QRtım tarafında kaldırıldı; plan ücretsiz kademeye alındı.', 'warn');
+        }
+      } catch { /* ag hatasi: ufuk zaten kendiliginden geciyor */ }
+    };
+
+    tazele();
+    const zamanlayici = setInterval(tazele, 6 * 60 * 60 * 1000); // 6 saat
+    return () => { iptal = true; clearInterval(zamanlayici); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentUser?.id]);
 
   const refreshContacts = async () => {
     const [sc, cat] = await Promise.all([listSavedContacts(), listCategories()]);

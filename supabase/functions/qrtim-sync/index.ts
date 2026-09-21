@@ -33,34 +33,10 @@ function json(body: unknown, status = 200): Response {
   });
 }
 
-function mapQrtimPlan(p: string | null): "free" | "pro" | "business" {
-  const v = (p ?? "").toLowerCase();
-  if (["business", "kurumsal", "stk", "enterprise"].includes(v)) return "business";
-  if (v === "" || v === "free") return "free";
-  return "pro";
-}
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-async function grantQrtimSubscription(admin: any, userId: string, qrtimPlan: string | null) {
-  const arkuPlan = mapQrtimPlan(qrtimPlan);
-  const { data: existing } = await admin
-    .from("subscriptions").select("id, source, status")
-    .eq("owner_id", userId).maybeSingle();
-  if (existing && existing.source === "direct" && existing.status === "active") return arkuPlan;
-  if (arkuPlan === "free") {
-    if (existing && existing.source === "qrtim") {
-      await admin.from("subscriptions")
-        .update({ plan: "free", qrtim_plan: qrtimPlan, status: "active" })
-        .eq("owner_id", userId);
-    }
-    return arkuPlan;
-  }
-  await admin.from("subscriptions").upsert({
-    owner_id: userId, plan: arkuPlan, status: "active",
-    source: "qrtim", qrtim_plan: qrtimPlan, seats: arkuPlan === "business" ? 5 : 1,
-  }, { onConflict: "owner_id" });
-  return arkuPlan;
-}
+// NOT: QRtım planını Arku aboneliğine çevirme mantığı buradan TAŞINDI —
+// aynısı qrtim-auth içinde de vardı. Plana artık 72 saatlik bir geçerlilik ufku
+// ekleniyor ve üç çağıranın da aynı kurala uyması gerektiği için tek yere
+// indirildi: public.arku_qrtim_apply_plan (20260922_qrtim_plan_expiry.sql).
 
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
@@ -178,7 +154,12 @@ Deno.serve(async (req: Request) => {
       }, { onConflict: "user_id" });
     }
 
-    const arkuPlan = await grantQrtimSubscription(admin, userId, q.plan ?? null);
+    // Plan ve 72 saatlik ufuk tek yerde uygulanıyor; qrtim-plan-refresh aynı
+    // fonksiyonu çağırarak ufku ileri itiyor.
+    const { data: arkuPlan } = await admin.rpc("arku_qrtim_apply_plan", {
+      p_user_id: userId,
+      p_qrtim_plan: q.plan ?? null,
+    });
 
     return json({
       valid: true,

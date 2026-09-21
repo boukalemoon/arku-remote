@@ -49,56 +49,12 @@ function json(body: unknown, status = 200): Response {
 }
 
 // QRtım planı -> Arku planı. Tüm ücretli planlar ücretsiz Arku verir.
-function mapQrtimPlan(p: string | null): "free" | "pro" | "business" {
-  const v = (p ?? "").toLowerCase();
-  if (["business", "kurumsal", "stk", "enterprise"].includes(v)) return "business";
-  if (v === "" || v === "free") return "free";
-  return "pro"; // student, professional ve diğer tüm ücretli planlar
-}
-
-// QRtım kaynaklı Arku aboneliği ver/güncelle.
-// Kurallar: ücretsiz plan için abonelik oluşturma; satın alınmış (source=direct,
-// active) aboneliği ezme; yalnızca qrtim kaynaklı satırı güncelle.
-//
-// ⚠ BİLİNEN EKSİK: buradaki plan, BAĞLAMA ANININ fotoğrafıdır ve eskir.
-// Yazılan satırın süresi dolmuyor (current_period_end boş kalıyor), plan
-// kontrolü de yalnızca status='active' diyor. Yani QRtım aboneliği biten
-// kullanıcı, tekrar QRtım ile giriş yapmadıkça ücretli kademede kalır.
-// Kapatan iş: QRtım'in `partner-plan` ucuyla periyodik tazeleme — sır artık
-// saklanıyor (20260922_qrtim_link_secrets), tazeleme yolu ve ağ erişilemezken
-// uygulanacak politika Burak'ın kararını bekliyor.
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-async function grantQrtimSubscription(admin: any, userId: string, qrtimPlan: string | null) {
-  const arkuPlan = mapQrtimPlan(qrtimPlan);
-
-  const { data: existing } = await admin
-    .from("subscriptions")
-    .select("id, source, status, plan")
-    .eq("owner_id", userId)
-    .maybeSingle();
-
-  // Satın alınmış aktif aboneliğe dokunma
-  if (existing && existing.source === "direct" && existing.status === "active") return;
-
-  if (arkuPlan === "free") {
-    // QRtım artık ücretsiz: yalnızca qrtim kaynaklı satırı free'ye çek
-    if (existing && existing.source === "qrtim") {
-      await admin.from("subscriptions")
-        .update({ plan: "free", qrtim_plan: qrtimPlan, status: "active" })
-        .eq("owner_id", userId);
-    }
-    return;
-  }
-
-  await admin.from("subscriptions").upsert({
-    owner_id: userId,
-    plan: arkuPlan,
-    status: "active",
-    source: "qrtim",
-    qrtim_plan: qrtimPlan,
-    seats: arkuPlan === "business" ? 5 : 1,
-  }, { onConflict: "owner_id" });
-}
+// NOT: QRtım planını Arku aboneliğine çevirme mantığı buradan TAŞINDI.
+// Aynı mantık qrtim-sync içinde de vardı ve artık plana 72 saatlik bir
+// geçerlilik ufku ekleniyor; üç çağıranın (bu fonksiyon, qrtim-sync,
+// qrtim-plan-refresh) aynı kurala uyması şart olduğu için kopya çoğaltmak yerine
+// tek yere indirildi: public.arku_qrtim_apply_plan
+// (20260922_qrtim_plan_expiry.sql). Süre de orada, tek sabitte duruyor.
 
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
@@ -284,7 +240,14 @@ Deno.serve(async (req: Request) => {
 
     // 8) QRtım aboneliğini Arku'ya senkronla — ücretli QRtım planları ücretsiz
     //    Arku aboneliği verir. Mevcut satın alınmış (direct) abonelik ezilmez.
-    await grantQrtimSubscription(admin, userId, q.plan ?? null);
+    //
+    //    Buradaki plan BAĞLAMA ANININ fotoğrafıdır ve eskir; bu yüzden yazılan
+    //    satır 72 saatlik bir ufukla yazılıyor ve qrtim-plan-refresh onu
+    //    periyodik tazeliyor. Tazelenmezse yetki kendiliğinden düşer.
+    await admin.rpc("arku_qrtim_apply_plan", {
+      p_user_id: userId,
+      p_qrtim_plan: q.plan ?? null,
+    });
 
     return json({
       email: loginEmail,

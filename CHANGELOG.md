@@ -18,6 +18,12 @@ Sürümleme: [Semantic Versioning](https://semver.org/lang/tr/)
   eşzamanlı aktarma kapasitesini tüketebiliyordu. Artık gerçek bir oturum
   gerekiyor ve kişi başına kısa bir istek sınırı var. Misafir olarak
   kullananlar etkilenmez; onların da bir oturumu vardır.
+- **QRtım aboneliği artık düzenli doğrulanıyor.** QRtım planı Arku'ya yalnızca
+  giriş anında yazılıyordu ve bir daha hiç sorgulanmıyordu: QRtım aboneliği
+  biten kullanıcı Arku'da ücretli kademede süresiz kalıyordu. Uygulama planı
+  artık QRtım'den periyodik doğruluyor. QRtım'e ulaşılamazsa son bilinen plan
+  **72 saat** korunuyor; QRtım hesabı silinmiş ya da bağlantı koparılmışsa
+  yetki hemen düşüyor. Satın alınmış Arku abonelikleri bundan etkilenmez.
 - **QRtım hesap eşleştirmesi e-postadan kalıcı kimliğe geçti.** E-posta
   değişebilir, devredilebilir ve aynı adres bir süre sonra başka birine ait
   olabilir. Eşleştirme artık QRtım'in hiç değişmeyen hesap kimliğiyle yapılıyor;
