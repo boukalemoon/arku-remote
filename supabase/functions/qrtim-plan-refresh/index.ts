@@ -134,8 +134,20 @@ Deno.serve(async (req: Request) => {
     const body = await res.json().catch(() => null) as
       { ok?: boolean; plan?: string | null; paid?: boolean } | null;
 
-    if (!body?.ok || typeof body.plan !== "string") {
+    if (!body?.ok) {
       return json({ status: "unreachable", plan: null });
+    }
+
+    // ALAN YOK = CEVAP YOK. QRtım planı hesaplayamadığında `plan` ve `paid`
+    // alanlarını hiç göndermiyor; `paid: false` ise gerçek bir cevap ("ücretli
+    // değil"). İkisini karıştırmak, karşı tarafın veri tutarsızlığı yüzünden
+    // ödeme yapan müşteriyi düşürmek olurdu.
+    //
+    // Bu durumun QRtım tarafındaki karşılığı `partner.plan_unavailable`
+    // denetim kaydı — adı bilerek aynı tuttuk ki iki tarafta da aynı olayı
+    // arayalım.
+    if (typeof body.paid !== "boolean") {
+      return json({ status: "plan_unavailable", plan: null });
     }
 
     // ÜCRETLİ Mİ kararını QRtım veriyor (`paid`), biz plan ADINDAN çıkarmıyoruz:
@@ -145,8 +157,10 @@ Deno.serve(async (req: Request) => {
     // kullanıcıya QRtım zaten plan: "free", paid: false döndürür.
     const { data: applied, error: applyErr } = await admin.rpc("arku_qrtim_apply_plan", {
       p_user_id: userId,
-      p_qrtim_plan: body.plan,
-      p_paid: typeof body.paid === "boolean" ? body.paid : null,
+      // Ad yalnızca hangi ÜCRETLİ kademe olduğunu seçer; gelmezse 'pro'ya,
+      // yani daha düşük kademeye düşer.
+      p_qrtim_plan: typeof body.plan === "string" ? body.plan : null,
+      p_paid: body.paid,
     });
     if (applyErr) return json({ status: "apply_failed", plan: null }, 500);
 
