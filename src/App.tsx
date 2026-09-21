@@ -934,9 +934,18 @@ export default function App() {
 
   // QRtım'den ?qrtim_token=... ile dönüşte tek noktadan işle:
   // oturum açıksa hesabı bağla, açık değilse QRtım ile giriş yap (SSO).
+  //
+  // ÇİFT ÇAĞRI KORUMASI: belirtec TEK KULLANIMLIKTIR, QRtim onu ilk istekte
+  // yakar ve ikinci istek 401 alir. React StrictMode gelistirme modunda
+  // efektleri iki kez calistiriyor; koruma olmadan giris BASARILI oldugu halde
+  // ekrana "QRtim ile giris basarisiz" yaziliyordu. Uctan uca testi tam olarak
+  // bu modda yapacagimiz icin onemli.
+  const qrtimTokenRef = React.useRef(false);
   React.useEffect(() => {
     const qrtimToken = new URLSearchParams(window.location.search).get('qrtim_token');
     if (!qrtimToken) return;
+    if (qrtimTokenRef.current) return;
+    qrtimTokenRef.current = true;
     if (!QRTIM_ENABLED) {
       // Askidayken gelen token islenmez; adres cubugundan da temizlenir.
       window.history.replaceState({}, '', window.location.pathname);

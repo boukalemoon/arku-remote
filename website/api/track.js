@@ -88,7 +88,13 @@ function ipHash(ip) {
 function geoOf(req) {
   const h = req.headers;
   const dec = (s) => { try { return decodeURIComponent(String(s || '')); } catch { return String(s || ''); } };
-  const ipRaw = String(h['x-forwarded-for'] || h['x-real-ip'] || h['x-vercel-forwarded-for'] || '')
+  // BAŞLIK SIRASI ÖNEMLİ. `x-forwarded-for`'un İLK elemanı İSTEMCİNİN yazdığı
+  // değerdir: vekiller gelen başlığı korur ve gerçek adresi SONA ekler. Aşağıdaki
+  // hız sınırı bu değeri anahtar olarak kullandığı için, onu önce okumak sınırı
+  // etkisiz kılabilir (her istekte başka bir "IP" uydurup yeni kova açmak) ve
+  // tekil ziyaretçi sayımını kirletir. Vercel'in kendi başlıkları platformda
+  // üretilir ve istemci tarafından belirlenemez; bu yüzden önce onlar okunur.
+  const ipRaw = String(h['x-vercel-forwarded-for'] || h['x-real-ip'] || h['x-forwarded-for'] || '')
     .split(',')[0].trim();
   return {
     country: String(h['x-vercel-ip-country'] || '').slice(0, 4),
