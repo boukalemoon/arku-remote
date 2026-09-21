@@ -92,15 +92,16 @@ Diğer üçü bağımsızdır.
 ### Sonraki migration'lar
 
 ```
-20260921_qrtim_uid_identity.sql    QRtım eşleştirmesi kalıcı kimliğe (qrtim_uid)
-20260921_turn_rate_limit.sql       TURN kimlik bilgisi için kişi başı hız sınırı
-20260921_ilgezdi_device_links.sql  İlgezdi cihazları arası sinyal (aynı hesap)
+20260921_qrtim_uid_identity.sql       QRtım eşleştirmesi kalıcı kimliğe (qrtim_uid)
+20260921_org_invite_verified_email.sql Kurum daveti yalnızca doğrulanmış e-postaya
+20260921_turn_rate_limit.sql          TURN kimlik bilgisi için kişi başı hız sınırı
+20260921_ilgezdi_device_links.sql     İlgezdi cihazları arası sinyal (aynı hesap)
 ```
 
-Üçü de bağımsız ve mevcut satırlara dokunmaz. İlki QRtım girişi açılmadan
-**önce** uygulanmalıdır. İkincisi `turn-credentials`'ın yeni sürümüyle birlikte
-gider (fonksiyon bu tabloyu çağırır). Üçüncüsü yalnızca İlgezdi entegrasyonu
-için gerekir; Arku istemcisi bu tabloları kullanmaz.
+Dördü de bağımsız ve mevcut satırlara dokunmaz. İlk ikisi QRtım girişi
+açılmadan **önce** uygulanmalıdır. Üçüncüsü `turn-credentials`'ın yeni
+sürümüyle birlikte gider (fonksiyon bu tabloyu çağırır). Dördüncüsü yalnızca
+İlgezdi entegrasyonu için gerekir; Arku istemcisi bu tabloları kullanmaz.
 
 ---
 
