@@ -30,21 +30,24 @@ interface IncomingCall { fromId: string; toId?: string; offerPayload: Record<str
 interface QrtimUser { qrtim_id: string; email: string; name: string; username: string; photo_url: string | null; title: string | null; company: string | null; plan: string; }
 
 /**
- * QRtim SSO ASKIYA ALINDI (2026-09-08).
+ * QRtim SSO KAPALI (2026-09-08'den beri).
  *
- * IKI SEBEP:
+ * IKI SEBEP VARDI:
  *  1) URUN: QRtim dijital kimlik yapisina gecirilmek uzere bastan tasarlaniyor.
  *     Entegrasyon, yeni kimlik modeli netlestikten sonra yeniden kurulacak.
- *  2) GUVENLIK (S1): qrtim-auth, QRtim'in dondurdugu e-postayi dogrulanmis
- *     kabul edip o e-posta icin oturum uretiyordu. QRtim tarafinda e-posta
- *     dogrulamasi zorunlu degilse, saldirgan kurban@firma.com ile QRtim
- *     hesabi acip AYNI e-postaya ait Arku hesabini devralabilirdi.
- *     Cozum QRtim tarafinda `email_verified` iddiasini eklemek; o gelene
- *     kadar yol kapali.
+ *  2) GUVENLIK (S1 — KAPANDI 2026-09-21): qrtim-auth, QRtim'in dondurdugu
+ *     e-postayi dogrulanmis kabul edip o e-posta icin oturum uretiyordu.
+ *     Saldirgan kurban@firma.com ile QRtim hesabi acip AYNI e-postaya ait
+ *     Arku hesabini devralabilirdi.
  *
- * Kod SILINMEDI: bayrak true yapilinca akis geri gelir. Sunucu tarafinda da
- * ayri bir kill switch var (qrtim-auth / QRTIM_SSO_ENABLED) — arayuzu acmak
- * tek basina yetmez, ikisi birden acilmalidir.
+ *     QRtim 10.09.2026'dan beri dogrulanmamis hesaba belirtec vermiyor ve
+ *     `email_verified` donduruyor. Arku tarafinda da kapatildi: qrtim-auth
+ *     bu alani SART KOSUYOR ve hesap eslestirmesi artik e-postayla degil
+ *     kalici kimlikle (qrtim_uid) yapiliyor.
+ *
+ * KALAN TEK ENGEL BIRINCI MADDE — yani urun karari. Acmaya karar verilirse
+ * IKISI BIRDEN acilmalidir: burada QRTIM_ENABLED = true ve sunucuda Supabase
+ * secret QRTIM_SSO_ENABLED=true. Biri tek basina yetmez.
  */
 const QRTIM_ENABLED = false;
 

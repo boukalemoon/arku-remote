@@ -93,6 +93,17 @@ Deno.serve(async (req: Request) => {
     // Çağıran kullanıcıyı JWT'den çöz
     const { data: userData, error: userErr } = await admin.auth.getUser(jwt);
     if (userErr || !userData?.user) return json({ error: "Geçersiz oturum" }, 401);
+
+    // Misafir (anonim) oturum bir hesap DEĞİLDİR: kalıcı değil, sahibi
+    // doğrulanmamış ve saklama görevi 30 gün sonra siliyor
+    // (20260912_retention_cleanup). Böyle bir oturuma QRtım kimliği bağlamak,
+    // benzersizlik kısıtı yüzünden kimliğin asıl hesaba bağlanmasını da
+    // engellerdi.
+    if (userData.user.is_anonymous) {
+      return json({
+        error: "QRtım hesabını bağlamak için önce Arku hesabınızla giriş yapın.",
+      }, 403);
+    }
     const userId = userData.user.id;
 
     // QRtım token'ını doğrula (tek kullanımlık; burada tüketilir)
@@ -110,15 +121,29 @@ Deno.serve(async (req: Request) => {
       return json({ error: vd.error || "Geçersiz QRtım token" }, 401);
     }
     const q = vd.user as {
-      qrtim_id: string; email: string; name: string; username: string;
+      qrtim_uid?: string | null;
+      qrtim_id: string; email: string; email_verified?: boolean;
+      name: string; username: string;
       phone: string | null; plan?: string | null;
     };
 
-    // users satırına QRtım kimliğini yaz (mevcut özelleştirmeyi ezmeden)
+    // qrtim-auth ile aynı iki şart: doğrulanmamış e-posta bağlanmaz ve
+    // eşleştirme kalıcı kimlikle yapılır (docs/qrtim-kimlik-entegrasyonu.md).
+    if (q.email_verified !== true) {
+      return json({ error: "QRtım hesabının e-postası doğrulanmamış." }, 403);
+    }
+    if (!q.qrtim_uid) {
+      return json({ error: "QRtım kalıcı kimliği (qrtim_uid) gelmedi." }, 502);
+    }
+
+    // users satırına QRtım kimliğini yaz (mevcut özelleştirmeyi ezmeden).
+    // users.email'e DOKUNULMAZ: burada kullanıcı zaten kendi Arku hesabında;
+    // QRtım'in e-postası qrtim_email'de durur.
     const { data: existing } = await admin
       .from("users").select("display_name, phone").eq("id", userId).maybeSingle();
     const row: Record<string, unknown> = {
       id: userId,
+      qrtim_uid: q.qrtim_uid,
       qrtim_id: q.qrtim_id,
       qrtim_username: q.username,
       qrtim_name: q.name,
@@ -127,7 +152,16 @@ Deno.serve(async (req: Request) => {
     };
     if (!existing?.display_name && q.name) row.display_name = q.name;
     if (!existing?.phone && q.phone) row.phone = q.phone;
-    await admin.from("users").upsert(row, { onConflict: "id" });
+
+    // HATA YUTULMAZ: bu QRtım hesabı başka bir Arku hesabına bağlıysa
+    // benzersizlik hatası döner ve bağlama BAŞARISIZ sayılır. Yutulursa
+    // kullanıcı "bağlandı" görür, hiçbir şey bağlanmamıştır.
+    const { error: upsertErr } = await admin.from("users").upsert(row, { onConflict: "id" });
+    if (upsertErr) {
+      return json({
+        error: "Bu QRtım hesabı başka bir Arku hesabına bağlı. Önce oradan bağlantıyı kesin.",
+      }, 409);
+    }
 
     const arkuPlan = await grantQrtimSubscription(admin, userId, q.plan ?? null);
 
@@ -139,7 +173,8 @@ Deno.serve(async (req: Request) => {
       },
       arku_plan: arkuPlan,
     });
-  } catch (e) {
-    return json({ error: String(e) }, 500);
+  } catch {
+    // İç hata ayrıntısı dışarı sızmasın.
+    return json({ error: "İşlem tamamlanamadı" }, 500);
   }
 });
