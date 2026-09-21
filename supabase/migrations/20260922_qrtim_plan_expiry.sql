@@ -134,11 +134,16 @@ grant  execute on function public.arku_effective_subscription(uuid) to authentic
 -- üretiliyor ve tanımsız plan `paid: false` dönüyor. Yeni kademe eklendiğinde
 -- ne bizim kod değişiyor ne de haber verilmesi gerekiyor.
 --
--- p_paid NULL ise (henüz `paid` göndermeyen bir çağıran — bağlama anındaki
--- arku-link yanıtı) BİLİNEN ad listesine düşülür ve bilinmeyen ad artık
--- ÜCRETSİZ sayılır. Bu geçici köprü, arku-link de `paid` döndürmeye
--- başlayınca kaldırılabilir; o zamana kadar ilk giriş adla, hemen ardından
--- gelen ilk tazeleme `paid` ile doğruluyor.
+-- p_paid NULL ise ABONELİĞE HİÇ DOKUNULMAZ. "Bilinmiyor", "ücretsiz" demek
+-- değildir: QRtım bir gün bu alanı göndermeyi bırakırsa (regresyon, sürüm
+-- uyuşmazlığı), NULL'ı `false` saymak bütün ödeme yapan müşterileri bir anda
+-- düşürürdü. Dokunmamak ikisini de yapmaz: yanlış yetki vermez, yanlış
+-- yetki almaz. Doğrulama hiç gelmezse 72 saatlik ufuk kendiliğinden geçer ve
+-- kullanıcı zaten ücretsize düşer — yani güvenli varsayılan yine yerinde.
+--
+-- Bu yüzden plan ADINDAN "ücretli mi" çıkarımı KALDIRILDI; artık hiçbir yolda
+-- yok. (Bir süre köprü olarak duruyordu, `arku-link` de `paid` döndürmeye
+-- başlayınca 22.09.2026'da silindi.)
 --
 -- KADEME ADI hâlâ bizde: hangi ÜCRETLİ kademenin Arku business'ına denk
 -- geldiği bizim ürün kararımız. Bilinmeyen ücretli ad `pro` olur — yani
@@ -170,12 +175,19 @@ begin
 
   v_ad := lower(trim(coalesce(p_qrtim_plan, '')));
 
-  -- Ücretli mi? Önce QRtım'in cevabı; yoksa bilinen ad listesi (köprü).
-  v_paid := coalesce(
-    p_paid,
-    v_ad in ('student', 'professional', 'stk', 'business', 'corporate',
-             'kurumsal', 'enterprise')
-  );
+  -- DOĞRULANAMADI: aboneliğe dokunma, mevcut planı olduğu gibi bildir.
+  -- Ufuk ilerletilmediği için doğrulama gelmemeye devam ederse süre kendi
+  -- geçer ve kullanıcı ücretsize düşer.
+  if p_paid is null then
+    return coalesce(
+      (select s.plan from public.subscriptions s
+        where s.owner_id = p_user_id and s.status = 'active'
+          and (s.current_period_end is null or s.current_period_end > now())),
+      'free'
+    );
+  end if;
+
+  v_paid := p_paid;
 
   -- Hangi kademe? Yalnızca ücretliyse sorulur.
   v_plan := case
@@ -286,8 +298,10 @@ commit;
 -- 4) `paid` YETKİLİDİR — ad ne olursa olsun:
 --      select public.arku_qrtim_apply_plan('<uuid>', 'professional', false); -- 'free'
 --      select public.arku_qrtim_apply_plan('<uuid>', 'deneme', true);        -- 'pro'
---    Köprü (paid bilinmiyor): bilinmeyen ad artık ÜCRETSİZ:
---      select public.arku_qrtim_apply_plan('<uuid>', 'deneme', null);        -- 'free'
+--    NULL = doğrulanamadı: satır DEĞİŞMEMELİ, mevcut plan dönmeli.
+--      select plan, current_period_end from public.subscriptions where owner_id='<uuid>';
+--      select public.arku_qrtim_apply_plan('<uuid>', 'professional', null);
+--      -- aynı plan dönmeli ve current_period_end İLERLEMEMİŞ olmalı
 --
 -- 5) Satın alınmış abonelik EZİLMEMELİ:
 --      -- source='direct', status='active' bir satırda
