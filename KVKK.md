@@ -37,7 +37,10 @@ TURN (relay) devreye girdiğinde trafik sunucu üzerinden **aktarılır** ama
 | Sinyalleşme (SDP + ICE adayları) | `public.signals` | Bağlantı kurulumu. **ICE adayları IP adresi içerir** | **5 dakika** (pg_cron) |
 | Bağlantı geçmişi (kim, kime, süre) | `public.connections` | Kullanıcıya gösterilen oturum listesi | Kullanıcı silene kadar |
 | Uygulama günlüğü | `public.logs` | Destek/teşhis | **90 gün** (pg_cron) |
+| TURN istek sayacı (kullanıcı kimliği + zaman) | `public.turn_issue_log` | Kötüye kullanım sınırı; içerik taşımaz | **1 saat** (pg_cron) |
 | Denetim izi (olay, taraflar, rıza sürümü) | `public.session_audit` | İspat — aşağıda ayrı başlık | **Silinmez** (append-only) |
+| Cihaz adı ve platform (İlgezdi) | `public.user_devices` | Hesabın cihazlarını birbirine bağlamak | Kullanıcı cihazı silene kadar |
+| Cihazlar arası sinyal (SDP + ICE) | `public.device_links` | Aynı hesabın cihazları arasında bağlantı kurulumu. **ICE adayları IP adresi içerir** | **5 dakika** (pg_cron) |
 | Ziyaretçi analitiği (ülke, şehir, tarayıcı) | Firestore `arku_events` | Site istatistiği | Nexus tarafında tanımlı |
 | Yorumlar (ad, unvan, metin, iletişim e-postası) | Firestore `arku_reviews` | Site referansları. E-posta **hiç yayımlanmaz** | Nexus tarafında tanımlı |
 
@@ -50,14 +53,21 @@ dosyası · ham IP adresi (analitikte) — hiçbiri sunucuya yazılmaz.
 
 ## 3. IP adresi
 
-IP, bir kişiye bağlanabildiği anda kişisel veridir. İki yerde karşımıza çıkıyor
-ve ikisi de ayrı ele alındı:
+IP, bir kişiye bağlanabildiği anda kişisel veridir. Üç yerde karşımıza çıkıyor
+ve üçü de ayrı ele alındı:
 
 **Sinyalleşme (`signals`).** ICE adayları cihazın yerel ve genel IP adreslerini
 içerir; bu, WebRTC'nin çalışması için zorunludur. Satırlar **5 dakika** sonra
 `pg_cron` ile silinir (`arku-clean-signals`). Politikalar yalnızca bağlantının
 taraflarının okumasına izin verir — üçüncü bir kullanıcı başkasının adaylarını
 göremez.
+
+**Cihazlar arası sinyalleşme (`device_links`).** İlgezdi'de aynı hesabın
+cihazları arasında sekme gönderilirken aynı tür adaylar üretilir. Aynı kural:
+**5 dakika** sonra silinir (`arku-clean-device-links`) ve satırları yalnızca
+hesabın kendisi okuyabilir. Cihaz adı (`user_devices.name`) kullanıcının
+seçtiği serbest metindir ve kişi adı içerebilir; bu yüzden hesap dışına hiç
+verilmez ve cihaz silindiğinde satır da gider.
 
 **Site analitiği (`/api/track`).** Ham IP **saklanmaz**. Yerine günlük dönen,
 gizli tuzlu bir özet yazılır (`ip_hash`): geri çevrilemez, ertesi gün eşleşmez,

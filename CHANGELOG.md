@@ -8,6 +8,33 @@ Sürümleme: [Semantic Versioning](https://semver.org/lang/tr/)
 
 ---
 
+## [Yayımlanmamış]
+
+### Güvenlik
+
+- **Bağlantı aktarıcısı (TURN) artık oturum istiyor.** Kimlik bilgisi,
+  uygulamaya gömülü herkese açık anahtarla da alınabiliyordu: hesabı olmayan
+  biri de aktarıcıyı kullanabiliyor, bant genişliğini ve — asıl önemlisi —
+  eşzamanlı aktarma kapasitesini tüketebiliyordu. Artık gerçek bir oturum
+  gerekiyor ve kişi başına kısa bir istek sınırı var. Misafir olarak
+  kullananlar etkilenmez; onların da bir oturumu vardır.
+- **QRtım hesap eşleştirmesi e-postadan kalıcı kimliğe geçti.** E-posta
+  değişebilir, devredilebilir ve aynı adres bir süre sonra başka birine ait
+  olabilir. Eşleştirme artık QRtım'in hiç değişmeyen hesap kimliğiyle yapılıyor;
+  mevcut hesaplar ilk girişte bir kez, yalnızca **doğrulanmış** e-posta
+  üzerinden taşınıyor. Doğrulanmamış e-postayla hesap bağlanmıyor ve aynı QRtım
+  hesabı iki Arku hesabına bağlanamıyor.
+  QRtım ile giriş **hâlâ kapalı**; açılması ayrı bir karar.
+
+### Eklendi
+
+- **İlgezdi cihazları arası bağlantı için veritabanı temeli.** Aynı hesabın
+  cihazlarının birbirine sinyal yollayabildiği iki yeni tablo. Arama akışına
+  dokunulmadı; Arku istemcisi bu tabloları kullanmıyor. Sinyaller 5 dakika
+  sonra siliniyor (ICE adayları IP adresi içerir).
+
+---
+
 ## [1.5.0] — 2026-09-12
 
 Kod tabanının tamamı (12.966 satır) satır satır denetlendi; çıkan 34 bulgunun

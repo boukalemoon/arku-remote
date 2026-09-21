@@ -89,6 +89,19 @@ sırayla tekrar uygulayın (dosyanın başındaki nota bakın).
 İlki olmadan Kurumsal sekmesi çalışmaz (firma açılır ama üye eklenemez).
 Diğer üçü bağımsızdır.
 
+### Sonraki migration'lar
+
+```
+20260921_qrtim_uid_identity.sql    QRtım eşleştirmesi kalıcı kimliğe (qrtim_uid)
+20260921_turn_rate_limit.sql       TURN kimlik bilgisi için kişi başı hız sınırı
+20260921_ilgezdi_device_links.sql  İlgezdi cihazları arası sinyal (aynı hesap)
+```
+
+Üçü de bağımsız ve mevcut satırlara dokunmaz. İlki QRtım girişi açılmadan
+**önce** uygulanmalıdır. İkincisi `turn-credentials`'ın yeni sürümüyle birlikte
+gider (fonksiyon bu tabloyu çağırır). Üçüncüsü yalnızca İlgezdi entegrasyonu
+için gerekir; Arku istemcisi bu tabloları kullanmaz.
+
 ---
 
 ## 4. Supabase panel ayarları (SQL ile yapılamaz)
@@ -109,8 +122,15 @@ TURN_STATIC_AUTH_SECRET   turnserver.conf'taki static-auth-secret ile AYNI
 TURN_TTL_SECONDS          43200 (opsiyonel)
 STUN_URLS                 kendi coturn'ünüz (opsiyonel — KVKK açısından önerilir,
                           aksi halde Google STUN kullanılır: bkz. KVKK.md §6)
-QRTIM_SSO_ENABLED         TANIMLAMAYIN — QRtım askıya alındı (S1)
+QRTIM_SSO_ENABLED         TANIMLAMAYIN — QRtım girişi kapalı (aşağıya bakın)
 ```
+
+**QRtım girişi (`QRTIM_SSO_ENABLED`).** Güvenlik engeli (S1) 21.09.2026'da
+kapandı: QRtım doğrulanmamış e-postaya belirteç vermiyor, `qrtim-auth` bu alanı
+şart koşuyor ve eşleştirme kalıcı kimlikle (`qrtim_uid`) yapılıyor. Açmak artık
+bir **ürün kararı**. Açılacaksa ikisi birden açılmalıdır — bu secret **ve**
+`src/App.tsx` → `QRTIM_ENABLED = true`; biri tek başına yetmez. Öncesinde
+`20260921_qrtim_uid_identity.sql` uygulanmış olmalıdır.
 
 ---
 

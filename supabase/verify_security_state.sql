@@ -23,7 +23,9 @@ select bolum, ad, detay from (
   where n.nspname = 'public'
     and c.relkind = 'r'
     and c.relname in ('signals','users','connections','logs',
-                      'organizations','organization_members','saved_contacts','contact_categories')
+                      'organizations','organization_members','saved_contacts','contact_categories',
+                      -- 2026-09-21 ile gelenler
+                      'user_devices','device_links','turn_issue_log')
 
   union all
 
@@ -35,7 +37,8 @@ select bolum, ad, detay from (
            || '  |  CHECK=' || coalesce(with_check, '(yok)')
   from pg_policies
   where schemaname = 'public'
-    and tablename in ('signals','users','connections','logs')
+    and tablename in ('signals','users','connections','logs',
+                      'user_devices','device_links')
 
   union all
 
@@ -47,7 +50,8 @@ select bolum, ad, detay from (
          'select=' || case when has_table_privilege('anon', 'public.'||t.tbl, 'select') then 'VAR' else 'yok' end
            || '  insert=' || case when has_table_privilege('anon', 'public.'||t.tbl, 'insert') then 'VAR' else 'yok' end
            || '  delete=' || case when has_table_privilege('anon', 'public.'||t.tbl, 'delete') then 'VAR' else 'yok' end
-  from (values ('signals'),('users'),('connections'),('logs')) as t(tbl)
+  from (values ('signals'),('users'),('connections'),('logs'),
+               ('user_devices'),('device_links'),('turn_issue_log')) as t(tbl)
   where to_regclass('public.' || t.tbl) is not null
 
   union all
@@ -61,7 +65,11 @@ select bolum, ad, detay from (
   from pg_proc p
   join pg_namespace n on n.oid = p.pronamespace
   where n.nspname = 'public'
-    and p.proname in ('resolve_connection_id','arku_effective_subscription')
+    and p.proname in ('resolve_connection_id','arku_effective_subscription',
+                      -- Bunlar API yüzeyinde OLMAMALI: anon ve authenticated
+                      -- sütunlarının ikisi de "hayir" demeli.
+                      'arku_qrtim_resolve_account','arku_turn_rate_limit',
+                      'arku_user_devices_limit','arku_device_links_rate_limit')
 
   union all
 
