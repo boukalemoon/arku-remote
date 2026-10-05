@@ -194,6 +194,8 @@ export class WebRTCManager {
   private sessionNonce = '';
   /** connections satirinin id'si — oturum bitince suresi yazilir. */
   private connectionRowId: string | null = null;
+  /** Oturum surerken 60 sn'de bir last_heartbeat gunceller. */
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private connectedAt: number | null = null;
   /** Giden transfer (tek seferde bir tane). */
   private outgoingFile: { id: string; file: File; cancelled: boolean } | null = null;
@@ -635,6 +637,34 @@ export class WebRTCManager {
     });
   }
 
+  /**
+   * Kalp atisi: oturum hala suruyor demektir.
+   *
+   * NEDEN GEREKLI: faturalanabilir sure coalesce(ended_at, last_heartbeat) -
+   * created_at olarak hesaplaniyor. Istemci cokerse ended_at hic yazilmaz;
+   * atis olmadan sure sonsuza kadar buyurdu. Atisla birlikte sure son atista
+   * donuyor ve kayit dogru kaliyor.
+   *
+   * 60 saniye: raporlama icin yeterince ince, veritabanina yuk olmayacak
+   * kadar seyrek. Hata yok sayilir — tek bir kacan atis sureyi en fazla bir
+   * periyot eksiltir.
+   */
+  private startHeartbeat(): void {
+    this.stopHeartbeat();
+    this.heartbeatTimer = setInterval(() => {
+      const rowId = this.connectionRowId;
+      if (!rowId) { this.stopHeartbeat(); return; }
+      void supabase.from('connections')
+        .update({ last_heartbeat: new Date().toISOString() })
+        .eq('id', rowId)
+        .then(() => { /* kacan atis sorun degil */ });
+    }, 60_000);
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeatTimer) { clearInterval(this.heartbeatTimer); this.heartbeatTimer = null; }
+  }
+
   private async saveConnection() {
     if (this.isReceiver) return;
     try {
@@ -642,16 +672,19 @@ export class WebRTCManager {
       // Misafir (anonim) oturumda bağlantı geçmişi tutulmaz.
       if (!user || user.is_anonymous) return;
       // Satırın id'si tutulur: oturum bitince süre ve bitiş zamanı yazılacak.
+      // created_at ve duration_seconds GONDERILMEZ: ikisini de sunucu koyar
+      // (20261005_service_duration). Faturaya esas olacak bir sureyi olcenin
+      // karsi taraf olmasi dogru degil; kolon duzeyi yetki de zaten yazmaya
+      // izin vermiyor.
       const { data, error } = await supabase.from('connections').insert({
         caller_id: user.id,
         receiver_id: this.peerId,
         status: 'active',
-        duration_seconds: 0,
-        created_at: new Date().toISOString(),
       }).select('id').single();
       if (error) throw new Error(error.message);
       this.connectionRowId = (data as { id: string } | null)?.id ?? null;
       this.connectedAt = Date.now();
+      this.startHeartbeat();
       this.onConnectionSaved?.(this.peerId);
       this.log('Bağlantı geçmişe kaydedildi.', 'sys');
     } catch (err) {
@@ -673,12 +706,13 @@ export class WebRTCManager {
     const startedAt = this.connectedAt;
     this.connectionRowId = null;
     this.connectedAt = null;
+    this.stopHeartbeat();
     if (!rowId) return;
-    const seconds = startedAt ? Math.max(0, Math.round((Date.now() - startedAt) / 1000)) : 0;
+    void startedAt; // sure artik sunucuda hesaplaniyor
+    // duration_seconds YAZILMAZ: trigger onu ended_at ve created_at'ten turetir.
     void supabase.from('connections').update({
       status: 'ended',
       ended_at: new Date().toISOString(),
-      duration_seconds: seconds,
     }).eq('id', rowId).then(({ error }) => {
       if (error) this.log(`Oturum kaydı kapatılamadı: ${error.message}`, 'warn');
     });
