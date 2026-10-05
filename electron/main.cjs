@@ -17,6 +17,22 @@ process.on('unhandledRejection', (err) => {
   console.error('[arku] islenmemis promise reddi:', err);
 });
 
+// ── Linux / Wayland: ekran paylasimi ────────────────────────────────────────
+// Wayland'da X11'deki gibi dogrudan ekran yakalama YOKTUR; yakalama
+// xdg-desktop-portal uzerinden PipeWire ile yapilir. Bu bayrak olmadan
+// desktopCapturer.getSources() Wayland oturumunda bos liste donuyor ya da
+// siyah goruntu veriyor — kullanici "paylasim basladi" goruyor, karsi taraf
+// siyah ekran goruyor ve sebebi hicbir yerde yazmiyor.
+//
+// Ubuntu 22.04 ve Fedora'da GNOME varsayilan olarak Wayland kullaniyor, yani
+// bu Linux kullanicilarinin cogunlugu demek.
+//
+// YALNIZCA Wayland oturumunda aciliyor: X11'de bayragin bir faydasi yok ve
+// calisan bir yolu degistirmenin anlami yok.
+if (process.platform === 'linux' && process.env.XDG_SESSION_TYPE === 'wayland') {
+  app.commandLine.appendSwitch('enable-features', 'WebRTCPipeWireCapturer');
+}
+
 // ── Otomatik güncelleme ──────────────────────────────────────────────────────
 // Windows (NSIS) ve Linux (AppImage): electron-updater ile indirilir, kullanıcı
 // onayıyla kurulur. macOS imzasız uygulamada ve .deb kurulumlarında otomatik
@@ -376,11 +392,53 @@ function rememberCaptureTarget(wcId, source) {
   });
 }
 
+/**
+ * macOS'ta Ekran Kaydi izni verilmis mi? Verilmemisse kullaniciya SOYLE.
+ *
+ * Izin yokken macOS kaynaklari yine listeler ama goruntu siyah gelir.
+ * Uyarmazsak paylasan taraf "paylasim basladi" gorur, karsi taraf siyah ekran
+ * gorur ve kimse sebebini bilmez. Izin programatik olarak istenemez; kullanici
+ * Sistem Ayarlari'ndan vermek zorunda, o yuzden tek yapabilecegimiz anlatmak.
+ *
+ * true donerse paylasima devam edilir.
+ */
+async function ekranKaydiIzniVarMi(parent) {
+  if (process.platform !== 'darwin') return true;
+  let durum = 'granted';
+  try { durum = systemPreferences.getMediaAccessStatus('screen'); } catch { return true; }
+  if (durum === 'granted') return true;
+
+  const { response } = await dialog.showMessageBox(parent, {
+    type: 'warning',
+    title: 'Ekran kaydı izni gerekli',
+    message: 'macOS, ekranınızın paylaşılması için Ekran Kaydı izni ister.',
+    detail: 'İzin verilmeden paylaşım başlasa bile karşı taraf SİYAH EKRAN görür.\n\n'
+      + 'Sistem Ayarları → Gizlilik ve Güvenlik → Ekran Kaydı altında '
+      + 'Arku Remote uygulamasını işaretleyin, sonra uygulamayı yeniden başlatın.\n\n'
+      + 'Not: uygulama imzalı olmadığı için her güncellemeden sonra bu izni '
+      + 'yeniden vermeniz gerekebilir.',
+    buttons: ['Sistem Ayarlarını Aç', 'Yine de dene', 'Vazgeç'],
+    defaultId: 0,
+    cancelId: 2,
+    noLink: true,
+  });
+  if (response === 0) {
+    try {
+      await shell.openExternal(
+        'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture');
+    } catch { /* acilamadi, kullanici elle gider */ }
+    return false;
+  }
+  return response === 1; // "Yine de dene"
+}
+
 function setupDisplayMediaHandler() {
   session.defaultSession.setDisplayMediaRequestHandler(
     (request, callback) => {
       const requester = requesterOf(request);
       const parent = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0];
+      ekranKaydiIzniVarMi(parent).then((izinli) => {
+      if (!izinli) { callback({}); return; }
       pickDisplaySource(parent, !!request.audioRequested).then((choice) => {
         // Seçim yapılmadıysa isteği reddet: boş nesne "kaynak yok" demektir.
         if (!choice) { callback({}); return; }
@@ -391,6 +449,7 @@ function setupDisplayMediaHandler() {
           video: choice.source,
           ...(request.audioRequested && choice.withAudio ? { audio: 'loopback' } : {}),
         });
+      });
       });
     },
     // Kendi seçicimizi kullanıyoruz; platformlar arası davranış aynı olsun.
@@ -419,11 +478,19 @@ function remoteControlStatus() {
     available: !!mod,
     error: nutError,
     platform: process.platform,
-    accessibility: true, // yalnızca macOS'ta anlamlı
+    accessibility: true,   // yalnızca macOS'ta anlamlı
+    screenCapture: true,   // yalnızca macOS'ta anlamlı
   };
   if (process.platform === 'darwin') {
     try { status.accessibility = systemPreferences.isTrustedAccessibilityClient(false); }
     catch { status.accessibility = true; }
+    // macOS'ta EKRAN KAYDI ayri bir izindir ve Erisilebilirlikten bagimsizdir.
+    // Izin yokken desktopCapturer kaynaklari yine listeler ama goruntu SIYAH
+    // gelir: paylasan taraf "paylasim basladi" gorur, karsi taraf siyah ekran
+    // gorur ve sebebi hicbir yerde yazmaz. Durumu okuyup soyleyebilmek icin
+    // ayrica sorguluyoruz.
+    try { status.screenCapture = systemPreferences.getMediaAccessStatus('screen') === 'granted'; }
+    catch { status.screenCapture = true; }
   }
   return status;
 }
