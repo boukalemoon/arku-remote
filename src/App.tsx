@@ -1802,7 +1802,21 @@ export default function App() {
     }
     try {
       const mimeType = pickRecorderMime();
-      const mr = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      // BIT HIZI TAVANI — kayitlar olabildigince kompakt olsun.
+      //
+      // Daha once bit hizi hic verilmiyordu ve tarayicinin varsayilani
+      // kullaniliyordu; 1080p ekran icin bu kolayca 4-8 Mbps'e cikiyor, yani
+      // bir saatlik kayit 2-3 GB. Uzak masaustu goruntusu buyuk olcude SABIT
+      // (pencereler, metin, degismeyen arkaplan), yani VP9 bu icerikte dusuk
+      // bit hizinda bile okunakli kalir. 1,5 Mbps'te bir saatlik kayit ~675 MB
+      // eder ve 2 GB tavanina rahat sigar.
+      //
+      // Yakalama kare hizi zaten ayarlanabilir (captureFrameRate, varsayilan
+      // 15); ikisi birlikte boyutu belirler.
+      const mr = new MediaRecorder(stream, {
+        ...(mimeType ? { mimeType } : {}),
+        videoBitsPerSecond: 1_500_000,
+      });
       recChunksRef.current = [];
       recBytesRef.current = 0;
       mr.ondataavailable = (e) => {
