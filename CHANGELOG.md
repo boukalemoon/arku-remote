@@ -8,7 +8,42 @@ Sürümleme: [Semantic Versioning](https://semver.org/lang/tr/)
 
 ---
 
-## [Yayımlanmamış]
+## [1.6.0] — 2026-10-06
+
+### ⚠ Bu sürüm v1.5.0'ı da içerir
+
+v1.5.0 hiç yayımlanmadı: etiketi oluşturulmadı, paketleri üretilmedi. Kod
+depoda duruyordu ama kimseye ulaşmadı. Bu yüzden **v1.4.0'dan güncellenen
+herkes hem 1.5.0 hem 1.6.0 değişikliklerini birden alır.** Aşağıdaki 1.5.0
+bölümü de bu sürümün parçasıdır.
+
+### Eklendi
+
+- **Hizmet süresi ölçümü.** Bir müşteriye ne kadar süre hizmet verildiği artık
+  sunucu saatiyle ölçülüyor ve müşteri bazında raporlanabiliyor. Oturum
+  sürerken dakikada bir "hâlâ bağlıyım" işareti gidiyor; uygulama çökse bile
+  süre son işarette donuyor, sonsuza kadar saymıyor.
+- **Oturum kaydını müşteriye gönderme.** Kayıt operatörün bilgisayarında
+  kalıyor; müşteri istediğinde tek düğmeyle, iki uç arasındaki şifreli kanaldan
+  doğrudan gönderiliyor. Arku sunucularına uğramıyor.
+
+### Değişti
+
+- **Kayıtlar belirgin biçimde küçüldü.** Kayıt bit hızına tavan kondu; bir
+  saatlik kayıt 2-3 GB yerine ~675 MB.
+
+### Düzeltildi
+
+- **Linux'ta ekran paylaşımı (Wayland).** Ubuntu 22.04 ve Fedora'nın varsayılan
+  oturumunda ekran paylaşımı sessizce boş geliyordu: paylaşan taraf "başladı"
+  görüyor, karşı taraf siyah ekran görüyordu. Düzeltildi.
+- **macOS'ta ekran kaydı izni.** İzin verilmeden paylaşım başladığında karşı
+  taraf siyah ekran görüyor ve sebebi hiçbir yerde yazmıyordu. Artık paylaşım
+  öncesi kontrol ediliyor ve kullanıcı doğru ayar sayfasına yönlendiriliyor.
+
+---
+
+## [Yayımlanmamış — 1.5.0 olarak hazırlanmıştı, yayımlanmadı]
 
 ### Güvenlik
 

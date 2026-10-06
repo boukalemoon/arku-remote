@@ -126,6 +126,27 @@ akışları etkilenmez.
 | Confirm email | Authentication → Providers → Email | AÇIK |
 | `pg_cron` | Database → Extensions | AÇIK (saklama süreleri buna bağlı) |
 
+### Canlı durum — 06.10.2026
+
+Edge fonksiyonlarının tamamı güncel sürümleriyle yayımlandı ve canlıda
+doğrulandı:
+
+| Fonksiyon | Sürüm | Doğrulama |
+|---|---|---|
+| `turn-credentials` | v3 | Anon anahtarla `401`, gerçek misafir oturumuyla TURN dönüyor |
+| `qrtim-auth` | v5 | `503` (kill switch kapalı), `verify_jwt=false` korundu |
+| `qrtim-sync` | v4 | `503` (kill switch kapalı) |
+| `qrtim-plan-refresh` | v1 | Anon anahtarla `401` — oturum şart |
+
+Veritabanı tarafında bekleyen migration kalmadı; `verify_migrations_applied.sql`
+hepsine `UYGULANDI` diyor.
+
+**QRtım girişi hâlâ KAPALI.** Açmak için ikisi birden:
+`QRTIM_SSO_ENABLED=true` (aşağıdaki secret) **ve** `src/App.tsx` →
+`QRTIM_ENABLED = true`. Biri tek başına yetmez; sunucu tarafı açık, istemci
+kapalıysa kullanıcı hiçbir şey göremez, tersi durumda düğme görünür ama
+sunucu 503 döner.
+
 ### Edge fonksiyonu secret'ları
 
 ```
