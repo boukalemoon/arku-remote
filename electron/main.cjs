@@ -6,6 +6,25 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 
+// ── Onay pencereleri açıkken uzaktan girdi durdurulur (denetim O3) ──────────
+// Uzaktan kontrol izni olan karşı taraf, yerel kullanıcıya gösterilen bir
+// onay ya da kaydetme penceresini klavyeyle yanıtlayabiliyordu (ör. "Tüm
+// Ekranı Paylaş" düğmesine Tab + Enter). Bir pencere açıkken gelen tüm
+// fare/klavye olayları atılır ve basılı tuşlar bırakılır.
+let modalDepth = 0;
+async function withModal(fn) {
+  modalDepth++;
+  try {
+    for (const wcId of controlGrants) queueRelease(wcId);
+  } catch { /* bırakma başarısız olsa da pencereyi göster */ }
+  try { return await fn(); } finally { modalDepth--; }
+}
+const guardedDialog = {
+  showMessageBox: (...a) => withModal(() => dialog.showMessageBox(...a)),
+  showSaveDialog: (...a) => withModal(() => dialog.showSaveDialog(...a)),
+  showOpenDialog: (...a) => withModal(() => dialog.showOpenDialog(...a)),
+};
+
 // Ana süreçte yakalanmamış bir hata, Electron'un "A JavaScript error occurred in
 // the main process" penceresini açar ve uygulamayı kullanılamaz hâle getirir.
 // Kök nedenler ayrıca düzeltiliyor; bu ağ yalnızca son çare — tek bir hatanın
@@ -65,7 +84,7 @@ async function checkLatestAndNotify(force = false) {
     if (!latest || latest.localeCompare(current, undefined, { numeric: true }) <= 0) return false;
     updateNotified = true;
     const win = BrowserWindow.getAllWindows()[0];
-    const { response } = await dialog.showMessageBox(win, {
+    const { response } = await guardedDialog.showMessageBox(win, {
       type: 'info',
       title: 'Yeni sürüm mevcut',
       message: `Arku Remote v${latest} yayınlandı (kurulu sürüm: v${current}).`,
@@ -104,7 +123,7 @@ function setupUpdates() {
 
   autoUpdater.on('update-downloaded', async (info) => {
     const win = BrowserWindow.getAllWindows()[0];
-    const { response } = await dialog.showMessageBox(win, {
+    const { response } = await guardedDialog.showMessageBox(win, {
       type: 'info',
       title: 'Güncelleme hazır',
       message: `Arku Remote v${info.version} indirildi.`,
@@ -206,9 +225,10 @@ function createWindow() {
   // protokolüyle almak. O zaman hiçbir uzak sayfa uygulama penceresinde
   // açılmaz. Geçici olarak eski davranış gerekirse şu ikisi eklenir:
   //   'https://qartim.com', 'https://arku-remote.vercel.app'
-  const NAV_ALLOWED_ORIGINS = new Set([
-    'http://localhost:3000',
-  ]);
+  // localhost:3000 yalnızca paketlenmemiş geliştirme sürümünde (denetim O11).
+  // Eskiden üretimde de açıktı: o porttan yayın yapan herhangi bir yerel süreç
+  // electronAPI köprüsünün tamamına erişebiliyordu.
+  const NAV_ALLOWED_ORIGINS = new Set(app.isPackaged ? [] : ['http://localhost:3000']);
 
   const isInternalUrl = (url) => {
     try {
@@ -226,7 +246,8 @@ function createWindow() {
   win.webContents.on('will-navigate', guardNavigation);
   win.webContents.on('will-redirect', guardNavigation);
 
-  const isDev = process.env.NODE_ENV === 'development' || !app.isPackaged;
+  // NODE_ENV paketli uygulamayı geliştirme kipine sokamaz (denetim O11).
+  const isDev = !app.isPackaged;
 if (isDev) {
   win.loadURL('http://localhost:3000');
   win.webContents.openDevTools({ mode: 'detach' });
@@ -411,7 +432,7 @@ async function ekranKaydiIzniVarMi(parent) {
   try { durum = systemPreferences.getMediaAccessStatus('screen'); } catch { return true; }
   if (durum === 'granted') return true;
 
-  const { response } = await dialog.showMessageBox(parent, {
+  const { response } = await guardedDialog.showMessageBox(parent, {
     type: 'warning',
     title: 'Ekran kaydı izni gerekli',
     message: 'macOS, ekranınızın paylaşılması için Ekran Kaydı izni ister.',
@@ -511,7 +532,7 @@ ipcMain.handle('remote-control:request', async (e) => {
 
   const status = remoteControlStatus();
   if (!status.available) {
-    await dialog.showMessageBox(win, {
+    await guardedDialog.showMessageBox(win, {
       type: 'error',
       title: 'Uzaktan kontrol kullanılamıyor',
       message: 'Girdi bileşeni bu kurulumda yüklenemedi.',
@@ -528,7 +549,7 @@ ipcMain.handle('remote-control:request', async (e) => {
   if (process.platform === 'darwin' && !status.accessibility) {
     // Sistem iznini iste (macOS bir kez sorar, sonra Sistem Ayarları'na yönlendirir).
     try { systemPreferences.isTrustedAccessibilityClient(true); } catch { /* yok say */ }
-    await dialog.showMessageBox(win, {
+    await guardedDialog.showMessageBox(win, {
       type: 'warning',
       title: 'Erişilebilirlik izni gerekli',
       message: 'macOS, klavye ve fare kontrolü için Erişilebilirlik izni ister.',
@@ -540,7 +561,7 @@ ipcMain.handle('remote-control:request', async (e) => {
     return { granted: false, pointer: false, reason: 'accessibility' };
   }
 
-  const { response } = await dialog.showMessageBox(win, {
+  const { response } = await guardedDialog.showMessageBox(win, {
     type: 'warning',
     title: 'Uzaktan kontrole izin ver',
     message: 'Karşı tarafın bilgisayarınızı kontrol etmesine izin verilsin mi?',
@@ -644,7 +665,7 @@ ipcMain.handle('recording:get-folder', () => readRecordingFolder());
 
 ipcMain.handle('recording:pick-folder', async (e) => {
   const win = BrowserWindow.fromWebContents(e.sender);
-  const { canceled, filePaths } = await dialog.showOpenDialog(win, {
+  const { canceled, filePaths } = await guardedDialog.showOpenDialog(win, {
     title: 'Kayitlarin saklanacagi klasoru secin',
     properties: ['openDirectory', 'createDirectory'],
   });
@@ -662,7 +683,7 @@ ipcMain.handle('recording:save', async (e, payload) => {
   if (!dir) {
     // Klasor henuz secilmemis: kaydetme penceresiyle sor.
     const win = BrowserWindow.fromWebContents(e.sender);
-    const { canceled, filePaths } = await dialog.showOpenDialog(win, {
+    const { canceled, filePaths } = await guardedDialog.showOpenDialog(win, {
       title: 'Kayitlarin saklanacagi klasoru secin',
       properties: ['openDirectory', 'createDirectory'],
     });
@@ -752,7 +773,7 @@ ipcMain.handle('stream:begin', async (e, opts) => {
   if (kind === 'recording') {
     let dir = readRecordingFolder();
     if (!dir) {
-      const { canceled, filePaths } = await dialog.showOpenDialog(win, {
+      const { canceled, filePaths } = await guardedDialog.showOpenDialog(win, {
         title: 'Kayitlarin saklanacagi klasoru secin',
         properties: ['openDirectory', 'createDirectory'],
       });
@@ -770,7 +791,7 @@ ipcMain.handle('stream:begin', async (e, opts) => {
     // temizlenmezse "../../Startup/x.exe" gibi bir ad varsayılan kaydetme
     // yolunu kullanıcının beklemediği bir yere taşır.
     const safeName = path.basename(String((opts && opts.name) || 'dosya')) || 'dosya';
-    const { canceled, filePath } = await dialog.showSaveDialog(win, {
+    const { canceled, filePath } = await guardedDialog.showSaveDialog(win, {
       title: 'Alinan dosyayi kaydet',
       defaultPath: safeName,
     });
@@ -825,7 +846,7 @@ ipcMain.handle('file:save', async (e, payload) => {
   if (!data) return { ok: false, error: 'Veri yok' };
   const safeName = path.basename(rawName) || 'dosya';
   const win = BrowserWindow.fromWebContents(e.sender);
-  const { canceled, filePath } = await dialog.showSaveDialog(win, {
+  const { canceled, filePath } = await guardedDialog.showSaveDialog(win, {
     title: 'Alinan dosyayi kaydet',
     defaultPath: safeName,
   });
@@ -890,7 +911,7 @@ ipcMain.handle('screens:select', async (e, sourceId) => {
     const current = captureTargets.get(e.sender.id);
     if (current && current.kind === 'window') {
       const win = BrowserWindow.fromWebContents(e.sender);
-      const { response } = await dialog.showMessageBox(win, {
+      const { response } = await guardedDialog.showMessageBox(win, {
         type: 'warning',
         title: 'Tüm ekranı paylaşmaya geçilsin mi?',
         message: 'Karşı taraf, paylaşımı tek pencereden TÜM EKRANA geçirmek istiyor.',
@@ -1138,8 +1159,11 @@ async function applyInput(mod, event, wcId, target) {
       break;
     }
     case 'wheel': {
-      const dy = Math.round((event.dy || 0) / 100);
-      const dx = Math.round((event.dx || 0) / 100);
+      // Tek olayda en fazla 20 adım (denetim D8): sınırsız değer girdi
+      // zincirini dakikalarca kilitleyebiliyordu.
+      const steps = (v) => Math.max(-20, Math.min(20, Math.round((Number(v) || 0) / 100)));
+      const dy = steps(event.dy);
+      const dx = steps(event.dx);
       if (dy > 0) await mouse.scrollDown(dy); else if (dy < 0) await mouse.scrollUp(-dy);
       if (dx > 0) await mouse.scrollRight(dx); else if (dx < 0) await mouse.scrollLeft(-dx);
       break;
@@ -1183,6 +1207,9 @@ ipcMain.on('input-event', (e, event) => {
 
   // Odak kaybında gelen toplu bırakma isteği zincire ayrıca eklenir.
   if (event.type === 'release-all') { queueRelease(e.sender.id); return; }
+
+  // Yerel kullanıcıya bir onay/kaydetme penceresi gösteriliyorsa girdi işlenmez.
+  if (modalDepth > 0) return;
 
   const mod = loadNut();
   if (!mod) return;
