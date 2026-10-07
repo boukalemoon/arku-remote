@@ -263,6 +263,9 @@ if (isDev) {
     closeStreamsOf(wcId);
   };
   win.webContents.on('did-start-navigation', dropGrant);
+  // Renderer çökerse ya da öldürülürse izin de düşer (denetim Y3): aksi halde
+  // yeniden yüklenen sayfa önceki oturumun kontrol iznini devralıyordu.
+  win.webContents.on('render-process-gone', dropGrant);
   win.on('closed', dropGrant);
 
   // Pencere hazır olduğunda göster

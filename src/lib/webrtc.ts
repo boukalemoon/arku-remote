@@ -2,6 +2,7 @@ import { supabase } from './supabase';
 import { getIceConfig, describeIce } from './ice';
 import { fingerprintFromSdp, deriveVerificationCode, derivePasswordProof } from './verify';
 import type { IceConfig } from './ice';
+import { parseChannelText } from './dcschema';
 
 export type ConnectionState = 'idle' | 'connecting' | 'connected' | 'disconnected';
 export type SignalType = 'offer' | 'answer' | 'ice-candidate' | 'hangup';
@@ -226,9 +227,26 @@ export class WebRTCManager {
   /** Baglanti dogrulama kodu (SAS). Baglanti kurulunca bir kez gelir. */
   onVerification?: (code: string | null) => void;
 
+  /**
+   * Acik baglantilarin kaydi. Arayuz cokerse (ErrorBoundary) hepsi buradan
+   * kapatilir; aksi halde ekran paylasimi ve uzaktan kontrol, ekranda
+   * "Kes" dugmesi kalmadan suruyordu (denetim Y3).
+   */
+  private static live = new Set<WebRTCManager>();
+
+  /** Tum oturumlari kapatir. Yalnizca acil durum yolu icin. */
+  static closeAll(): void {
+    for (const m of WebRTCManager.live) {
+      try { void m.disconnect(); } catch { /* yine de digerlerini kapat */ }
+    }
+  }
+
   constructor(myId: string) {
     this.myId = myId;
     this.originalId = myId;
+    // Kapanmis (pc'si olmayan) eski yoneticileri birak; kayit sinirsiz buyumesin.
+    for (const m of WebRTCManager.live) if (!m.pc && !m.dataChannel) WebRTCManager.live.delete(m);
+    WebRTCManager.live.add(this);
   }
 
   /** Verilen kimlik bu oturumun karşı tarafına mı ait? (App seviyesi hangup filtresi) */
@@ -329,20 +347,25 @@ export class WebRTCManager {
       // Ikili veri = aktif gelen dosyanin parcasi. Ayni anda tek transfer
       // oldugu icin parcaya ayrica kimlik yazmaya gerek yok.
       if (e.data instanceof ArrayBuffer) { this.onFileChunk(e.data); return; }
+      // Karsi taraftan gelen her mesaj semadan gecer (denetim Y3/O5). Eskiden
+      // dogrudan ControlMsg'e cevriliyordu: nesne olarak gelen bir dosya adi
+      // React kokunu dusuruyor, sayi olmayan boyut sinir kontrolunu atlatiyordu.
+      const parsed = parseChannelText(e.data);
+      if (!parsed) {
+        this.log('Gecersiz veri kanali mesaji atildi.', 'warn');
+        return;
+      }
       try {
-        const msg = JSON.parse(e.data as string) as Record<string, unknown>;
-        // `k` tasiyan mesajlar kontrol mesajidir; digerleri eski girdi bicimi.
-        if (msg && typeof msg.k === 'string') {
-          const ctl = msg as unknown as ControlMsg;
+        if (parsed.kind === 'control') {
           // Dosya mesajlari manager icinde islenir; arayuze yalnizca
           // onFile olaylari olarak yansir.
-          if (this.handleFileControl(ctl)) return;
-          this.onControl?.(ctl);
+          if (this.handleFileControl(parsed.msg)) return;
+          this.onControl?.(parsed.msg);
           return;
         }
-        this.onInputEvent?.(msg as unknown as InputEventMsg);
-      } catch {
-        // ignore malformed messages
+        this.onInputEvent?.(parsed.msg);
+      } catch (err) {
+        this.log(`Veri kanali mesaji islenemedi: ${String(err)}`, 'warn');
       }
     };
   }
