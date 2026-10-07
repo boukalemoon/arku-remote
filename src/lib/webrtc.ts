@@ -226,6 +226,8 @@ export class WebRTCManager {
   onFileSink?: (buf: ArrayBuffer) => void;
   /** Baglanti dogrulama kodu (SAS). Baglanti kurulunca bir kez gelir. */
   onVerification?: (code: string | null) => void;
+  /** Karşı taraf hangup gönderdi (oturum kesin bitti, ICE kopması değil). */
+  onPeerHangup?: () => void;
 
   /**
    * Acik baglantilarin kaydi. Arayuz cokerse (ErrorBoundary) hepsi buradan
@@ -844,6 +846,9 @@ export class WebRTCManager {
       this.log('Karşı taraf bağlantıyı kesti.', 'warn');
       this.onStateChange?.('disconnected');
       this.close();
+      // Arayüz tam kapatmayı burada yapar: close() eş kimliklerini sildiği
+      // için App seviyesindeki hangup dinleyicisi bu sinyali artık tanımaz.
+      this.onPeerHangup?.();
     }
   }
 

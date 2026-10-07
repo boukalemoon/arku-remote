@@ -110,6 +110,15 @@ const formatId = (raw: string): string => { const c = raw.replace(/\D/g, '').pad
  * upsert sessizce başarısız olur ve kullanıcı ULAŞILAMAZ hâle gelir.
  * arku_ensure_connection_id RPC'si uygulandıktan sonra bu yol kullanılmaz.
  */
+/**
+ * Bu tarayıcı ekranını paylaşabilir mi? (denetim 2026-10-08, saha testi)
+ * Android ve iOS tarayıcıları web sayfalarına getDisplayMedia vermez. Eskiden
+ * böyle bir cihaz gelen çağrıda "Kabul Et"e bastığında ekran seçici hiç
+ * açılmıyor, hata sessizce yutuluyor ve arayan 30 sn zaman aşımını bekliyordu.
+ */
+const CAN_SHARE_SCREEN = typeof navigator !== 'undefined'
+  && typeof navigator.mediaDevices?.getDisplayMedia === 'function';
+
 const generateProfileId = (uid: string): string => formatId(Math.abs(uid.split('').reduce((a, c) => ((a << 5) - a + c.charCodeAt(0)) | 0, 0)).toString());
 
 /**
@@ -711,6 +720,7 @@ export default function App() {
               reason === 'busy' ? 'Karsi taraf mesgul, su an baska bir oturumda.'
               : reason === 'rejected' ? 'Baglanti istegi reddedildi.'
               : reason === 'badpass' ? 'Oturum parolasi hatali. Karsi tarafin ekranindaki parolayi kontrol edin.'
+              : reason === 'unsupported' ? 'Karsi cihaz ekranini paylasamiyor: mobil tarayicilar (Android/iOS) ekran paylasimini desteklemiyor. Paylasan taraf bilgisayar olmali.'
               : 'Karsi taraf baglantıyi kesti.',
               'warn',
             );
@@ -2292,6 +2302,24 @@ export default function App() {
       }
       if (state === 'idle') { if (mediaRecorderRef.current) stopRecording(false); setIsConnecting(false); setRemoteStream(null); setQuality(null); setInputEnabled(false); disableRemoteControl(); }
     };
+    // Karşı taraf kapattığında oturumu TAMAMEN kapat (saha testi 2026-10-08).
+    // Eskiden: yönetici hangup'ı işleyip eş kimliklerini siliyor, App
+    // seviyesindeki hangup dinleyicisi isPeer() ile kimliği tanıyamadığı için
+    // hiçbir şey yapmıyordu; 'disconnected' durumu da webrtc'yi temizlemediği
+    // için oturum paneli açık kalıyor, paylaşan taraf kendisi "Kes"e basana
+    // kadar bağlantı sürüyor görünüyordu.
+    m.onPeerHangup = () => {
+      if (webrtcRef.current !== m) return; // eski bir oturumun gecikmeli sinyali
+      if (connTimeoutRef.current) { clearTimeout(connTimeoutRef.current); connTimeoutRef.current = null; }
+      if (localVideoRef.current?.srcObject) {
+        (localVideoRef.current.srcObject as MediaStream)?.getTracks().forEach(t => { t.onended = null; t.stop(); });
+        localVideoRef.current.srcObject = null;
+      }
+      setWebrtc(null); setRemoteStream(null); setQuality(null); setVerifyCode(null);
+      setPeerLabel(''); setRtcState('idle'); setIsConnecting(false); setInputEnabled(false);
+      disableRemoteControl();
+      addLocalLog('Karsi taraf baglantiyi kesti.', 'warn');
+    };
     m.onRemoteStream = (stream) => {
       setRemoteStream(stream);
       if (remoteVideoRef.current) remoteVideoRef.current.srcObject = stream;
@@ -2413,6 +2441,14 @@ export default function App() {
     // getDisplayMedia must be called while still in the user gesture context
     // (button click). Closing the modal first breaks the gesture chain in Chrome.
     let screen: MediaStream | null = null;
+    if (!CAN_SHARE_SCREEN) {
+      // Ekran seçici bu tarayıcıda yok; çağrıyı açıklamayla kapat ki arayan
+      // 30 sn beklemesin ve sebebi görsün.
+      setIncomingCall(null);
+      addLog('Bu cihaz ekranini paylasamiyor (tarayici desteklemiyor). Istek, sebebiyle birlikte geri cevrildi.', 'error');
+      await sendBusySignal(fromId, toId, 'unsupported');
+      return;
+    }
     try {
       screen = await navigator.mediaDevices.getDisplayMedia({
         // cursor:'always' — operatör imleci görebilmeli. Standart dışı ama
@@ -3598,10 +3634,14 @@ export default function App() {
               <div className="px-4 py-3 border border-steppe-border mb-4 font-mono" style={{ background: 'var(--log-bg)' }}>
                 <span className="text-steppe-gold text-base">{incomingCall.fromId.slice(0,8)}...</span>
               </div>
-              <p className="text-[10px] text-steppe-muted mb-6 leading-relaxed">Kabul edersen ekraninizi secmeniz istenecek ve karsi tarafa paylasilacak.</p>
+              {CAN_SHARE_SCREEN ? (
+                <p className="text-[10px] text-steppe-muted mb-6 leading-relaxed">Kabul edersen ekraninizi secmeniz istenecek ve karsi tarafa paylasilacak.</p>
+              ) : (
+                <p className="text-[10px] text-red-400 mb-6 leading-relaxed">Bu cihazin tarayicisi ekran paylasimini desteklemiyor (Android/iOS). Bu cihazdan baska bir bilgisayara baglanabilirsiniz, ama bu cihazin ekrani paylasilamaz.</p>
+              )}
               <div className="grid grid-cols-2 gap-3">
                 <button onClick={handleRejectCall} className="py-3 border border-red-500/30 text-red-400 text-[10px] uppercase tracking-widest hover:bg-red-500/10 transition-all">Reddet</button>
-                <button onClick={handleAcceptCall} className="btn-primary">Kabul Et</button>
+                <button onClick={handleAcceptCall} className="btn-primary">{CAN_SHARE_SCREEN ? 'Kabul Et' : 'Tamam, bildir'}</button>
               </div>
             </motion.div>
           </div>
