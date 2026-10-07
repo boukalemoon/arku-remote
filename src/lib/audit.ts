@@ -46,14 +46,37 @@ export interface DeviceAttributes {
 
 let deviceCache: DeviceAttributes | null = null;
 
+/**
+ * MAC adresi ve işletim sistemi kullanıcı adı denetim kaydına yazılsın mı?
+ *
+ * VARSAYILAN KAPALI. İkisi de tek başlarına kişisel veridir; toplanmaları
+ * ayrı bir işleme faaliyetidir ve aydınlatma metninde yer almadan
+ * yazılmamalıdır. Kaydın çürütülemezliği hash zincirinden gelir, MAC'ten
+ * değil. Kullanıcı Ayarlar'dan açabilir. Ayrıntı: docs/KVKK.md
+ */
+let collectDeviceIds = false;
+
+/** Arayüzdeki tercihi bildirir (Ayarlar > Denetim İzi). */
+export function setDeviceIdPolicy(enabled: boolean): void {
+  if (enabled !== collectDeviceIds) deviceCache = null; // önbellek politikaya bağlı
+  collectDeviceIds = enabled;
+}
+
 /** Cihaz özniteliklerini bir kez okur (yalnızca masaüstünde anlamlı). */
 export async function getDeviceAttributes(): Promise<DeviceAttributes> {
   if (deviceCache) return deviceCache;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const api = (window as any).electronAPI;
   if (api?.deviceIdentity) {
-    try { deviceCache = (await api.deviceIdentity()) ?? {}; }
-    catch { deviceCache = {}; }
+    try {
+      const raw: DeviceAttributes = (await api.deviceIdentity()) ?? {};
+      // Varsayılanda kimliklendirici alanlar DÜŞÜRÜLÜR. Makine adı ve
+      // platform, oturumu bir cihaza bağlamak için yeterli; MAC ve kullanıcı
+      // adı ise doğrudan kişiye bağlanır.
+      deviceCache = collectDeviceIds
+        ? raw
+        : { hostname: raw.hostname, platform: raw.platform, release: raw.release };
+    } catch { deviceCache = {}; }
   } else {
     // Web sürümü: MAC/hostname erişilemez, yalnızca platform bilgisi.
     deviceCache = { platform: navigator.platform || 'web' };

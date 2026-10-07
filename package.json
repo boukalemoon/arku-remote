@@ -6,7 +6,7 @@
     "email": "info@arku.com.tr"
   },
   "private": true,
-  "version": "1.4.0",
+  "version": "1.6.0",
   "type": "module",
   "main": "electron/main.cjs",
   "repository": {
@@ -84,11 +84,14 @@
     "rebuild:native": "electron-builder install-app-deps",
     "release:sync": "node scripts/release.mjs sync",
     "release:notes": "node scripts/release.mjs notes",
-    "release:check": "node scripts/release.mjs check"
+    "release:check": "node scripts/release.mjs check",
+    "test": "node --experimental-strip-types --no-warnings --test src/lib/*.test.ts tests/electron/*.test.cjs supabase/functions/*/*.test.ts",
+    "test:sql": "bash supabase/tests/run.sh",
+    "test:turn": "bash tests/turn/peer_deny_test.sh"
   },
   "dependencies": {
     "@nut-tree-fork/nut-js": "^4.2.6",
-    "@supabase/supabase-js": "^2.49.0",
+    "@supabase/supabase-js": "^2.116.0",
     "electron-updater": "^6.8.9",
     "lucide-react": "^0.546.0",
     "motion": "^12.23.24",

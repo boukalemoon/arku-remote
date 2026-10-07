@@ -21,6 +21,20 @@ export default defineConfig({
       '@': path.resolve(__dirname, '.'),
     },
   },
+  build: {
+    rollupOptions: {
+      output: {
+        // Tek parça 650 kB idi: React, motion, lucide ve Supabase istemcisi
+        // aynı dosyada. Satıcı kodu ayrı tutulunca uygulama kodu her sürümde
+        // değişse bile tarayıcı satıcı parçalarını önbellekten kullanır.
+        manualChunks: {
+          react: ['react', 'react-dom'],
+          supabase: ['@supabase/supabase-js'],
+          ui: ['motion/react', 'lucide-react'],
+        },
+      },
+    },
+  },
   server: {
     port: 3000,
     host: '0.0.0.0',

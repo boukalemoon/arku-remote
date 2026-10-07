@@ -12,9 +12,35 @@
 // coturn aynı hesabı kendi sırrıyla yeniden üretip doğrular; kullanıcı
 // veritabanı gerekmez.
 //
-// YETKİ: verify_jwt AÇIK kalmalı (varsayılan). Her Arku istemcisinin bir
-// oturumu vardır (misafirler dahil anonim oturum), dolayısıyla bu kısıt
-// kimseyi dışarıda bırakmaz ama oturumsuz kazıyıcıları engeller.
+// YETKİ (B1 — 2026-09-21'de sertleştirildi)
+//
+// verify_jwt AÇIK kalmalı (varsayılan) AMA TEK BAŞINA YETMEZ: projenin
+// herkese açık anon anahtarı da geçerli bir JWT'dir ve her kuruluma gömülüdür.
+// Gateway onu kabul ettiği için, eskiden oturumu olmayan herkes relay kimliği
+// alabiliyordu ("bir ucun JWT istemesi, kullanıcı istemesi demek değildir").
+//
+// Bu yüzden fonksiyon kendi kapısını kuruyor:
+//   1) `role` = authenticated ve dolu `sub` şartı. Misafirler de anonim
+//      oturumla geldiği için bu kimseyi dışarıda bırakmaz; yalnızca
+//      oturumsuz çağrıyı eler.
+//   2) Belirteç ayrıca auth sunucusuna doğrulatılır. Gateway'e ek olarak:
+//      fonksiyon bir gün --no-verify-jwt ile yayımlanırsa 1. adım tek başına
+//      sahte bir JWT'yi ayırt edemez. Auth sunucusuna ULAŞILAMAZSA relay
+//      kimliği VERİLMEZ, yalnızca STUN döner (denetim 2026-10-07, O7; eskiden
+//      istek geçiyordu). Uygulama çalışmaya devam eder.
+//   3) Kişi başı hız sınırı (arku_turn_rate_limit, 20260921_turn_rate_limit).
+//      Sınır uygulanamazsa da yalnızca STUN döner.
+//
+// İş mantığı handler.ts'te; bu dosya yalnızca Deno ve Supabase'i bağlar.
+//
+// KAPSAM: anonim girişler açık olduğu için saldırgan yeni oturum açıp yeni
+// `sub` alabilir. Kitlesel hesap üretimini durduracak olan Supabase Auth'un
+// IP başına sınırı ve CAPTCHA'sıdır; üçüncü katman coturn kotalarıdır.
+//
+// TTL NEDEN 12 SAAT: kısaltmak cazip görünüyor ama coturn, ayırma (allocation)
+// yenilemelerinde kimliği yeniden doğrular; süresi dolmuş bir kimlik UZUN
+// SÜREN bir oturumu ortasından koparabilir. Gözetimsiz erişimde oturumlar
+// saatlerce sürüyor. Kısaltmadan önce canlıda uzun oturum testi gerekir.
 //
 // ÜÇ ÇALIŞMA MODU
 //
@@ -46,192 +72,27 @@
 //   STUN_URLS                opsiyonel, virgülle ayrılmış STUN listesi
 
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+import { createClient } from "jsr:@supabase/supabase-js@2";
+import { handle, type AdminApi } from "./handler.ts";
 
-const cors = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers":
-    "authorization, x-client-info, apikey, content-type",
-  "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
-};
-
-function json(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: {
-      ...cors,
-      "Content-Type": "application/json",
-      // Kimlik bilgisi kullanıcıya özel ve süreli — hiçbir ara katman saklamasın.
-      "Cache-Control": "no-store",
-    },
-  });
-}
-
-const DEFAULT_STUN = [
-  "stun:stun.l.google.com:19302",
-  "stun:stun1.l.google.com:19302",
-];
-
-const DEFAULT_TTL = 43_200; // 12 saat
-
-/** Sağlayıcı yanıtındaki ICE girdisi — şema sağlayıcıya göre değişir, gevşek okunur. */
-interface RTCIceServerLike {
-  urls?: string | string[];
-  username?: string;
-  credential?: string;
-}
-
-/** "a, b ,c" -> ["a","b","c"]; boş girdide boş dizi. */
-function splitList(raw: string | undefined): string[] {
-  if (!raw) return [];
-  return raw.split(",").map((s) => s.trim()).filter(Boolean);
-}
-
-/** base64( HMAC-SHA1(secret, message) ) — coturn'ün beklediği biçim. */
-async function hmacSha1Base64(secret: string, message: string): Promise<string> {
-  const key = await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(secret),
-    { name: "HMAC", hash: "SHA-1" },
-    false,
-    ["sign"],
+function admin(): AdminApi {
+  const client = createClient(
+    Deno.env.get("SUPABASE_URL")!,
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
+    { auth: { persistSession: false } },
   );
-  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(message));
-  // btoa ikili veriyi latin1 string üzerinden bekler.
-  let bin = "";
-  for (const b of new Uint8Array(sig)) bin += String.fromCharCode(b);
-  return btoa(bin);
+  return {
+    async getUser(token) {
+      const { data, error } = await client.auth.getUser(token);
+      if (error) return { id: null, status: (error as { status?: number }).status ?? null };
+      return { id: data?.user?.id ?? null, status: 200 };
+    },
+    async rateLimit(sub) {
+      const { data, error } = await client.rpc("arku_turn_rate_limit", { p_caller: sub });
+      if (error) throw new Error(error.message);
+      return data !== false;
+    },
+  };
 }
 
-/**
- * Çağıranın kimliğini JWT'nin `sub` alanından okur. İmza doğrulamasını
- * Supabase gateway zaten yapmıştır (verify_jwt); burada yalnızca kimliği
- * TURN kullanıcı adına yazmak için ayrıştırıyoruz. Ayrıştırılamazsa
- * "anon" kullanılır — kimlik bilgisi yine süreli ve geçerlidir.
- */
-function callerId(req: Request): string {
-  const auth = req.headers.get("Authorization") ?? "";
-  const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-  const part = token.split(".")[1];
-  if (!part) return "anon";
-  try {
-    const padded = part.replace(/-/g, "+").replace(/_/g, "/");
-    const claims = JSON.parse(atob(padded + "=".repeat((4 - padded.length % 4) % 4)));
-    return typeof claims.sub === "string" && claims.sub ? claims.sub : "anon";
-  } catch {
-    return "anon";
-  }
-}
-
-Deno.serve(async (req: Request) => {
-  if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
-  if (req.method !== "POST" && req.method !== "GET") {
-    return json({ error: "Yalnızca GET/POST desteklenir" }, 405);
-  }
-
-  const stunUrls = splitList(Deno.env.get("STUN_URLS"));
-  const stunServers = (stunUrls.length ? stunUrls : DEFAULT_STUN).map((urls) => ({ urls }));
-
-  const secret = Deno.env.get("TURN_STATIC_AUTH_SECRET");
-  const providerUrl = Deno.env.get("TURN_PROVIDER_URL");
-  const staticUser = Deno.env.get("TURN_USERNAME");
-  const staticPass = Deno.env.get("TURN_CREDENTIAL");
-  const turnUrls = splitList(Deno.env.get("TURN_URLS"));
-
-  const hasSharedSecret = !!secret && turnUrls.length > 0;
-  const hasProvider = !!providerUrl;
-  const hasStaticPair = !!(staticUser && staticPass) && turnUrls.length > 0;
-
-  // TURN yapılandırılmamışsa hata DEĞİL: istemci STUN ile devam eder.
-  // (Kısıtlı ağlarda bağlantı kurulamaz ama uygulama çalışmaya devam eder.)
-  if (!hasSharedSecret && !hasProvider && !hasStaticPair) {
-    return json({
-      iceServers: stunServers,
-      ttl: 0,
-      turn: false,
-      reason:
-        "TURN yapılandırılmamış. Şunlardan biri gerekli: TURN_PROVIDER_URL, " +
-        "veya TURN_URLS ile birlikte TURN_STATIC_AUTH_SECRET, " +
-        "veya TURN_URLS ile birlikte TURN_USERNAME+TURN_CREDENTIAL.",
-    });
-  }
-
-  // ── C modu: sağlayıcı API'sinden kimlik al (Metered vb.) ───────────────────
-  // İsteği sunucu yapar; apiKey içeren adres istemciye asla gitmez.
-  if (!hasSharedSecret && hasProvider) {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 4000);
-    try {
-      const res = await fetch(providerUrl!, { signal: ctrl.signal });
-      if (!res.ok) throw new Error(`sağlayıcı ${res.status}`);
-      const body = await res.json();
-      // Metered düz bir dizi döner; bazı sağlayıcılar { iceServers: [...] }.
-      const list: unknown = Array.isArray(body) ? body : body?.iceServers;
-      if (!Array.isArray(list) || list.length === 0) throw new Error("boş yanıt");
-
-      const servers = list as RTCIceServerLike[];
-      const anyTurn = servers.some((s) => {
-        const u = Array.isArray(s?.urls) ? s.urls.join(",") : String(s?.urls ?? "");
-        return u.includes("turn:") || u.includes("turns:");
-      });
-
-      return json({
-        // Sağlayıcı kendi STUN'unu da döndürür; kendi listemizi yedek olarak ekliyoruz.
-        iceServers: [...servers, ...stunServers],
-        ttl: 3600,
-        turn: anyTurn,
-        mode: "provider",
-      });
-    } catch (e) {
-      // Sağlayıcıya ulaşılamadı: B moduna, o da yoksa STUN'a düş.
-      if (!hasStaticPair) {
-        return json({
-          iceServers: stunServers,
-          ttl: 0,
-          turn: false,
-          reason: `TURN sağlayıcısına ulaşılamadı: ${String(e)}`,
-        });
-      }
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-
-  // ── B modu: elle girilmiş sabit kimlik ─────────────────────────────────────
-  if (!hasSharedSecret) {
-    return json({
-      iceServers: [
-        ...stunServers,
-        { urls: turnUrls, username: staticUser, credential: staticPass },
-      ],
-      ttl: 3600,
-      turn: true,
-      mode: "static",
-    });
-  }
-
-  // ── A modu: coturn paylaşılan sırrından süreli kimlik türet ────────────────
-  const ttlRaw = Number(Deno.env.get("TURN_TTL_SECONDS"));
-  const ttl = Number.isFinite(ttlRaw) && ttlRaw > 0 ? Math.floor(ttlRaw) : DEFAULT_TTL;
-
-  const expiry = Math.floor(Date.now() / 1000) + ttl;
-  const username = `${expiry}:${callerId(req)}`;
-
-  let credential: string;
-  try {
-    credential = await hmacSha1Base64(secret!, username);
-  } catch (e) {
-    return json({ error: `Kimlik bilgisi üretilemedi: ${String(e)}` }, 500);
-  }
-
-  return json({
-    // Sıra önemli: STUN önce (ucuz aday), TURN sonra (relay son çare).
-    iceServers: [
-      ...stunServers,
-      { urls: turnUrls, username, credential },
-    ],
-    username,
-    ttl,
-    turn: true,
-    mode: "hmac",
-  });
-});
+Deno.serve((req: Request) => handle(req, { env: Deno.env, admin }));

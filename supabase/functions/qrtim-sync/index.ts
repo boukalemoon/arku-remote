@@ -33,34 +33,10 @@ function json(body: unknown, status = 200): Response {
   });
 }
 
-function mapQrtimPlan(p: string | null): "free" | "pro" | "business" {
-  const v = (p ?? "").toLowerCase();
-  if (["business", "kurumsal", "stk", "enterprise"].includes(v)) return "business";
-  if (v === "" || v === "free") return "free";
-  return "pro";
-}
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-async function grantQrtimSubscription(admin: any, userId: string, qrtimPlan: string | null) {
-  const arkuPlan = mapQrtimPlan(qrtimPlan);
-  const { data: existing } = await admin
-    .from("subscriptions").select("id, source, status")
-    .eq("owner_id", userId).maybeSingle();
-  if (existing && existing.source === "direct" && existing.status === "active") return arkuPlan;
-  if (arkuPlan === "free") {
-    if (existing && existing.source === "qrtim") {
-      await admin.from("subscriptions")
-        .update({ plan: "free", qrtim_plan: qrtimPlan, status: "active" })
-        .eq("owner_id", userId);
-    }
-    return arkuPlan;
-  }
-  await admin.from("subscriptions").upsert({
-    owner_id: userId, plan: arkuPlan, status: "active",
-    source: "qrtim", qrtim_plan: qrtimPlan, seats: arkuPlan === "business" ? 5 : 1,
-  }, { onConflict: "owner_id" });
-  return arkuPlan;
-}
+// NOT: QRtım planını Arku aboneliğine çevirme mantığı buradan TAŞINDI —
+// aynısı qrtim-auth içinde de vardı. Plana artık 72 saatlik bir geçerlilik ufku
+// ekleniyor ve üç çağıranın da aynı kurala uyması gerektiği için tek yere
+// indirildi: public.arku_qrtim_apply_plan (20260922_qrtim_plan_expiry.sql).
 
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
@@ -93,6 +69,17 @@ Deno.serve(async (req: Request) => {
     // Çağıran kullanıcıyı JWT'den çöz
     const { data: userData, error: userErr } = await admin.auth.getUser(jwt);
     if (userErr || !userData?.user) return json({ error: "Geçersiz oturum" }, 401);
+
+    // Misafir (anonim) oturum bir hesap DEĞİLDİR: kalıcı değil, sahibi
+    // doğrulanmamış ve saklama görevi 30 gün sonra siliyor
+    // (20260912_retention_cleanup). Böyle bir oturuma QRtım kimliği bağlamak,
+    // benzersizlik kısıtı yüzünden kimliğin asıl hesaba bağlanmasını da
+    // engellerdi.
+    if (userData.user.is_anonymous) {
+      return json({
+        error: "QRtım hesabını bağlamak için önce Arku hesabınızla giriş yapın.",
+      }, 403);
+    }
     const userId = userData.user.id;
 
     // QRtım token'ını doğrula (tek kullanımlık; burada tüketilir)
@@ -107,18 +94,37 @@ Deno.serve(async (req: Request) => {
     });
     const vd = await vr.json().catch(() => ({ valid: false }));
     if (!vr.ok || !vd.valid || !vd.user) {
-      return json({ error: vd.error || "Geçersiz QRtım token" }, 401);
+      // `code` makine tarafından okunabilir; istemci mesajı ona göre seçer.
+      return json({
+        error: vd.error || "Geçersiz QRtım token",
+        code: typeof vd.code === "string" ? vd.code : "token_invalid",
+      }, 401);
     }
     const q = vd.user as {
-      qrtim_id: string; email: string; name: string; username: string;
-      phone: string | null; plan?: string | null;
+      qrtim_uid?: string | null;
+      qrtim_id: string; email: string; email_verified?: boolean;
+      name: string; username: string;
+      // `paid` için qrtim-auth'taki nota bakın.
+      phone: string | null; plan?: string | null; paid?: boolean;
     };
 
-    // users satırına QRtım kimliğini yaz (mevcut özelleştirmeyi ezmeden)
+    // qrtim-auth ile aynı iki şart: doğrulanmamış e-posta bağlanmaz ve
+    // eşleştirme kalıcı kimlikle yapılır (docs/qrtim-kimlik-entegrasyonu.md).
+    if (q.email_verified !== true) {
+      return json({ error: "QRtım hesabının e-postası doğrulanmamış." }, 403);
+    }
+    if (!q.qrtim_uid) {
+      return json({ error: "QRtım kalıcı kimliği (qrtim_uid) gelmedi." }, 502);
+    }
+
+    // users satırına QRtım kimliğini yaz (mevcut özelleştirmeyi ezmeden).
+    // users.email'e DOKUNULMAZ: burada kullanıcı zaten kendi Arku hesabında;
+    // QRtım'in e-postası qrtim_email'de durur.
     const { data: existing } = await admin
       .from("users").select("display_name, phone").eq("id", userId).maybeSingle();
     const row: Record<string, unknown> = {
       id: userId,
+      qrtim_uid: q.qrtim_uid,
       qrtim_id: q.qrtim_id,
       qrtim_username: q.username,
       qrtim_name: q.name,
@@ -127,9 +133,35 @@ Deno.serve(async (req: Request) => {
     };
     if (!existing?.display_name && q.name) row.display_name = q.name;
     if (!existing?.phone && q.phone) row.phone = q.phone;
-    await admin.from("users").upsert(row, { onConflict: "id" });
 
-    const arkuPlan = await grantQrtimSubscription(admin, userId, q.plan ?? null);
+    // HATA YUTULMAZ: bu QRtım hesabı başka bir Arku hesabına bağlıysa
+    // benzersizlik hatası döner ve bağlama BAŞARISIZ sayılır. Yutulursa
+    // kullanıcı "bağlandı" görür, hiçbir şey bağlanmamıştır.
+    const { error: upsertErr } = await admin.from("users").upsert(row, { onConflict: "id" });
+    if (upsertErr) {
+      return json({
+        error: "Bu QRtım hesabı başka bir Arku hesabına bağlı. Önce oradan bağlantıyı kesin.",
+      }, 409);
+    }
+
+    // Plan tazeleme sırrını sakla — qrtim-auth ile aynı gerekçe: sır yalnızca
+    // bağlama anında dönüyor, istemciye hiç gitmiyor, politikası olmayan ayrı
+    // tabloda duruyor. Hata bağlamayı düşürmez.
+    if (typeof vd.link_secret === "string" && vd.link_secret) {
+      await admin.from("qrtim_link_secrets").upsert({
+        user_id: userId,
+        qrtim_uid: q.qrtim_uid,
+        link_secret: vd.link_secret,
+      }, { onConflict: "user_id" });
+    }
+
+    // Plan ve 72 saatlik ufuk tek yerde uygulanıyor; qrtim-plan-refresh aynı
+    // fonksiyonu çağırarak ufku ileri itiyor.
+    const { data: arkuPlan } = await admin.rpc("arku_qrtim_apply_plan", {
+      p_user_id: userId,
+      p_qrtim_plan: q.plan ?? null,
+      p_paid: typeof q.paid === "boolean" ? q.paid : null,
+    });
 
     return json({
       valid: true,
@@ -139,7 +171,8 @@ Deno.serve(async (req: Request) => {
       },
       arku_plan: arkuPlan,
     });
-  } catch (e) {
-    return json({ error: String(e) }, 500);
+  } catch {
+    // İç hata ayrıntısı dışarı sızmasın.
+    return json({ error: "İşlem tamamlanamadı" }, 500);
   }
 });

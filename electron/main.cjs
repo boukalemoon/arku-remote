@@ -6,6 +6,25 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 
+// ── Onay pencereleri açıkken uzaktan girdi durdurulur (denetim O3) ──────────
+// Uzaktan kontrol izni olan karşı taraf, yerel kullanıcıya gösterilen bir
+// onay ya da kaydetme penceresini klavyeyle yanıtlayabiliyordu (ör. "Tüm
+// Ekranı Paylaş" düğmesine Tab + Enter). Bir pencere açıkken gelen tüm
+// fare/klavye olayları atılır ve basılı tuşlar bırakılır.
+let modalDepth = 0;
+async function withModal(fn) {
+  modalDepth++;
+  try {
+    for (const wcId of controlGrants) queueRelease(wcId);
+  } catch { /* bırakma başarısız olsa da pencereyi göster */ }
+  try { return await fn(); } finally { modalDepth--; }
+}
+const guardedDialog = {
+  showMessageBox: (...a) => withModal(() => dialog.showMessageBox(...a)),
+  showSaveDialog: (...a) => withModal(() => dialog.showSaveDialog(...a)),
+  showOpenDialog: (...a) => withModal(() => dialog.showOpenDialog(...a)),
+};
+
 // Ana süreçte yakalanmamış bir hata, Electron'un "A JavaScript error occurred in
 // the main process" penceresini açar ve uygulamayı kullanılamaz hâle getirir.
 // Kök nedenler ayrıca düzeltiliyor; bu ağ yalnızca son çare — tek bir hatanın
@@ -16,6 +35,22 @@ process.on('uncaughtException', (err) => {
 process.on('unhandledRejection', (err) => {
   console.error('[arku] islenmemis promise reddi:', err);
 });
+
+// ── Linux / Wayland: ekran paylasimi ────────────────────────────────────────
+// Wayland'da X11'deki gibi dogrudan ekran yakalama YOKTUR; yakalama
+// xdg-desktop-portal uzerinden PipeWire ile yapilir. Bu bayrak olmadan
+// desktopCapturer.getSources() Wayland oturumunda bos liste donuyor ya da
+// siyah goruntu veriyor — kullanici "paylasim basladi" goruyor, karsi taraf
+// siyah ekran goruyor ve sebebi hicbir yerde yazmiyor.
+//
+// Ubuntu 22.04 ve Fedora'da GNOME varsayilan olarak Wayland kullaniyor, yani
+// bu Linux kullanicilarinin cogunlugu demek.
+//
+// YALNIZCA Wayland oturumunda aciliyor: X11'de bayragin bir faydasi yok ve
+// calisan bir yolu degistirmenin anlami yok.
+if (process.platform === 'linux' && process.env.XDG_SESSION_TYPE === 'wayland') {
+  app.commandLine.appendSwitch('enable-features', 'WebRTCPipeWireCapturer');
+}
 
 // ── Otomatik güncelleme ──────────────────────────────────────────────────────
 // Windows (NSIS) ve Linux (AppImage): electron-updater ile indirilir, kullanıcı
@@ -49,7 +84,7 @@ async function checkLatestAndNotify(force = false) {
     if (!latest || latest.localeCompare(current, undefined, { numeric: true }) <= 0) return false;
     updateNotified = true;
     const win = BrowserWindow.getAllWindows()[0];
-    const { response } = await dialog.showMessageBox(win, {
+    const { response } = await guardedDialog.showMessageBox(win, {
       type: 'info',
       title: 'Yeni sürüm mevcut',
       message: `Arku Remote v${latest} yayınlandı (kurulu sürüm: v${current}).`,
@@ -76,16 +111,25 @@ function setupUpdates() {
   try { ({ autoUpdater } = require('electron-updater')); } catch { return; }
 
   autoUpdater.autoDownload = true;
-  autoUpdater.autoInstallOnAppQuit = true; // kullanıcı "Daha Sonra" derse çıkışta kurulur
+  // ÇIKIŞTA SESSİZ KURULUM KAPALI.
+  //
+  // Paketler kod imzalı değil (CI'da CSC_IDENTITY_AUTO_DISCOVERY: false), bu
+  // yüzden electron-updater imza doğrulaması yapamıyor: güvenin tek dayanağı
+  // GitHub release'inin bütünlüğü. Depoya release yazma yetkisi ele geçen
+  // biri, tüm kurulu istemcilere HABERSİZ kod gönderebilirdi. İndirme sürüyor
+  // (kullanıcı beklemesin) ama kurulum artık yalnızca kullanıcı onay
+  // verdiğinde yapılıyor. Authenticode sertifikası eklendiğinde açılabilir.
+  autoUpdater.autoInstallOnAppQuit = false;
 
   autoUpdater.on('update-downloaded', async (info) => {
     const win = BrowserWindow.getAllWindows()[0];
-    const { response } = await dialog.showMessageBox(win, {
+    const { response } = await guardedDialog.showMessageBox(win, {
       type: 'info',
       title: 'Güncelleme hazır',
       message: `Arku Remote v${info.version} indirildi.`,
-      detail: 'Şimdi yeniden başlatarak güncelleyebilirsiniz; ertelerseniz uygulama kapanırken otomatik kurulur.',
-      buttons: ['Şimdi Yeniden Başlat', 'Daha Sonra'],
+      detail: 'Şimdi yeniden başlatıp kurabilirsiniz. Ertelerseniz kurulum '
+        + 'YAPILMAZ; uygulamayı bir sonraki açışınızda yeniden sorulur.',
+      buttons: ['Şimdi Yeniden Başlat ve Kur', 'Daha Sonra'],
       defaultId: 0,
       cancelId: 1,
     });
@@ -170,11 +214,21 @@ function createWindow() {
   // DAHA İYİSİ: QRtım girişini varsayılan tarayıcıda açıp dönüşü özel bir
   // protokolle (arku://) almak. O zaman hiçbir uzak sayfa uygulama
   // penceresinde açılmaz ve köprüye hiç yaklaşamaz. Ayrı bir iş kalemi.
-  const NAV_ALLOWED_ORIGINS = new Set([
-    'http://localhost:3000',
-    'https://qartim.com',
-    'https://arku-remote.vercel.app',
-  ]);
+  //
+  // QRTİM ASKIYA ALINDIĞI İÇİN (src/App.tsx > QRTIM_ENABLED = false) o akışın
+  // gerektirdiği iki uzak köken LİSTEDEN ÇIKARILDI. Preload köprüsünü taşıyan
+  // bir pencerenin gidebileceği her uzak adres gereksiz yüzeydir; kapalı bir
+  // akış için tutulmasına gerek yok.
+  //
+  // QRtım geri açıldığında doğru çözüm bu listeye eklemek DEĞİL, yukarıda
+  // anlatılan yoldur: girişi varsayılan tarayıcıda açıp dönüşü arku://
+  // protokolüyle almak. O zaman hiçbir uzak sayfa uygulama penceresinde
+  // açılmaz. Geçici olarak eski davranış gerekirse şu ikisi eklenir:
+  //   'https://qartim.com', 'https://arku-remote.vercel.app'
+  // localhost:3000 yalnızca paketlenmemiş geliştirme sürümünde (denetim O11).
+  // Eskiden üretimde de açıktı: o porttan yayın yapan herhangi bir yerel süreç
+  // electronAPI köprüsünün tamamına erişebiliyordu.
+  const NAV_ALLOWED_ORIGINS = new Set(app.isPackaged ? [] : ['http://localhost:3000']);
 
   const isInternalUrl = (url) => {
     try {
@@ -192,7 +246,8 @@ function createWindow() {
   win.webContents.on('will-navigate', guardNavigation);
   win.webContents.on('will-redirect', guardNavigation);
 
-  const isDev = process.env.NODE_ENV === 'development' || !app.isPackaged;
+  // NODE_ENV paketli uygulamayı geliştirme kipine sokamaz (denetim O11).
+  const isDev = !app.isPackaged;
 if (isDev) {
   win.loadURL('http://localhost:3000');
   win.webContents.openDevTools({ mode: 'detach' });
@@ -223,8 +278,15 @@ if (isDev) {
     captureTargets.delete(wcId);
     // Basılı kalmış tuşları bırak — pencere kapanırken/gezinirken keyup gelmez.
     queueRelease(wcId);
+    // Açık kalmış diske yazma akışlarını kapat. Kayıt akışı KORUNUR (o ana
+    // kadarki görüntü değerlidir); yarım kalmış dosya transferi SİLİNİR
+    // (bozuk bir dosyayı diskte bırakmak kullanıcıyı yanıltır).
+    closeStreamsOf(wcId);
   };
   win.webContents.on('did-start-navigation', dropGrant);
+  // Renderer çökerse ya da öldürülürse izin de düşer (denetim Y3): aksi halde
+  // yeniden yüklenen sayfa önceki oturumun kontrol iznini devralıyordu.
+  win.webContents.on('render-process-gone', dropGrant);
   win.on('closed', dropGrant);
 
   // Pencere hazır olduğunda göster
@@ -354,11 +416,53 @@ function rememberCaptureTarget(wcId, source) {
   });
 }
 
+/**
+ * macOS'ta Ekran Kaydi izni verilmis mi? Verilmemisse kullaniciya SOYLE.
+ *
+ * Izin yokken macOS kaynaklari yine listeler ama goruntu siyah gelir.
+ * Uyarmazsak paylasan taraf "paylasim basladi" gorur, karsi taraf siyah ekran
+ * gorur ve kimse sebebini bilmez. Izin programatik olarak istenemez; kullanici
+ * Sistem Ayarlari'ndan vermek zorunda, o yuzden tek yapabilecegimiz anlatmak.
+ *
+ * true donerse paylasima devam edilir.
+ */
+async function ekranKaydiIzniVarMi(parent) {
+  if (process.platform !== 'darwin') return true;
+  let durum = 'granted';
+  try { durum = systemPreferences.getMediaAccessStatus('screen'); } catch { return true; }
+  if (durum === 'granted') return true;
+
+  const { response } = await guardedDialog.showMessageBox(parent, {
+    type: 'warning',
+    title: 'Ekran kaydı izni gerekli',
+    message: 'macOS, ekranınızın paylaşılması için Ekran Kaydı izni ister.',
+    detail: 'İzin verilmeden paylaşım başlasa bile karşı taraf SİYAH EKRAN görür.\n\n'
+      + 'Sistem Ayarları → Gizlilik ve Güvenlik → Ekran Kaydı altında '
+      + 'Arku Remote uygulamasını işaretleyin, sonra uygulamayı yeniden başlatın.\n\n'
+      + 'Not: uygulama imzalı olmadığı için her güncellemeden sonra bu izni '
+      + 'yeniden vermeniz gerekebilir.',
+    buttons: ['Sistem Ayarlarını Aç', 'Yine de dene', 'Vazgeç'],
+    defaultId: 0,
+    cancelId: 2,
+    noLink: true,
+  });
+  if (response === 0) {
+    try {
+      await shell.openExternal(
+        'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture');
+    } catch { /* acilamadi, kullanici elle gider */ }
+    return false;
+  }
+  return response === 1; // "Yine de dene"
+}
+
 function setupDisplayMediaHandler() {
   session.defaultSession.setDisplayMediaRequestHandler(
     (request, callback) => {
       const requester = requesterOf(request);
       const parent = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0];
+      ekranKaydiIzniVarMi(parent).then((izinli) => {
+      if (!izinli) { callback({}); return; }
       pickDisplaySource(parent, !!request.audioRequested).then((choice) => {
         // Seçim yapılmadıysa isteği reddet: boş nesne "kaynak yok" demektir.
         if (!choice) { callback({}); return; }
@@ -369,6 +473,7 @@ function setupDisplayMediaHandler() {
           video: choice.source,
           ...(request.audioRequested && choice.withAudio ? { audio: 'loopback' } : {}),
         });
+      });
       });
     },
     // Kendi seçicimizi kullanıyoruz; platformlar arası davranış aynı olsun.
@@ -397,11 +502,19 @@ function remoteControlStatus() {
     available: !!mod,
     error: nutError,
     platform: process.platform,
-    accessibility: true, // yalnızca macOS'ta anlamlı
+    accessibility: true,   // yalnızca macOS'ta anlamlı
+    screenCapture: true,   // yalnızca macOS'ta anlamlı
   };
   if (process.platform === 'darwin') {
     try { status.accessibility = systemPreferences.isTrustedAccessibilityClient(false); }
     catch { status.accessibility = true; }
+    // macOS'ta EKRAN KAYDI ayri bir izindir ve Erisilebilirlikten bagimsizdir.
+    // Izin yokken desktopCapturer kaynaklari yine listeler ama goruntu SIYAH
+    // gelir: paylasan taraf "paylasim basladi" gorur, karsi taraf siyah ekran
+    // gorur ve sebebi hicbir yerde yazmaz. Durumu okuyup soyleyebilmek icin
+    // ayrica sorguluyoruz.
+    try { status.screenCapture = systemPreferences.getMediaAccessStatus('screen') === 'granted'; }
+    catch { status.screenCapture = true; }
   }
   return status;
 }
@@ -419,7 +532,7 @@ ipcMain.handle('remote-control:request', async (e) => {
 
   const status = remoteControlStatus();
   if (!status.available) {
-    await dialog.showMessageBox(win, {
+    await guardedDialog.showMessageBox(win, {
       type: 'error',
       title: 'Uzaktan kontrol kullanılamıyor',
       message: 'Girdi bileşeni bu kurulumda yüklenemedi.',
@@ -436,7 +549,7 @@ ipcMain.handle('remote-control:request', async (e) => {
   if (process.platform === 'darwin' && !status.accessibility) {
     // Sistem iznini iste (macOS bir kez sorar, sonra Sistem Ayarları'na yönlendirir).
     try { systemPreferences.isTrustedAccessibilityClient(true); } catch { /* yok say */ }
-    await dialog.showMessageBox(win, {
+    await guardedDialog.showMessageBox(win, {
       type: 'warning',
       title: 'Erişilebilirlik izni gerekli',
       message: 'macOS, klavye ve fare kontrolü için Erişilebilirlik izni ister.',
@@ -448,7 +561,7 @@ ipcMain.handle('remote-control:request', async (e) => {
     return { granted: false, pointer: false, reason: 'accessibility' };
   }
 
-  const { response } = await dialog.showMessageBox(win, {
+  const { response } = await guardedDialog.showMessageBox(win, {
     type: 'warning',
     title: 'Uzaktan kontrole izin ver',
     message: 'Karşı tarafın bilgisayarınızı kontrol etmesine izin verilsin mi?',
@@ -552,7 +665,7 @@ ipcMain.handle('recording:get-folder', () => readRecordingFolder());
 
 ipcMain.handle('recording:pick-folder', async (e) => {
   const win = BrowserWindow.fromWebContents(e.sender);
-  const { canceled, filePaths } = await dialog.showOpenDialog(win, {
+  const { canceled, filePaths } = await guardedDialog.showOpenDialog(win, {
     title: 'Kayitlarin saklanacagi klasoru secin',
     properties: ['openDirectory', 'createDirectory'],
   });
@@ -570,7 +683,7 @@ ipcMain.handle('recording:save', async (e, payload) => {
   if (!dir) {
     // Klasor henuz secilmemis: kaydetme penceresiyle sor.
     const win = BrowserWindow.fromWebContents(e.sender);
-    const { canceled, filePaths } = await dialog.showOpenDialog(win, {
+    const { canceled, filePaths } = await guardedDialog.showOpenDialog(win, {
       title: 'Kayitlarin saklanacagi klasoru secin',
       properties: ['openDirectory', 'createDirectory'],
     });
@@ -597,6 +710,131 @@ ipcMain.handle('recording:open-folder', async () => {
   return true;
 });
 
+// ── Akış halinde diske yazma (kayıt + gelen dosya) ───────────────────────────
+//
+// NEDEN: hem oturum kaydı hem gelen dosya renderer'da TAMAMEN BELLEKTE
+// birikiyordu. Kayıt için MediaRecorder saniyelik parçalar üretiyor ama
+// hiçbiri durdurulana kadar diske yazılmıyordu: 4 Mbps tavanla bir saatlik
+// kayıt ~1,8 GB RAM demek. Sekme çöktüğünde kayıt TAMAMEN kayboluyordu —
+// delil olarak tutulan bir veri için kabul edilemez. Dosya tarafında da
+// 200 MB'lık üst sınırda aynı anda 4 kopya oluşuyordu (dizi -> Blob ->
+// ArrayBuffer -> IPC kopyası).
+//
+// GÜVENLİK: hedef yolu RENDERER BELİRLEMEZ. Yol ya ana süreçte saklanan
+// kayıt klasöründen ya da kullanıcının kaydetme penceresinden gelir.
+// Akış kimliği onu açan webContents'e bağlıdır; başka bir pencere o akışa
+// yazamaz.
+const streams = new Map(); // id -> { wcId, fh, path, chain, error, bytes }
+let streamSeq = 0;
+
+/** Yazımları sıraya alır: eşzamanlı append çağrıları veriyi karıştırmamalı. */
+function queueWrite(st, buf) {
+  st.chain = st.chain.then(async () => {
+    if (st.error) return;
+    try {
+      await st.fh.write(buf);
+      st.bytes += buf.length;
+    } catch (err) {
+      st.error = String((err && err.message) || err);
+    }
+  });
+}
+
+async function closeStream(id, { discard = false } = {}) {
+  const st = streams.get(id);
+  if (!st) return { ok: false, error: 'Akis bulunamadi' };
+  streams.delete(id);
+  await st.chain.catch(() => {});
+  try { await st.fh.close(); } catch { /* yok say */ }
+  if (discard) {
+    try { await fs.promises.unlink(st.path); } catch { /* yok say */ }
+    return { ok: false, cancelled: true };
+  }
+  if (st.error) return { ok: false, error: st.error, path: st.path };
+  return { ok: true, path: st.path, bytes: st.bytes };
+}
+
+/**
+ * Bir pencereye ait tüm açık akışları kapatır.
+ * Kayıt akışı saklanır, yarım dosya transferi silinir.
+ */
+function closeStreamsOf(wcId) {
+  for (const [id, st] of streams) {
+    if (st.wcId !== wcId) continue;
+    void closeStream(id, { discard: st.kind === 'file' });
+  }
+}
+
+ipcMain.handle('stream:begin', async (e, opts) => {
+  const kind = opts && opts.kind;
+  const win = BrowserWindow.fromWebContents(e.sender);
+  let target = '';
+
+  if (kind === 'recording') {
+    let dir = readRecordingFolder();
+    if (!dir) {
+      const { canceled, filePaths } = await guardedDialog.showOpenDialog(win, {
+        title: 'Kayitlarin saklanacagi klasoru secin',
+        properties: ['openDirectory', 'createDirectory'],
+      });
+      if (canceled || !filePaths || !filePaths[0]) return { cancelled: true };
+      dir = filePaths[0];
+      writeRecordingFolder(dir);
+    }
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    // Dosya adını ana süreç üretir; renderer'dan gelen `peer` yalnızca
+    // etiket olarak kullanılır ve yol ayırıcılarından arındırılır.
+    const peer = String((opts && opts.peer) || 'oturum').replace(/[^A-Za-z0-9._-]/g, '').slice(0, 40);
+    target = path.join(dir, `arku-${stamp}-${peer || 'oturum'}.webm`);
+  } else if (kind === 'file') {
+    // path.basename: dosya adını KARŞI TARAF belirler; yol ayırıcıları
+    // temizlenmezse "../../Startup/x.exe" gibi bir ad varsayılan kaydetme
+    // yolunu kullanıcının beklemediği bir yere taşır.
+    const safeName = path.basename(String((opts && opts.name) || 'dosya')) || 'dosya';
+    const { canceled, filePath } = await guardedDialog.showSaveDialog(win, {
+      title: 'Alinan dosyayi kaydet',
+      defaultPath: safeName,
+    });
+    if (canceled || !filePath) return { cancelled: true };
+    target = filePath;
+  } else {
+    return { error: 'Bilinmeyen akis turu' };
+  }
+
+  try {
+    const fh = await fs.promises.open(target, 'w');
+    const id = `s${++streamSeq}`;
+    streams.set(id, {
+      wcId: e.sender.id, kind, fh, path: target,
+      chain: Promise.resolve(), error: null, bytes: 0,
+    });
+    return { id, path: target, folder: kind === 'recording' ? path.dirname(target) : undefined };
+  } catch (err) {
+    return { error: String((err && err.message) || err) };
+  }
+});
+
+ipcMain.on('stream:write', (e, payload) => {
+  const st = streams.get(payload && payload.id);
+  // Akış kimliği, onu açan pencereye bağlı.
+  if (!st || st.wcId !== e.sender.id) return;
+  const chunk = payload.chunk;
+  if (!chunk) return;
+  queueWrite(st, Buffer.from(chunk));
+});
+
+ipcMain.handle('stream:end', async (e, id) => {
+  const st = streams.get(id);
+  if (!st || st.wcId !== e.sender.id) return { ok: false, error: 'Akis bulunamadi' };
+  return closeStream(id);
+});
+
+ipcMain.handle('stream:abort', async (e, id) => {
+  const st = streams.get(id);
+  if (!st || st.wcId !== e.sender.id) return { ok: false };
+  return closeStream(id, { discard: true });
+});
+
 // -- Alinan dosyayi diske yaz --------------------------------------------------
 // GUVENLIK: dosya adini KARSI TARAF belirler. path.basename ile yol
 // ayiricilari temizlenmezse "../../Startup/x.exe" gibi bir ad varsayilan
@@ -608,7 +846,7 @@ ipcMain.handle('file:save', async (e, payload) => {
   if (!data) return { ok: false, error: 'Veri yok' };
   const safeName = path.basename(rawName) || 'dosya';
   const win = BrowserWindow.fromWebContents(e.sender);
-  const { canceled, filePath } = await dialog.showSaveDialog(win, {
+  const { canceled, filePath } = await guardedDialog.showSaveDialog(win, {
     title: 'Alinan dosyayi kaydet',
     defaultPath: safeName,
   });
@@ -656,6 +894,39 @@ ipcMain.handle('screens:select', async (e, sourceId) => {
     });
     const match = sources.find((x) => x.id === sourceId);
     if (!match) return false;
+
+    // ── RIZA KAPSAMI GENİŞLİYORSA YENİDEN SOR ────────────────────────────
+    // Kullanıcı yalnızca BİR PENCERE paylaştıysa, o pencerenin dışındaki
+    // hiçbir şeye rıza vermemiştir. Kontrol izni "klavyemi kullanabilirsin"
+    // demek; "tüm masaüstümü paylaşabilirsin" demek değil.
+    //
+    // Eskiden bu geçiş sessizce yapılıyordu: karşı taraf kontrol iznini
+    // aldıktan sonra tek bir mesajla tüm ekrana geçebiliyor, yerel kullanıcı
+    // yalnızca bir günlük satırı görüyordu. (replaceTrack yeniden pazarlık
+    // gerektirmediği için ekran seçici penceresi de açılmıyor.)
+    //
+    // Ekran -> ekran geçişi kapsamı GENİŞLETMEZ (kullanıcı zaten bir ekranın
+    // tamamını paylaşıyor) ve çoklu monitör akışının asıl amacı o; orada
+    // sormuyoruz, renderer kullanıcıya günlük satırı düşüyor.
+    const current = captureTargets.get(e.sender.id);
+    if (current && current.kind === 'window') {
+      const win = BrowserWindow.fromWebContents(e.sender);
+      const { response } = await guardedDialog.showMessageBox(win, {
+        type: 'warning',
+        title: 'Tüm ekranı paylaşmaya geçilsin mi?',
+        message: 'Karşı taraf, paylaşımı tek pencereden TÜM EKRANA geçirmek istiyor.',
+        detail: 'Şu anda yalnızca seçtiğiniz pencere görünüyor. Kabul ederseniz '
+          + 'masaüstünüzün tamamı — diğer pencereler, bildirimler ve açık '
+          + 'belgeler dahil — karşı tarafa görünür olur.\n\n'
+          + 'Yalnızca gerçekten gerekliyse ve güvendiğiniz kişiye izin verin.',
+        buttons: ['Tüm Ekranı Paylaş', 'Vazgeç'],
+        defaultId: 1,
+        cancelId: 1,
+        noLink: true,
+      });
+      if (response !== 0) return false;
+    }
+
     rememberCaptureTarget(e.sender.id, match);
     return true;
   } catch { return false; }
@@ -699,6 +970,18 @@ ipcMain.handle('check-for-updates', async () => {
 });
 
 app.whenReady().then(() => {
+  // ── İzinler: varsayılan REDDET ──────────────────────────────────────────
+  // Electron, işleyici tanımlanmazsa izin isteklerini VERİR. Arku kamera,
+  // mikrofon, bildirim, konum veya pano-okuma izni kullanmıyor; ekran
+  // paylaşımı ise aşağıdaki setDisplayMediaRequestHandler ile kendi
+  // seçicimize bağlı. Gezinme muhafızı yabancı içeriğin pencereye girmesini
+  // zaten engelliyor, ama varsayılanı reddetmek bedava bir katman.
+  session.defaultSession.setPermissionRequestHandler((_wc, _permission, callback) => {
+    callback(false);
+  });
+  // İzin SORULMADAN kontrol edilen yol (permission check).
+  session.defaultSession.setPermissionCheckHandler(() => false);
+
   // Oturum genelinde bir kez bağlanır (pencere başına değil).
   setupDisplayMediaHandler();
   createWindow();
@@ -876,8 +1159,11 @@ async function applyInput(mod, event, wcId, target) {
       break;
     }
     case 'wheel': {
-      const dy = Math.round((event.dy || 0) / 100);
-      const dx = Math.round((event.dx || 0) / 100);
+      // Tek olayda en fazla 20 adım (denetim D8): sınırsız değer girdi
+      // zincirini dakikalarca kilitleyebiliyordu.
+      const steps = (v) => Math.max(-20, Math.min(20, Math.round((Number(v) || 0) / 100)));
+      const dy = steps(event.dy);
+      const dx = steps(event.dx);
       if (dy > 0) await mouse.scrollDown(dy); else if (dy < 0) await mouse.scrollUp(-dy);
       if (dx > 0) await mouse.scrollRight(dx); else if (dx < 0) await mouse.scrollLeft(-dx);
       break;
@@ -922,6 +1208,9 @@ ipcMain.on('input-event', (e, event) => {
   // Odak kaybında gelen toplu bırakma isteği zincire ayrıca eklenir.
   if (event.type === 'release-all') { queueRelease(e.sender.id); return; }
 
+  // Yerel kullanıcıya bir onay/kaydetme penceresi gösteriliyorsa girdi işlenmez.
+  if (modalDepth > 0) return;
+
   const mod = loadNut();
   if (!mod) return;
   if (pendingInputs >= MAX_PENDING_INPUTS) return;
@@ -930,7 +1219,9 @@ ipcMain.on('input-event', (e, event) => {
   const target = captureTargets.get(wcId);
   pendingInputs++;
   inputChain = inputChain
-    .then(() => applyInput(mod, event, wcId, target))
+    // Kuyrukta bekleyen olaylar da pencere açıldıysa atılır: kontrol eden taraf
+    // önce kuyruğu doldurup sonra onay penceresini kendisi tetikleyebilir.
+    .then(() => (modalDepth > 0 ? undefined : applyInput(mod, event, wcId, target)))
     .catch(() => {})
     .finally(() => { pendingInputs--; });
 });

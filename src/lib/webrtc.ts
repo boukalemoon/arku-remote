@@ -1,7 +1,8 @@
 import { supabase } from './supabase';
 import { getIceConfig, describeIce } from './ice';
-import { fingerprintFromSdp, deriveVerificationCode } from './verify';
+import { fingerprintFromSdp, deriveVerificationCode, derivePasswordProof } from './verify';
 import type { IceConfig } from './ice';
+import { parseChannelText } from './dcschema';
 
 export type ConnectionState = 'idle' | 'connecting' | 'connected' | 'disconnected';
 export type SignalType = 'offer' | 'answer' | 'ice-candidate' | 'hangup';
@@ -30,8 +31,12 @@ export type InputEventMsg =
 export type RemoteScreen = { id: string; name: string };
 
 export type ControlMsg =
-  | { k: 'clip-req' }                 // "panonu bana gönder"
-  | { k: 'clip-set'; text: string }   // "bunu panona yaz"
+  // "panonu bana gönder". `id`: bu isteğin kimliği; yanıt onu geri taşır.
+  // Olmadan, gelen her clip-set "benim istediğim yanıt" sanılıyordu ve karşı
+  // taraf oturum boyunca istediği an operatörün panosuna yazabiliyordu.
+  | { k: 'clip-req'; id?: string }
+  // "bunu panona yaz". `id` doluysa bir clip-req'in yanıtıdır.
+  | { k: 'clip-set'; text: string; id?: string }
   | { k: 'screens-req' }              // "hangi ekranların var?"
   | { k: 'screens'; list: RemoteScreen[]; current?: string }
   | { k: 'screen-select'; id: string } // "şu ekrana geç"
@@ -62,7 +67,9 @@ export type FileEvent =
   | { t: 'accepted'; id: string }
   | { t: 'rejected'; id: string }
   | { t: 'progress'; id: string; done: number; total: number; dir: 'in' | 'out' }
-  | { t: 'complete'; id: string; name: string; blob: Blob }
+  // blob === null: dosya AKIŞ HALİNDE diske yazıldı (masaüstü), bellekte
+  // birleştirilmedi. Arayüz o durumda kaydetme adımını atlar.
+  | { t: 'complete'; id: string; name: string; blob: Blob | null }
   | { t: 'cancelled'; id: string; reason?: string };
 
 /**
@@ -72,17 +79,31 @@ export type FileEvent =
  * büyüğü bazı tarayıcılarda kanalı kapatır.
  * BUFFER: geri basınç eşiği — bufferedAmount bunu aşarsa gönderim
  * duraklar. Olmadan büyük dosya belleği şişirip kanalı düşürür.
- * MAX_SIZE: alıcı tarafta dosya bellekte birleştirildiği için üst sınır.
+ * MAX_SIZE: üst sınır. Masaüstünde parçalar artık diske akıtıldığı için
+ * bellek kısıtı değil, makul bir kötüye kullanım tavanıdır; WEB sürümünde
+ * ise dosya hâlâ bellekte birleştirildiği için gerçek bir kısıt.
  */
 const FILE_CHUNK_SIZE = 16 * 1024;
 const FILE_BUFFER_THRESHOLD = 1 * 1024 * 1024;
 const MAX_FILE_BYTES = 200 * 1024 * 1024;
+/**
+ * Parcalar BELLEKTE birlestirildiginde gecerli olan daha dar ust sinir.
+ *
+ * Masaustunde parcalar diske akitiliyor (onFileSink), dolayisiyla bellek
+ * kisiti yok ve MAX_FILE_BYTES gecerli. WEB surumunde ise dosya hala
+ * bellekte toplaniyor ve tepe kullanim boyutun birkac katina cikiyor
+ * (parca dizisi -> Blob -> ArrayBuffer). 200 MB'lik bir dosya orada sekmeyi
+ * cokertir; 50 MB guvenli bir tavan.
+ */
+const MAX_FILE_BYTES_MEMORY = 50 * 1024 * 1024;
 
 interface IncomingSignal {
   id?: string;
   type: SignalType;
   from_id: string;
   payload: Record<string, unknown>;
+  /** Arayanın ürettiği oturum kimliği. Yanıtın sahipliğini doğrulamak için şart. */
+  session_id?: string | null;
 }
 
 /**
@@ -139,7 +160,7 @@ export class WebRTCManager {
   private unknownCandidates = new Map<string, RTCIceCandidateInit[]>();
   private channel: ReturnType<typeof supabase.channel> | null = null;
   private cleanupTimer: ReturnType<typeof setInterval> | null = null;
-  private pollingTimer: ReturnType<typeof setInterval> | null = null;
+  private pollingTimer: ReturnType<typeof setTimeout> | null = null;
   private sessionId: string | null = null;
   private pendingRemoteCandidates: RTCIceCandidateInit[] = [];
   private hasSessionIdColumn = true;
@@ -154,15 +175,33 @@ export class WebRTCManager {
   private statsTimer: ReturnType<typeof setInterval> | null = null;
   /** Karşı taraf sessizce gittiğinde bağlantıyı düşüren zamanlayıcı. */
   private disconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  /** Bu oturumun parolasi — dogrulama kodu turetmesine karisir. */
-  private sessionPassword = '';
+  /**
+   * Realtime kanalı SUBSCRIBED durumunda mı?
+   *
+   * Yedek HTTP sorgusunun SIKLIĞINI belirler — varlığını değil. Kanal
+   * "SUBSCRIBED" dediği hâlde olayları SESSİZCE teslim etmemesi mümkündür
+   * (2026-07-27'de yaşanan buydu: politikalar auth.uid()'e bağlandı,
+   * realtime.setAuth çağrılmadığı için postgres_changes olayları hiç gelmedi
+   * ve hiçbir hata da üretilmedi). Bu yüzden polling hiç kapatılmıyor.
+   */
+  private wsHealthy = false;
+  /**
+   * Arayanin urettigi tek kullanimlik oturum nonce'u.
+   *
+   * Offer payload'inda `n` olarak gider, mesru alici yanitinda geri tasir.
+   * Tanimadigimiz bir kimlikten gelen `answer`i benimsemeden once aradigimiz
+   * iki kanittan biri (digeri session_id). Bkz. handleSignal.
+   */
+  private sessionNonce = '';
   /** connections satirinin id'si — oturum bitince suresi yazilir. */
   private connectionRowId: string | null = null;
+  /** Oturum surerken 60 sn'de bir last_heartbeat gunceller. */
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private connectedAt: number | null = null;
   /** Giden transfer (tek seferde bir tane). */
   private outgoingFile: { id: string; file: File; cancelled: boolean } | null = null;
   /** Gelen transfer — ikili parçalar buna aittir (tek seferde bir tane). */
-  private incomingFile: { id: string; name: string; size: number; parts: ArrayBuffer[]; received: number } | null = null;
+  private incomingFile: { id: string; name: string; size: number; parts: ArrayBuffer[] | null; received: number } | null = null;
   /** Bit hızı/kayıp farkını hesaplamak için bir önceki ölçüm. */
   private lastStatsSample: { at: number; bytes: number; lost: number; packets: number } | null = null;
 
@@ -177,12 +216,37 @@ export class WebRTCManager {
   onControl?: (msg: ControlMsg) => void;
   /** Dosya transferi olaylari. */
   onFile?: (ev: FileEvent) => void;
+  /**
+   * Gelen dosya parcalarini BELLEKTE BIRIKTIRMEK YERINE disa akitir.
+   *
+   * Arayuz bunu masaustunde ayarlar (parcalar ana surece gonderilip dosyaya
+   * append edilir). Ayarlanmissa manager hicbir sey biriktirmez ve 'complete'
+   * olayinda blob null gelir. Ayarlanmamissa (web) eski davranis surer.
+   */
+  onFileSink?: (buf: ArrayBuffer) => void;
   /** Baglanti dogrulama kodu (SAS). Baglanti kurulunca bir kez gelir. */
   onVerification?: (code: string | null) => void;
+  /** Karşı taraf hangup gönderdi (oturum kesin bitti, ICE kopması değil). */
+  onPeerHangup?: () => void;
+
+  /**
+   * Acik baglantilarin kaydi. Arayuz cokerse (ErrorBoundary) hepsi buradan
+   * kapatilir; aksi halde ekran paylasimi ve uzaktan kontrol, ekranda
+   * "Kes" dugmesi kalmadan suruyordu (denetim Y3).
+   */
+  private static live = new Set<WebRTCManager>();
+
+  /** Tum oturumlari kapatir. Yalnizca acil durum yolu icin. */
+  static closeAll(): void {
+    for (const m of WebRTCManager.live) {
+      try { void m.disconnect(); } catch { /* yine de digerlerini kapat */ }
+    }
+  }
 
   constructor(myId: string) {
     this.myId = myId;
     this.originalId = myId;
+    WebRTCManager.live.add(this);
   }
 
   /** Verilen kimlik bu oturumun karşı tarafına mı ait? (App seviyesi hangup filtresi) */
@@ -210,6 +274,16 @@ export class WebRTCManager {
 
   private generateSessionId(): string {
     return `${this.myId}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  }
+
+  /**
+   * Tahmin edilemez oturum nonce'u. Math.random YETMEZ — bu deger bir
+   * kimlik dogrulama kaniti olarak kullaniliyor.
+   */
+  private static generateNonce(): string {
+    const b = new Uint8Array(16);
+    globalThis.crypto.getRandomValues(b);
+    return Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
   }
 
   private async send(type: SignalType, payload: unknown) {
@@ -273,20 +347,25 @@ export class WebRTCManager {
       // Ikili veri = aktif gelen dosyanin parcasi. Ayni anda tek transfer
       // oldugu icin parcaya ayrica kimlik yazmaya gerek yok.
       if (e.data instanceof ArrayBuffer) { this.onFileChunk(e.data); return; }
+      // Karsi taraftan gelen her mesaj semadan gecer (denetim Y3/O5). Eskiden
+      // dogrudan ControlMsg'e cevriliyordu: nesne olarak gelen bir dosya adi
+      // React kokunu dusuruyor, sayi olmayan boyut sinir kontrolunu atlatiyordu.
+      const parsed = parseChannelText(e.data);
+      if (!parsed) {
+        this.log('Gecersiz veri kanali mesaji atildi.', 'warn');
+        return;
+      }
       try {
-        const msg = JSON.parse(e.data as string) as Record<string, unknown>;
-        // `k` tasiyan mesajlar kontrol mesajidir; digerleri eski girdi bicimi.
-        if (msg && typeof msg.k === 'string') {
-          const ctl = msg as unknown as ControlMsg;
+        if (parsed.kind === 'control') {
           // Dosya mesajlari manager icinde islenir; arayuze yalnizca
           // onFile olaylari olarak yansir.
-          if (this.handleFileControl(ctl)) return;
-          this.onControl?.(ctl);
+          if (this.handleFileControl(parsed.msg)) return;
+          this.onControl?.(parsed.msg);
           return;
         }
-        this.onInputEvent?.(msg as unknown as InputEventMsg);
-      } catch {
-        // ignore malformed messages
+        this.onInputEvent?.(parsed.msg);
+      } catch (err) {
+        this.log(`Veri kanali mesaji islenemedi: ${String(err)}`, 'warn');
       }
     };
   }
@@ -437,7 +516,7 @@ export class WebRTCManager {
     const local = fingerprintFromSdp(this.pc?.localDescription?.sdp);
     const remote = fingerprintFromSdp(this.pc?.remoteDescription?.sdp);
     if (!local || !remote) { this.onVerification?.(null); return; }
-    const code = await deriveVerificationCode(local, remote, this.sessionPassword);
+    const code = await deriveVerificationCode(local, remote);
     this.onVerification?.(code);
     if (code) this.log(`Bağlantı doğrulama kodu: ${code}`, 'sys');
   }
@@ -581,6 +660,34 @@ export class WebRTCManager {
     });
   }
 
+  /**
+   * Kalp atisi: oturum hala suruyor demektir.
+   *
+   * NEDEN GEREKLI: faturalanabilir sure coalesce(ended_at, last_heartbeat) -
+   * created_at olarak hesaplaniyor. Istemci cokerse ended_at hic yazilmaz;
+   * atis olmadan sure sonsuza kadar buyurdu. Atisla birlikte sure son atista
+   * donuyor ve kayit dogru kaliyor.
+   *
+   * 60 saniye: raporlama icin yeterince ince, veritabanina yuk olmayacak
+   * kadar seyrek. Hata yok sayilir — tek bir kacan atis sureyi en fazla bir
+   * periyot eksiltir.
+   */
+  private startHeartbeat(): void {
+    this.stopHeartbeat();
+    this.heartbeatTimer = setInterval(() => {
+      const rowId = this.connectionRowId;
+      if (!rowId) { this.stopHeartbeat(); return; }
+      void supabase.from('connections')
+        .update({ last_heartbeat: new Date().toISOString() })
+        .eq('id', rowId)
+        .then(() => { /* kacan atis sorun degil */ });
+    }, 60_000);
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeatTimer) { clearInterval(this.heartbeatTimer); this.heartbeatTimer = null; }
+  }
+
   private async saveConnection() {
     if (this.isReceiver) return;
     try {
@@ -588,16 +695,19 @@ export class WebRTCManager {
       // Misafir (anonim) oturumda bağlantı geçmişi tutulmaz.
       if (!user || user.is_anonymous) return;
       // Satırın id'si tutulur: oturum bitince süre ve bitiş zamanı yazılacak.
+      // created_at ve duration_seconds GONDERILMEZ: ikisini de sunucu koyar
+      // (20261005_service_duration). Faturaya esas olacak bir sureyi olcenin
+      // karsi taraf olmasi dogru degil; kolon duzeyi yetki de zaten yazmaya
+      // izin vermiyor.
       const { data, error } = await supabase.from('connections').insert({
         caller_id: user.id,
         receiver_id: this.peerId,
         status: 'active',
-        duration_seconds: 0,
-        created_at: new Date().toISOString(),
       }).select('id').single();
       if (error) throw new Error(error.message);
       this.connectionRowId = (data as { id: string } | null)?.id ?? null;
       this.connectedAt = Date.now();
+      this.startHeartbeat();
       this.onConnectionSaved?.(this.peerId);
       this.log('Bağlantı geçmişe kaydedildi.', 'sys');
     } catch (err) {
@@ -619,12 +729,13 @@ export class WebRTCManager {
     const startedAt = this.connectedAt;
     this.connectionRowId = null;
     this.connectedAt = null;
+    this.stopHeartbeat();
     if (!rowId) return;
-    const seconds = startedAt ? Math.max(0, Math.round((Date.now() - startedAt) / 1000)) : 0;
+    void startedAt; // sure artik sunucuda hesaplaniyor
+    // duration_seconds YAZILMAZ: trigger onu ended_at ve created_at'ten turetir.
     void supabase.from('connections').update({
       status: 'ended',
       ended_at: new Date().toISOString(),
-      duration_seconds: seconds,
     }).eq('id', rowId).then(({ error }) => {
       if (error) this.log(`Oturum kaydı kapatılamadı: ${error.message}`, 'warn');
     });
@@ -643,7 +754,25 @@ export class WebRTCManager {
       // sebebi neredeyse her zaman şu: karşı tarafa profil kimliğiyle (123-456-789)
       // ulaştık, o ise UUID'siyle cevap veriyor. Beklediğimiz answer'ı bu yüzden
       // atmak yerine kimliği benimseyip eş anlamlı olarak kaydediyoruz.
-      const isAwaitedAnswer = sig.type === 'answer' && !this.isReceiver && !this.pc.remoteDescription;
+      //
+      // AMA SAHİPLİK DOĞRULANMADAN DEĞİL. Eskiden tek koşul "henüz remote
+      // description yok"tu: kimliğimizi bilen biri kendi kimliğinden bize bir
+      // `answer` yazıp meşru alıcıyı yarışta geçebiliyordu (alıcı tarafta insan
+      // "Kabul Et"e basıp ekran seçmek zorunda olduğu için yarışı kazanmak
+      // kolaydı). O noktadan sonra operatör, müşterisinin ekranı yerine
+      // saldırganın gösterdiği taklit ekranı izliyordu.
+      //
+      // İki bağımsız kanıt arıyoruz; biri yeterli:
+      //   1. session_id — arayanın ürettiği, tahmin edilemez kimlik. Meşru alıcı
+      //      onu offer'dan okuyup yanıtına yazar (v1.4.0 istemciler de yazıyor,
+      //      bu yüzden geriye dönük uyumlu). Saldırgan offer satırını RLS
+      //      yüzünden OKUYAMAZ, dolayısıyla üretemez.
+      //   2. nonce — offer payload'ındaki `n`. v1.5.0+ alıcılar geri taşır.
+      const claimsSession = !!sig.session_id && sig.session_id === this.sessionId;
+      const claimsNonce = !!this.sessionNonce
+        && (sig.payload as { n?: unknown } | null)?.n === this.sessionNonce;
+      const isAwaitedAnswer = sig.type === 'answer' && !this.isReceiver
+        && !this.pc.remoteDescription && (claimsSession || claimsNonce);
       if (isAwaitedAnswer) {
         this.log(`Karşı taraf farklı kimlikle yanıtladı, eşleştirildi: ${sig.from_id.slice(0, 8)}...`, 'sys');
         this.peerAliases.add(sig.from_id);
@@ -657,6 +786,14 @@ export class WebRTCManager {
         }
         return;
       } else {
+        // Doğrulanmayan yanıt = ya gecikmiş bir eski oturumun sinyali ya da
+        // çağrıyı kaçırma denemesi. İkisi de atılır, ama ikincisi görünsün.
+        if (sig.type === 'answer' && !this.isReceiver) {
+          this.log(
+            `Sahipligi dogrulanamayan yanit reddedildi (${sig.from_id.slice(0, 8)}...).`,
+            'warn',
+          );
+        }
         return;
       }
     }
@@ -674,7 +811,21 @@ export class WebRTCManager {
         this.log('Aynı offer tekrar geldi, yok sayıldı.', 'info');
         return;
       }
-      // ICE restart offer from caller (receiver handles this)
+      // ROL KONTROLU SART. ICE restart offer'ini YALNIZCA arayan gonderir
+      // (attemptIceRestart, isReceiver ise erken doner), dolayisiyla bunu
+      // yalnizca ALICI islemelidir.
+      //
+      // Eskiden rol bakilmiyordu: cagri cakismasinda (iki taraf ayni anda
+      // birbirini ariyor) ARAYAN tarafta `have-local-offer` durumunda
+      // setRemoteDescription(offer) cagriliyor ve tarayici InvalidStateError
+      // firlatiyordu. Realtime geri cagrisinda try/catch olmadigi icin bu
+      // yakalanmamis bir promise reddine donusuyor, polling yolunda ise
+      // yutulup ayni turdaki kalan sinyalleri dusuruyordu.
+      // Cakismanin kendisi App seviyesinde (decideIncomingOffer) cozuluyor.
+      if (!this.isReceiver) {
+        this.log('Arayan rolundeyiz, gelen offer yok sayildi (cagri cakismasi).', 'warn');
+        return;
+      }
       this.log('ICE restart teklifi alındı.', 'warn');
       await this.pc.setRemoteDescription(new RTCSessionDescription(this.sanitizeDescription(sig.payload)));
       await this.applyPendingCandidates();
@@ -695,19 +846,54 @@ export class WebRTCManager {
       this.log('Karşı taraf bağlantıyı kesti.', 'warn');
       this.onStateChange?.('disconnected');
       this.close();
+      // Arayüz tam kapatmayı burada yapar: close() eş kimliklerini sildiği
+      // için App seviyesindeki hangup dinleyicisi bu sinyali artık tanımaz.
+      this.onPeerHangup?.();
     }
   }
 
   // HTTP polling fallback — works even when Supabase Realtime WebSocket is down
+  /**
+   * Yedek HTTP sorgusunun aralığı (ms).
+   *
+   * HIZLI (1,5 sn) — kurulum aşamasında ya da WebSocket düşmüşken. Offer,
+   *   answer ve ICE adayları saniyeler içinde işlenmeli; burada gecikme
+   *   doğrudan "bağlanmıyor" demek.
+   * YAVAŞ (10 sn) — bağlantı kurulduktan SONRA ve WebSocket sağlıklıyken.
+   *   O noktada akış veri kanalından gidiyor; sinyalleşmede kalan tek iş
+   *   hangup ve ICE restart. 10 saniye onlar için yeterli ve oturum başına
+   *   istek sayısını ~%85 düşürür.
+   *
+   * POLLING HİÇ KAPATILMIYOR ve bu bilinçli: kanalın SUBSCRIBED görünüp
+   * sessizce teslim etmemesi gerçekten yaşanmış bir arıza (bkz. wsHealthy).
+   * Emniyet ağını kaldırmak, o arızayı yeniden sessiz hâle getirir.
+   */
+  private static readonly POLL_FAST_MS = 1500;
+  private static readonly POLL_SLOW_MS = 10_000;
+
+  private pollDelay(): number {
+    const established = this.pc?.connectionState === 'connected';
+    return (this.wsHealthy && established)
+      ? WebRTCManager.POLL_SLOW_MS
+      : WebRTCManager.POLL_FAST_MS;
+  }
+
   private startPolling(): void {
     if (this.pollingTimer) return;
     // Include signals from the last 10 seconds to catch anything sent just before we started
     this.pollSince = new Date(Date.now() - 10000).toISOString();
-    this.pollingTimer = setInterval(() => this.pollSignals(), 1500);
+    // Kendini planlayan döngü: aralık her turda yeniden hesaplanır, böylece
+    // bağlantı kurulduğu anda kendiliğinden yavaşlar.
+    const tick = async () => {
+      await this.pollSignals();
+      if (!this.pollingTimer) return; // close() çağrıldı
+      this.pollingTimer = setTimeout(tick, this.pollDelay());
+    };
+    this.pollingTimer = setTimeout(tick, WebRTCManager.POLL_FAST_MS);
   }
 
   private stopPolling(): void {
-    if (this.pollingTimer) { clearInterval(this.pollingTimer); this.pollingTimer = null; }
+    if (this.pollingTimer) { clearTimeout(this.pollingTimer); this.pollingTimer = null; }
   }
 
   private async pollSignals(): Promise<void> {
@@ -715,7 +901,11 @@ export class WebRTCManager {
     try {
       const { data } = await supabase
         .from('signals')
-        .select('id, type, from_id, payload, created_at')
+        // session_id ŞART: tanımadığımız bir kimlikten gelen `answer`ın
+        // sahipliği onunla doğrulanıyor (bkz. handleSignal). Eskiden
+        // seçilmediği için polling yolundan gelen yanıtlar bu kanıtı
+        // taşımıyordu.
+        .select('id, type, from_id, payload, session_id, created_at')
         .eq('to_id', this.myId)
         // DİKKAT: burada from_id'ye göre FİLTRELEME YOK ve bu kasıtlı.
         // Karşı taraf bize çevirdiğimizden BAŞKA bir kimlikle cevap verebilir
@@ -737,12 +927,19 @@ export class WebRTCManager {
         if (this.processedSignalIds.has(row.id)) continue;
         this.markProcessed(row.id);
         this.pollSince = row.created_at;
-        await this.handleSignal({
-          id: row.id,
-          type: row.type as SignalType,
-          from_id: row.from_id,
-          payload: row.payload as Record<string, unknown>,
-        });
+        // Her satir ayri korunuyor: eskiden tek bir hata disaridaki catch'e
+        // dusup AYNI TURDAKI KALAN SINYALLERI de dusuruyordu.
+        try {
+          await this.handleSignal({
+            id: row.id,
+            type: row.type as SignalType,
+            from_id: row.from_id,
+            payload: row.payload as Record<string, unknown>,
+            session_id: (row as { session_id?: string | null }).session_id ?? null,
+          });
+        } catch (err) {
+          this.log(`Sinyal islenemedi (${row.type}): ${String(err)}`, 'warn');
+        }
       }
     } catch {
       // Silently ignore to avoid log spam during brief network hiccups
@@ -775,12 +972,21 @@ export class WebRTCManager {
           const sig = payload.new as IncomingSignal & { id: string };
           if (this.processedSignalIds.has(sig.id)) return;
           this.markProcessed(sig.id);
-          await this.handleSignal(sig);
+          // try/catch SART: handleSignal icindeki bir istisna (orn. yanlis
+          // sinyalleşme durumunda setRemoteDescription) burada yakalanmamis
+          // promise reddine donusuyordu.
+          try { await this.handleSignal(sig); }
+          catch (err) { this.log(`Sinyal islenemedi (${sig.type}): ${String(err)}`, 'warn'); }
         }
       );
 
-    // Attempt WebSocket subscription with a 5-second timeout.
-    // If it fails or times out, polling (started below) will take over.
+    // WebSocket aboneliğini 5 saniyelik bir zaman aşımıyla dene.
+    //
+    // Kanalın durumu polling'i KAPATMAZ, yalnızca YAVAŞLATIR (bkz. pollDelay).
+    // Gerekçe: kanal SUBSCRIBED dediği hâlde olayları sessizce teslim etmemesi
+    // gerçekten yaşanmış bir arızadır ve hiçbir hata üretmez; emniyet ağını
+    // kaldırmak onu yeniden sessiz hâle getirir.
+    this.wsHealthy = false;
     await new Promise<void>((resolve) => {
       const timeout = setTimeout(() => {
         this.log('WebSocket zaman aşımı — polling modu aktif.', 'warn');
@@ -790,19 +996,24 @@ export class WebRTCManager {
       this.channel?.subscribe((status: string) => {
         if (status === 'SUBSCRIBED') {
           clearTimeout(timeout);
+          this.wsHealthy = true;
           this.log('Signal kanalı hazır (WebSocket).', 'sys');
           resolve();
+          return;
         }
-        if (status === 'CHANNEL_ERROR' || status === 'ERROR' || status === 'TIMED_OUT') {
+        if (status === 'CHANNEL_ERROR' || status === 'ERROR' || status === 'TIMED_OUT'
+            || status === 'CLOSED') {
           clearTimeout(timeout);
-          this.log(`WebSocket hatası (${status}) — polling devreye girdi.`, 'warn');
+          // Kanal SONRADAN da düşebilir; o anda yedek hızlanır.
+          this.wsHealthy = false;
+          this.log(`WebSocket hatası (${status}) — polling hizlandirildi.`, 'warn');
           resolve(); // Don't throw — polling covers this
         }
       });
     });
 
-    // Always run polling alongside WebSocket as a safety net.
-    // processedSignalIds prevents double-processing.
+    // Yedek sorgu her oturumda çalışır; hızı kanalın sağlığına ve bağlantının
+    // kurulup kurulmadığına göre kendini ayarlar.
     this.startPolling();
   }
 
@@ -813,11 +1024,11 @@ export class WebRTCManager {
   // Böylece kimliği bilen/tahmin eden herkesin karşı tarafı çaldırması biter.
   async call(peerId: string, opts: { password?: string } = {}): Promise<void> {
     if (peerId === this.myId) throw new Error('Kendi cihazınıza bağlanamazsınız.');
-    this.sessionPassword = opts.password ?? '';
 
     this.isReceiver = false;
     this.setPeer(peerId);
     this.sessionId = this.generateSessionId();
+    this.sessionNonce = WebRTCManager.generateNonce();
     this.pendingRemoteCandidates = [];
     this.onStateChange?.('connecting');
     this.log(`${peerId} adresine bağlantı isteği gönderiliyor...`, 'warn');
@@ -844,11 +1055,35 @@ export class WebRTCManager {
 
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
-    // Parola offer ile birlikte gider. Alıcı, sanitizeDescription ile yalnızca
-    // {type, sdp} alanlarını setRemoteDescription'a verdiği için ek alan zararsızdır.
+    // Offer'a iki ek alan biner. Alıcı, sanitizeDescription ile yalnızca
+    // {type, sdp} alanlarını setRemoteDescription'a verdiği için zararsızdır.
+    //
+    //   pwh — oturum parolasının HMAC kanıtı. Parola artık DÜZ METİN GİTMEZ:
+    //         eskiden `pw` olarak gidiyor ve `signals` tablosunda 5 dakikaya
+    //         kadar duruyordu; veritabanına erişen biri hem araya girebiliyor
+    //         hem parolayı öğrenebiliyordu. Kanıt oturum kimliğine bağlı
+    //         olduğu için tekrar oynatılamaz.
+    //   n   — oturum nonce'u. Meşru alıcı yanıtında geri taşır; tanımadığımız
+    //         bir kimlikten gelen `answer`ı benimsemeden önce aradığımız
+    //         kanıtlardan biri (bkz. handleSignal).
+    const proof = opts.password ? await derivePasswordProof(opts.password, this.sessionId) : null;
+    // GUVENLI OLMAYAN BAGLAM TUZAGI: crypto.subtle yalnizca guvenli baglamda
+    // (https, file://, localhost) vardir. Uygulamayi yerel agdan duz http ile
+    // acarsaniz (orn. http://192.168.1.25:3000 — `npm run dev` o adresi de
+    // yayinlar) kanit uretilemez ve karsi taraf "parola hatali" der. Sessizce
+    // basarisiz olmak yerine sebebi soyluyoruz.
+    if (opts.password && !proof) {
+      this.log(
+        'Oturum parolasi kaniti uretilemedi (crypto.subtle yok). Sayfa guvenli '
+        + 'olmayan bir baglamda acilmis olabilir: https, localhost ya da masaustu '
+        + 'uygulamasini kullanin. Baglanti parola dogrulanamadigi icin reddedilecek.',
+        'error',
+      );
+    }
     await this.send('offer', {
       type: offer.type, sdp: offer.sdp,
-      ...(opts.password ? { pw: opts.password } : {}),
+      n: this.sessionNonce,
+      ...(proof ? { pwh: proof } : {}),
     });
 
     this.log('Bağlantı isteği gönderildi, yanıt bekleniyor...');
@@ -870,11 +1105,14 @@ export class WebRTCManager {
     fromId: string,
     offerPayload: Record<string, unknown>,
     screenStream: MediaStream,
-    opts: { sessionId?: string; addressedAs?: string; offerSignalId?: string; password?: string } = {},
+    opts: { sessionId?: string; addressedAs?: string; offerSignalId?: string } = {},
   ): Promise<void> {
     const { sessionId, addressedAs, offerSignalId } = opts;
-    this.sessionPassword = opts.password ?? '';
     this.isReceiver = true;
+    // Arayanın nonce'unu yanıta geri taşıyacağız: karşı taraf bizi böyle
+    // doğruluyor. Yoksa (v1.4.0 arayan) session_id eşleşmesi yeterli.
+    const offerNonce = typeof (offerPayload as { n?: unknown })?.n === 'string'
+      ? String((offerPayload as { n?: unknown }).n) : '';
     if (addressedAs && addressedAs.trim()) this.myId = addressedAs.trim();
     this.setPeer(fromId);
     // session_id yalnızca offer ile geldiyse güvenilir. Kendi ürettiğimiz bir id
@@ -934,7 +1172,10 @@ export class WebRTCManager {
     await this.applyPendingCandidates();
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
-    await this.send('answer', answer);
+    await this.send('answer', {
+      type: answer.type, sdp: answer.sdp,
+      ...(offerNonce ? { n: offerNonce } : {}),
+    });
 
     this.log('Yanıt gönderildi, bağlantı kuruluyor...');
     this.cleanupTimer = setInterval(() => this.cleanSignals(), 30000);
@@ -946,7 +1187,8 @@ export class WebRTCManager {
   private onFileChunk(buf: ArrayBuffer): void {
     const inc = this.incomingFile;
     if (!inc) return; // kabul edilmemis transferden gelen veri - yok say
-    inc.parts.push(buf);
+    // Akis modunda parca diske gider, bellekte tutulmaz.
+    if (inc.parts) inc.parts.push(buf); else this.onFileSink?.(buf);
     inc.received += buf.byteLength;
     // Beyan edilenden fazlasini gondermeye calisan esi kes.
     if (inc.received > inc.size) {
@@ -981,8 +1223,24 @@ export class WebRTCManager {
 
   /** Gelen teklifi kabul eder (arayuz kullaniciya sorduktan SONRA cagirir). */
   acceptIncomingFile(offer: FileOffer): void {
-    if (offer.size > MAX_FILE_BYTES) { this.rejectIncomingFile(offer.id); return; }
-    this.incomingFile = { id: offer.id, name: offer.name, size: offer.size, parts: [], received: 0 };
+    // Sinir, parcalarin nereye gittigine bagli: diske akiyorsa genis,
+    // bellekte birlesiyorsa dar.
+    const cap = this.onFileSink ? MAX_FILE_BYTES : MAX_FILE_BYTES_MEMORY;
+    if (offer.size > cap) {
+      this.log(
+        `Dosya cok buyuk (${Math.round(offer.size / 1048576)} MB). Bu surumde ust sinir `
+        + `${Math.round(cap / 1048576)} MB`
+        + (this.onFileSink ? '.' : ' — masaustu uygulamasinda daha buyuk dosya alabilirsiniz.'),
+        'error',
+      );
+      this.rejectIncomingFile(offer.id);
+      return;
+    }
+    this.incomingFile = {
+      id: offer.id, name: offer.name, size: offer.size,
+      // Akis modunda (onFileSink ayarli) bellekte birikme YOK.
+      parts: this.onFileSink ? null : [], received: 0,
+    };
     this.sendControl({ k: 'file-accept', id: offer.id });
   }
 
@@ -1062,7 +1320,10 @@ export class WebRTCManager {
         this.onFile?.({ t: 'cancelled', id: inc.id, reason: 'incomplete' });
         return true;
       }
-      this.onFile?.({ t: 'complete', id: inc.id, name: inc.name, blob: new Blob(inc.parts) });
+      this.onFile?.({
+        t: 'complete', id: inc.id, name: inc.name,
+        blob: inc.parts ? new Blob(inc.parts) : null,
+      });
       return true;
     }
     if (msg.k === 'file-cancel') {
@@ -1115,6 +1376,8 @@ export class WebRTCManager {
    * kilitlenmemeli. Eskiden insert await ediliyordu ve arayüz donuyordu.
    */
   async disconnect(): Promise<void> {
+    // Kullanici oturumu bitirdi: acil kapatma kaydindan dusur.
+    WebRTCManager.live.delete(this);
     const peer = this.peerId;
     const fromId = this.myId;
     const sessionId = this.sessionId;
@@ -1143,7 +1406,8 @@ export class WebRTCManager {
     if (this.outgoingFile) this.outgoingFile.cancelled = true;
     this.outgoingFile = null;
     this.incomingFile = null;
-    this.sessionPassword = '';
+    this.sessionNonce = '';
+    this.wsHealthy = false;
     this.onVerification?.(null);
     // Oturum suresi ve bitis zamani geceye yazilir (beklenmez).
     this.finishConnectionRecord();

@@ -1,5 +1,72 @@
-@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Cinzel:wght@400;700&display=swap');
 @import "tailwindcss";
+
+/* ── Yazı tipleri: KENDİ BARINDIRMA ─────────────────────────────────────────
+ *
+ * Eskiden burada Google Fonts'a bir @import vardı. İki ayrı yerde kırılıyordu:
+ *
+ *  1) WEB: middleware.ts'teki CSP `style-src 'self'` diyor; fonts.googleapis.com
+ *     bu listede olmadığı için @import BLOKLANIYOR ve tipografi hiç
+ *     yüklenmiyordu (her sayfa yüklemesinde konsolda CSP ihlali).
+ *  2) MASAÜSTÜ: file:// origin'inde CSP olmadığı için istek gerçekten gidiyor;
+ *     uygulama her açılışta Google'a bağlanıp kullanıcının IP adresini üçüncü
+ *     bir tarafa açıyordu. "Veriniz ikinizin arasında kalır" diyen bir üründe
+ *     bu, aydınlatma metnine girmesi gereken bir yurt dışı aktarımı.
+ *
+ * Dosyalar artık depoda (src/fonts/). Vite bunları parmak izli asset olarak
+ * dist/assets altına kopyalar ve CSS içindeki yolu GÖRELİ yazar — bu yüzden
+ * hem web'de hem `file://` ile yüklenen Electron penceresinde çalışır.
+ * (`/fonts/...` biçiminde MUTLAK yol yazma: Electron'da dosya sisteminin
+ *  köküne bakar ve font sessizce yüklenmez.)
+ *
+ * Türkçe kapsama: ğ Ğ ş Ş İ karakterleri latin-ext altkümesinde, ı ç ö ü ise
+ * latin altkümesinde. İkisi de şart; birini atlamak eksik harf demek.
+ * Her iki aile de değişken font (variable) olduğu için tek dosya tüm
+ * ağırlıkları (300-700 / 400-700) taşır.
+ */
+
+/* Space Grotesk — gövde metni */
+@font-face {
+  font-family: 'Space Grotesk';
+  font-style: normal;
+  font-weight: 300 700;
+  font-display: swap;
+  src: url('./fonts/space-grotesk-latin.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA,
+    U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193,
+    U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: 'Space Grotesk';
+  font-style: normal;
+  font-weight: 300 700;
+  font-display: swap;
+  src: url('./fonts/space-grotesk-latin-ext.woff2') format('woff2');
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF,
+    U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020,
+    U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+
+/* Cinzel — başlıklar ve kimlik/parola gibi büyük sayılar */
+@font-face {
+  font-family: 'Cinzel';
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url('./fonts/cinzel-latin.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA,
+    U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193,
+    U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: 'Cinzel';
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url('./fonts/cinzel-latin-ext.woff2') format('woff2');
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF,
+    U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020,
+    U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
 
 @theme {
   --font-sans: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;

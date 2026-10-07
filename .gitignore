@@ -15,3 +15,6 @@ firebase.json
 .env.*supabase/.temp/
 
 .vercel
+
+# Vercel yerel proje baglantisi (proje/takim kimligi) — depoda durmamali
+.vercel/

@@ -21,6 +21,16 @@ export interface EmbedConfig {
   op: string | null;
   /** postMessage hedef origin'i (bizi gömen ana sayfanın origin'i). */
   parentOrigin: string;
+  /**
+   * Ana uygulamanın origin'i GÜVENİLİR biçimde çözülebildi mi?
+   *
+   * false ise mesajlaşma tamamen kapatılır. Eskiden çözülemediğinde '*'
+   * kullanılıyordu ve iki sonucu vardı: oturum olayları (oturum kimliği, mod)
+   * herhangi bir gömen sayfaya gönderiliyordu ve gelen mesaj filtresi devre
+   * dışı kaldığı için HERHANGİ BİR köken "arku:command / end" gönderip
+   * oturumu kesebiliyordu.
+   */
+  trusted: boolean;
 }
 
 function detectParentOrigin(): string {
@@ -37,6 +47,7 @@ function detectParentOrigin(): string {
 
 function compute(): EmbedConfig {
   const p = new URLSearchParams(window.location.search);
+  const parentOrigin = detectParentOrigin();
   return {
     embed: p.get('embed') === '1',
     mode: p.get('mode') === 'view' ? 'view' : 'control',
@@ -44,7 +55,8 @@ function compute(): EmbedConfig {
     // `target` ile gönderir; `session` geriye dönük uyumluluk için alias.
     session: p.get('target') ?? p.get('session'),
     op: p.get('op'),
-    parentOrigin: detectParentOrigin(),
+    parentOrigin,
+    trusted: parentOrigin !== '*',
   };
 }
 
@@ -59,6 +71,9 @@ let lastEvent: SessionEvent | '' = '';
  */
 export function postSessionEvent(event: SessionEvent, sessionId: string | null, mode: EmbedMode): void {
   if (!EMBED.embed) return;
+  // Köken doğrulanamadıysa hiçbir şey göndermiyoruz: '*' hedefiyle yayın
+  // yapmak oturum bilgisini herhangi bir gömen sayfaya açardı.
+  if (!EMBED.trusted) return;
   if (event === lastEvent) return; // yinelenen ardışık olayları atla (örn. çift 'ended')
   lastEvent = event;
   const message = {

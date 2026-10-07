@@ -20,7 +20,60 @@ permissions:
   contents: write
 
 jobs:
+  # Otomatik testler (denetim 2026-10-07). Derlemeden ONCE calisir; kalirsa
+  # hicbir platform derlenmez ve surum yayimlanmaz.
+  #   * Birim testleri: veri kanali semasi (src/lib/*.test.ts) ve Electron
+  #     ana surec girdi kapisi (tests/electron/*.test.cjs). Ek paket gerekmez.
+  #   * Veritabani testleri: supabase/tests/run.sh, gecici bir Postgres 16
+  #     uzerinde Supabase taklidi kurar; canli veritabanina dokunmaz.
+  test:
+    runs-on: ubuntu-latest
+    name: Test
+    permissions:
+      contents: read
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Database tests
+        run: npm run test:sql
+        env:
+          PGHOST: localhost
+          PGPORT: '5432'
+          PGUSER: postgres
+          PGPASSWORD: postgres
+
+      # turnserver.conf gercek coturn ile yalnizca 127.0.0.1'de denenir; eslere
+      # veri gonderilmez (-n 0). Eski `denied-peer-ip=::` satiri tum relay'i
+      # engelliyordu; bu adim o tur hatalari yakalar.
+      - name: TURN config test
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y coturn
+          npm run test:turn
+
   build:
+    needs: test
     strategy:
       fail-fast: false
       matrix:
