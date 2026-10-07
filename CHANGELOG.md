@@ -23,14 +23,28 @@ bölümü de bu sürümün parçasıdır.
   sunucu saatiyle ölçülüyor ve müşteri bazında raporlanabiliyor. Oturum
   sürerken dakikada bir "hâlâ bağlıyım" işareti gidiyor; uygulama çökse bile
   süre son işarette donuyor, sonsuza kadar saymıyor.
-- **Oturum kaydını müşteriye gönderme.** Kayıt operatörün bilgisayarında
-  kalıyor; müşteri istediğinde tek düğmeyle, iki uç arasındaki şifreli kanaldan
-  doğrudan gönderiliyor. Arku sunucularına uğramıyor.
 
 ### Değişti
 
 - **Kayıtlar belirgin biçimde küçüldü.** Kayıt bit hızına tavan kondu; bir
   saatlik kayıt 2-3 GB yerine ~675 MB.
+
+### Güvenlik (bağımsız denetim, 2026-10-07)
+
+- **Yeni hesaplar kimlik alamıyordu.** Sunucu kimlik fonksiyonu yeni
+  kullanıcılarda hata veriyordu; düzeltildi (migration `20261007000100`).
+- **Kurum yöneticisi kurumu ele geçirebiliyordu.** Yönetici kendini sahip
+  yapamıyor, kurucuyu çıkaramıyor, kullanıcıları onaysız kuruma ekleyemiyor.
+  Koltuk sınırı devre dışı üyeyi yeniden etkinleştirerek aşılamıyor
+  (migration `20261007000200`).
+- **Karşı taraf arayüzü çökertip kontrolü açık bırakabiliyordu.** Veri
+  kanalından gelen her mesaj artık türü ve sınırlarıyla doğrulanıyor; arayüz
+  çökerse tüm oturumlar kapanıyor ve uzaktan kontrol izni geri alınıyor.
+- **Onay pencereleri karşı tarafça yanıtlanabiliyordu.** Bir onay, kaydetme
+  ya da kayıt rızası penceresi açıkken uzaktan klavye ve fare işletilmiyor.
+- Dosya adlarındaki yön işaretleri temizleniyor (ör. sağdan sola işaretiyle `.exe`yi `.pdf` gibi gösterme);
+  sayı olmayan dosya boyutu sınır kontrolünü atlatamıyor.
+- Paketli uygulama `NODE_ENV` ile geliştirme kipine sokulamıyor.
 
 ### Düzeltildi
 
