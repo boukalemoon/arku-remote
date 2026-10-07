@@ -1219,7 +1219,9 @@ ipcMain.on('input-event', (e, event) => {
   const target = captureTargets.get(wcId);
   pendingInputs++;
   inputChain = inputChain
-    .then(() => applyInput(mod, event, wcId, target))
+    // Kuyrukta bekleyen olaylar da pencere açıldıysa atılır: kontrol eden taraf
+    // önce kuyruğu doldurup sonra onay penceresini kendisi tetikleyebilir.
+    .then(() => (modalDepth > 0 ? undefined : applyInput(mod, event, wcId, target)))
     .catch(() => {})
     .finally(() => { pendingInputs--; });
 });

@@ -9,13 +9,15 @@ test('Y3: nesne olarak gelen dosya adı reddedilir (React çökmesi)', () => {
   assert.equal(parseChannelText('{"k":"file-offer","id":"x","name":{},"size":1}'), null);
 });
 
-test('O5: sayı olmayan, negatif, kesirli ya da dev boyut reddedilir', () => {
-  for (const size of ['abc', '100', -1, 0, 1.5, Number.NaN, Infinity, 2 ** 53, null]) {
+test('O5: sayı olmayan, negatif, kesirli ya da dev boyut reddedilir (0 bayt geçerli)', () => {
+  for (const size of ['abc', '100', -1, 1.5, Number.NaN, Infinity, 2 ** 53, null]) {
     assert.equal(parseControlMsg({ k: 'file-offer', id: 'x', name: 'a.txt', size }), null, String(size));
   }
 });
 
 test('geçerli dosya teklifi korunur, yön işaretleri temizlenir', () => {
+  assert.deepEqual(parseControlMsg({ k: 'file-offer', id: 'f0', name: 'bos.txt', size: 0 }),
+    { k: 'file-offer', id: 'f0', name: 'bos.txt', size: 0 });
   assert.deepEqual(parseControlMsg({ k: 'file-offer', id: 'f1', name: 'rapor.pdf', size: 1234 }),
     { k: 'file-offer', id: 'f1', name: 'rapor.pdf', size: 1234 });
   const spoof = parseControlMsg({ k: 'file-offer', id: 'f2', name: 'belge‮fdp.exe', size: 10 });

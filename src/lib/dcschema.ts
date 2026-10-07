@@ -70,7 +70,8 @@ export function parseControlMsg(raw: unknown): ControlMsg | null {
     case 'file-offer': {
       if (!nonEmpty(m.id, LIMITS.id) || !str(m.name, LIMITS.fileName * 4)) return null;
       const size = m.size;
-      if (!Number.isSafeInteger(size) || (size as number) <= 0 || (size as number) > LIMITS.fileSize) return null;
+      // 0 bayt geçerli: gönderen boş dosya teklif edebiliyor ve hemen file-end yolluyor.
+      if (!Number.isSafeInteger(size) || (size as number) < 0 || (size as number) > LIMITS.fileSize) return null;
       const name = sanitizeDisplayName(m.name).slice(0, LIMITS.fileName);
       if (!name) return null;
       return { k: 'file-offer', id: m.id, name, size: size as number };

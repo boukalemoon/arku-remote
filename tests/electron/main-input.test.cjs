@@ -45,7 +45,11 @@ function loadMain() {
     systemPreferences: { isTrustedAccessibilityClient: () => true, getMediaAccessStatus: () => 'granted' },
     clipboard: { readText: () => '', writeText: noop },
   };
-  const rec = (name) => async (...a) => { calls.push([name, ...a]); };
+  const state = { delayMs: 0 };
+  const rec = (name) => async (...a) => {
+    if (state.delayMs) await new Promise((r) => setTimeout(r, state.delayMs));
+    calls.push([name, ...a]);
+  };
   const nut = {
     Point: function (x, y) { this.x = x; this.y = y; },
     Button: { LEFT: 'L', RIGHT: 'R', MIDDLE: 'M' },
@@ -58,7 +62,7 @@ function loadMain() {
   current = { electron, nut };
   delete require.cache[require.resolve(MAIN)];
   require(MAIN);
-  return { ipc, calls, setDialog: (fn) => { dialogImpl = fn; } };
+  return { ipc, calls, state, setDialog: (fn) => { dialogImpl = fn; } };
 }
 
 const tick = () => new Promise((r) => setTimeout(r, 20));
@@ -105,4 +109,20 @@ test('D8: tek wheel olayı en fazla 20 adım kaydırır', async () => {
   const down = m.calls.find((c) => c[0] === 'scrollDown');
   assert.ok(down, 'kaydırma yapılmadı');
   assert.ok(down[1] <= 20, `adım sayısı ${down[1]}`);
+});
+
+test('O3: pencere açılmadan önce kuyruğa girmiş tuşlar da pencere açıkken işlenmez', async () => {
+  const m = loadMain();
+  await grant(m);
+  m.state.delayMs = 15; // girdi zinciri yavaş: olaylar kuyrukta bekler
+  for (let i = 0; i < 5; i++) m.ipc.on.get('input-event')({ sender }, { type: 'wheel', dx: 0, dy: 100, x: 0.5, y: 0.5 });
+  m.ipc.on.get('input-event')({ sender }, { type: 'keydown', key: 'Enter', code: 'Enter' });
+  let release;
+  m.setDialog(() => new Promise((r) => { release = r; }));
+  const pending = m.ipc.handle.get('recording:pick-folder')({ sender });
+  await new Promise((r) => setTimeout(r, 200)); // kuyruk tamamen boşalsın
+  const pressedWhileOpen = m.calls.some((c) => c[0] === 'pressKey' && c[1] === 'Return');
+  release({ canceled: true, filePaths: [] });
+  await pending.catch(() => {});
+  assert.equal(pressedWhileOpen, false, 'kuyruktaki Enter pencere açıkken basıldı');
 });

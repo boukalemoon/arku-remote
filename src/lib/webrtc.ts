@@ -244,8 +244,6 @@ export class WebRTCManager {
   constructor(myId: string) {
     this.myId = myId;
     this.originalId = myId;
-    // Kapanmis (pc'si olmayan) eski yoneticileri birak; kayit sinirsiz buyumesin.
-    for (const m of WebRTCManager.live) if (!m.pc && !m.dataChannel) WebRTCManager.live.delete(m);
     WebRTCManager.live.add(this);
   }
 
@@ -1373,6 +1371,8 @@ export class WebRTCManager {
    * kilitlenmemeli. Eskiden insert await ediliyordu ve arayüz donuyordu.
    */
   async disconnect(): Promise<void> {
+    // Kullanici oturumu bitirdi: acil kapatma kaydindan dusur.
+    WebRTCManager.live.delete(this);
     const peer = this.peerId;
     const fromId = this.myId;
     const sessionId = this.sessionId;

@@ -388,6 +388,17 @@ export default function App() {
   const [incomingFile, setIncomingFile] = React.useState<FileOffer | null>(null);
   const [fileProgress, setFileProgress] = React.useState<{ id: string; done: number; total: number; dir: 'in' | 'out' } | null>(null);
   const fileInputRef = React.useRef<HTMLInputElement>(null);
+  // Uygulama içi onay pencereleri (kayıt rızası, gelen dosya) açıkken uzaktan
+  // girdi işletilmez (denetim O3). Aksi halde kontrol izni olan karşı taraf
+  // "Onaylıyorum" düğmesine kendisi tıklayıp rızayı yerel kullanıcı adına
+  // verebiliyordu.
+  const consentPromptOpenRef = React.useRef(false);
+  React.useEffect(() => {
+    const open = recPrompt || !!incomingFile;
+    consentPromptOpenRef.current = open;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    if (open) (window as any).electronAPI?.sendInput?.({ type: 'release-all' });
+  }, [recPrompt, incomingFile]);
   /**
    * Gelen cagri kanallarinin WebSocket sagligi (kimlik -> abone mi).
    *
@@ -2301,6 +2312,8 @@ export default function App() {
     m.onInputEvent = (event: InputEventMsg) => {
       // Ekranı paylaşan kullanıcı izin vermeden uzaktan kontrol işletilmez
       if (!remoteControlAllowedRef.current) return;
+      // Yerel kullanıcıya onay soruluyorsa karşı taraf yanıtlayamasın.
+      if (consentPromptOpenRef.current && event.type !== 'release-all') return;
       // Forward to Electron main process if running as desktop app
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       (window as any).electronAPI?.sendInput?.(event);
