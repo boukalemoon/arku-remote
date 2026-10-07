@@ -63,6 +63,15 @@ jobs:
           PGUSER: postgres
           PGPASSWORD: postgres
 
+      # turnserver.conf gercek coturn ile yalnizca 127.0.0.1'de denenir; eslere
+      # veri gonderilmez (-n 0). Eski `denied-peer-ip=::` satiri tum relay'i
+      # engelliyordu; bu adim o tur hatalari yakalar.
+      - name: TURN config test
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y coturn
+          npm run test:turn
+
   build:
     needs: test
     strategy:

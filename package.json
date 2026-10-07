@@ -86,7 +86,8 @@
     "release:notes": "node scripts/release.mjs notes",
     "release:check": "node scripts/release.mjs check",
     "test": "node --experimental-strip-types --no-warnings --test src/lib/*.test.ts tests/electron/*.test.cjs supabase/functions/*/*.test.ts",
-    "test:sql": "bash supabase/tests/run.sh"
+    "test:sql": "bash supabase/tests/run.sh",
+    "test:turn": "bash tests/turn/peer_deny_test.sh"
   },
   "dependencies": {
     "@nut-tree-fork/nut-js": "^4.2.6",
