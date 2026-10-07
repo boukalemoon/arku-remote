@@ -85,7 +85,7 @@
     "release:sync": "node scripts/release.mjs sync",
     "release:notes": "node scripts/release.mjs notes",
     "release:check": "node scripts/release.mjs check",
-    "test": "node --experimental-strip-types --no-warnings --test src/lib/*.test.ts tests/electron/*.test.cjs",
+    "test": "node --experimental-strip-types --no-warnings --test src/lib/*.test.ts tests/electron/*.test.cjs supabase/functions/*/*.test.ts",
     "test:sql": "bash supabase/tests/run.sh"
   },
   "dependencies": {
