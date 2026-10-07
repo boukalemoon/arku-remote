@@ -24,7 +24,7 @@
 --   3) Uygulamayı bir kez açıp misafir sekmesinde de oturum oluştuğunu
 --      doğrulayın (Ayarlar'da kimlik görünüyorsa oturum vardır).
 --
--- GERİ ALMA: 20260801_signals_rls_identity_revert.sql — tek komut,
+-- GERİ ALMA: supabase/rollback/20260801_signals_rls_identity_revert.sql — tek komut,
 -- anında bugünkü çalışan duruma döner.
 -- =========================================================
 
@@ -136,5 +136,5 @@ commit;
 --    realtime.setAuth çalışmıyordur, GERİ ALIN.
 --
 -- 3) Herhangi bir adım başarısızsa:
---    20260801_signals_rls_identity_revert.sql
+--    supabase/rollback/20260801_signals_rls_identity_revert.sql
 -- =========================================================

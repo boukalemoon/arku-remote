@@ -70,7 +70,7 @@ yayınını ve sinyal hacmini tek tabloda gösterir.
 > üretim tablosuna test satırı yazıyordu. Teşhis için yukarıdaki dosyayı
 > kullanın.
 
-### ⛔ `20260702_arku_initial_schema.sql` — yalnızca boş projede
+### ⛔ `supabase/legacy/20260702_arku_initial_schema.sql` — yalnızca boş projede
 
 Bu dosya izinli politikaları yeniden oluşturur ve sonraki migration'ların
 kapattığı açıkları (S1/S2, PII sızıntısı) **geri açar**. Mevcut projede asla
