@@ -19,10 +19,26 @@ import { resetIceCache } from './lib/ice';
 import { recordAudit, listAudit, verifyAuditChain, setDeviceIdPolicy } from './lib/audit';
 import { verifyOfferPassword } from './lib/verify';
 import type { AuditRow, AuditVerifyResult } from './lib/audit';
+import { authRedirectUrl, parseAuthReturn, describeAuthError } from './lib/authRedirect';
 
 type Theme = 'otuken' | 'umay' | 'gok' | 'gece';
 type Tab = 'dashboard' | 'connections' | 'contacts' | 'organization' | 'settings';
-type AuthMode = 'login' | 'register' | 'mfa' | 'reset';
+type AuthMode = 'login' | 'register' | 'mfa' | 'reset' | 'checkmail' | 'newpass';
+
+// E-posta bağlantısından dönüşün sonucu (doğrulandı / şifre sıfırlama / hata).
+// MODÜL YÜKLENİRKEN okunur: supabase-js oturumu adresten alıp adresi
+// temizlediği için bir useEffect içinde okumak çok geç kalabilir.
+const INITIAL_AUTH_RETURN = typeof window !== 'undefined'
+  ? parseAuthReturn(window.location.hash, window.location.search)
+  : null;
+
+/** E-posta bağlantılarının döneceği adres (bkz. lib/authRedirect.ts). */
+const emailRedirectTo = (): string => authRedirectUrl(
+  window.location,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  !!(window as any).electronAPI?.isElectron,
+  import.meta.env.VITE_AUTH_REDIRECT_URL as string | undefined,
+);
 interface LogEntryLocal { time: string; msg: string; type: LogType; }
 // toId: arayanın bize ulaşmak için kullandığı kimlik (UUID veya 123-456-789).
 // Cevabı bu kimlikle imzalamamız gerekir, yoksa arayan yanıtı tanıyamaz.
@@ -228,6 +244,23 @@ export default function App() {
   const [mfaCode, setMfaCode] = React.useState(['','','','','','']);
   const [isMfaValidating, setIsMfaValidating] = React.useState(false);
   const [authError, setAuthError] = React.useState('');
+  // Hata olmayan bilgilendirme (ör. "e-postaniz dogrulandi").
+  const [authNotice, setAuthNotice] = React.useState('');
+  // Kayit/giris istegi surerken dugmeler kilitli: cift tiklama ayni kaydi iki
+  // kez gonderiyor, biri "duplicate key" ile sunucu hatasina dusuyordu (2026-10-11).
+  const [authBusy, setAuthBusy] = React.useState(false);
+  // State tek başına yetmiyor: aynı olay döngüsündeki iki tık, React yeniden
+  // çizmeden önce ikisi de authBusy=false görüyor (E2E testi yakaladı).
+  // Kilit eşzamanlı bir ref ile tutulur, state yalnızca düğme görünümü içindir.
+  const authBusyRef = React.useRef(false);
+  const lockAuth = (): boolean => {
+    if (authBusyRef.current) return false;
+    authBusyRef.current = true; setAuthBusy(true); return true;
+  };
+  const unlockAuth = () => { authBusyRef.current = false; setAuthBusy(false); };
+  const [unconfirmedEmail, setUnconfirmedEmail] = React.useState('');
+  const [newPassValue, setNewPassValue] = React.useState('');
+  const [newPassConfirm, setNewPassConfirm] = React.useState('');
   const [resetSent, setResetSent] = React.useState(false);
   const [resetEmail, setResetEmail] = React.useState('');
   const mfaRefs = React.useRef<(HTMLInputElement | null)[]>([]);
@@ -804,6 +837,28 @@ export default function App() {
     return () => clearTimeout(t);
   }, [incomingCall]);
 
+  // E-posta bağlantısından dönüş: sonucu kullanıcıya açıkça söyle ve adresi temizle.
+  React.useEffect(() => {
+    const r = INITIAL_AUTH_RETURN;
+    if (!r) return;
+    if (r.kind === 'error') {
+      setShowAuth(true); setAuthMode('login'); setAuthError('');
+      setAuthNotice(describeAuthError(r.code));
+    } else if (r.kind === 'signup') {
+      setShowAuth(true); setAuthMode('login'); setAuthError('');
+      setAuthNotice('E-posta adresiniz dogrulandi. Bu tarayicida oturumunuz acildi; masaustu uygulamasini kullaniyorsaniz oraya donup e-posta ve sifrenizle giris yapin.');
+    } else if (r.kind === 'recovery') {
+      setShowAuth(true); setAuthMode('newpass'); setAuthError('');
+    }
+    try { window.history.replaceState(null, '', window.location.pathname); } catch { /* yok say */ }
+  }, []);
+  React.useEffect(() => {
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event) => {
+      if (event === 'PASSWORD_RECOVERY') { setShowAuth(true); setAuthMode('newpass'); setAuthError(''); }
+    });
+    return () => subscription.unsubscribe();
+  }, []);
+
   React.useEffect(() => {
     const { data: { subscription } } = supabase.auth.onAuthStateChange(async (_e, session) => {
       // Realtime WebSocket'i kendi JWT'sini taşır ve RLS'i onunla değerlendirir.
@@ -1060,7 +1115,8 @@ export default function App() {
   };
 
   const handleRegister = async () => {
-    setAuthError('');
+    if (authBusyRef.current) return;
+    setAuthError(''); setAuthNotice('');
     if (!displayName.trim()) { setAuthError('Ad Soyad zorunludur.'); return; }
     // Bu hesap, bir baskasinin bilgisayarina baglanma yetkisi tasiyor; esigin
     // bir e-ticaret sitesiyle ayni olmamasi gerekir. Supabase panelinde de
@@ -1073,25 +1129,61 @@ export default function App() {
     if (currentUser?.is_anonymous) {
       try { await supabase.auth.signOut({ scope: 'local' }); } catch { /* yok say */ }
     }
-    const { data, error } = await supabase.auth.signUp({ email, password, options: { data: { display_name: displayName, phone } } });
-    if (error) { setAuthError(error.message); await ensureAnonSession(); return; }
-    // "Confirm email" açıkken Supabase oturum DÖNDÜRMEZ; kullanıcı doğrulamadan giriş yapamaz.
-    const dogrulamaGerekli = !data.session;
-    setShowAuth(false);
-    addLog(dogrulamaGerekli
-      ? 'Kayit alindi. Hesabinizi kullanabilmek icin e-postanizdaki dogrulama baglantisina tiklayin.'
-      : 'Kayit basarili.', 'warn');
-    if (dogrulamaGerekli) await ensureAnonSession();
+    if (!lockAuth()) return;
+    try {
+      const { data, error } = await supabase.auth.signUp({
+        email, password,
+        // Dönüş adresi verilmezse Supabase panelindeki Site URL'e (localhost)
+        // yönlendiriyordu; müşteri doğrulandığı hâlde hata sayfası görüyordu.
+        options: { data: { display_name: displayName, phone }, emailRedirectTo: emailRedirectTo() },
+      });
+      if (error) { setAuthError(error.message); await ensureAnonSession(); return; }
+      // "Confirm email" açıkken Supabase oturum DÖNDÜRMEZ; kullanıcı doğrulamadan giriş yapamaz.
+      const dogrulamaGerekli = !data.session;
+      if (dogrulamaGerekli) {
+        // Pencereyi kapatma: ne yapacağını burada açıkça göster.
+        setUnconfirmedEmail(email);
+        setAuthMode('checkmail');
+        addLog('Kayit alindi. E-postanizdaki dogrulama baglantisina bir kez tiklayin, sonra giris yapin.', 'warn');
+        await ensureAnonSession();
+      } else {
+        setShowAuth(false);
+        addLog('Kayit basarili.', 'sys');
+      }
+    } finally {
+      unlockAuth();
+    }
+  };
+  /** Doğrulama e-postasını yeniden gönderir (tükenmiş/kaybolmuş bağlantı için). */
+  const handleResendConfirmation = async () => {
+    const target = (unconfirmedEmail || email).trim();
+    if (!target) { setAuthError('E-posta adresinizi girin.'); return; }
+    if (!lockAuth()) return;
+    setAuthError('');
+    try {
+      const { error } = await supabase.auth.resend({ type: 'signup', email: target, options: { emailRedirectTo: emailRedirectTo() } });
+      if (error) { setAuthError(error.message); return; }
+      setAuthNotice(`Yeni dogrulama e-postasi ${target} adresine gonderildi.`);
+    } finally {
+      unlockAuth();
+    }
   };
   const handleLogin = async () => {
-    setAuthError('');
-    const { error } = await supabase.auth.signInWithPassword({ email, password });
+    if (!lockAuth()) return;
+    setAuthError(''); setAuthNotice('');
+    let error: { message: string } | null = null;
+    try {
+      ({ error } = await supabase.auth.signInWithPassword({ email, password }));
+    } finally {
+      unlockAuth();
+    }
     if (error) {
       // Supabase bu durumu İngilizce döndürür; kullanıcıya ne yapacağını söyleyelim.
       const dogrulanmamis = /confirm/i.test(error.message);
+      setUnconfirmedEmail(dogrulanmamis ? email : '');
       setAuthError(dogrulanmamis
-        ? 'E-posta adresiniz henuz dogrulanmamis. Gelen kutunuzdaki dogrulama baglantisina tiklayin.'
-        : error.message);
+        ? 'E-posta adresiniz henuz dogrulanmamis. Gelen kutunuzdaki baglantiya tiklayin ya da asagidan yeniden gonderin.'
+        : /invalid login/i.test(error.message) ? 'E-posta veya sifre hatali.' : error.message);
       await ensureAnonSession();
       return;
     }
@@ -1106,9 +1198,42 @@ export default function App() {
   const handlePasswordReset = async () => {
     setAuthError('');
     if (!resetEmail) { setAuthError('E-posta adresinizi girin.'); return; }
-    const { error } = await supabase.auth.resetPasswordForEmail(resetEmail);
-    if (error) { setAuthError(error.message); return; }
-    setResetSent(true);
+    if (!lockAuth()) return;
+    try {
+      const { error } = await supabase.auth.resetPasswordForEmail(resetEmail, { redirectTo: emailRedirectTo() });
+      if (error) {
+        setAuthError(error.status === 429 || /rate limit|seconds/i.test(error.message)
+          ? 'Kisa surede cok fazla istek gonderildi. Bir dakika bekleyip tekrar deneyin.'
+          : error.message);
+        return;
+      }
+      setResetSent(true);
+    } finally {
+      unlockAuth();
+    }
+  };
+  /** Şifre sıfırlama bağlantısından dönen kullanıcı yeni şifresini belirler. */
+  const handleSetNewPassword = async () => {
+    if (authBusyRef.current) return;
+    setAuthError('');
+    if (newPassValue.length < 10) { setAuthError('Yeni sifre en az 10 karakter olmali.'); return; }
+    if (newPassValue !== newPassConfirm) { setAuthError('Sifreler eslesmiyor.'); return; }
+    if (!lockAuth()) return;
+    try {
+      // Bağlantı geçersizse uygulama anonim oturum açmış olabilir; o oturumla
+      // "şifre güncellendi" demek yanlış olur (bağımsız denetim bulgusu R3).
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session?.user || session.user.is_anonymous) {
+        setAuthError('Sifirlama baglantisi gecersiz ya da suresi dolmus. Lutfen yeni bir sifirlama baglantisi isteyin.');
+        return;
+      }
+      const { error } = await supabase.auth.updateUser({ password: newPassValue });
+      if (error) { setAuthError(error.message); return; }
+      setNewPassValue(''); setNewPassConfirm('');
+      setShowAuth(false); addLog('Sifreniz guncellendi.', 'sys');
+    } finally {
+      unlockAuth();
+    }
   };
   const handleUpdateProfile = async () => {
     if (!currentUser) return; setProfileUpdateDone(false);
@@ -3659,8 +3784,12 @@ export default function App() {
                 <div className="space-y-4">
                   <input type="email" placeholder="E-POSTA" className="input-field" value={email} onChange={e => setEmail(e.target.value)} />
                   <input type="password" placeholder="SIFRE" className="input-field" value={password} onChange={e => setPassword(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') handleLogin(); }} />
+                  {authNotice && <p className="text-[10px] text-green-400 leading-relaxed">{authNotice}</p>}
                   {authError && <p className="text-[10px] text-red-400">{authError}</p>}
-                  <button onClick={handleLogin} className="btn-primary">Devam Et</button>
+                  <button onClick={handleLogin} disabled={authBusy} className="btn-primary disabled:opacity-50">{authBusy ? 'Bekleyin...' : 'Devam Et'}</button>
+                  {(unconfirmedEmail || /otp_expired|dogrulama/i.test(authNotice)) && (
+                    <button onClick={handleResendConfirmation} disabled={authBusy} className="w-full text-[10px] text-steppe-gold underline underline-offset-2 disabled:opacity-50">Dogrulama e-postasini yeniden gonder</button>
+                  )}
                   <button onClick={() => { setAuthMode('reset'); setAuthError(''); setResetSent(false); setResetEmail(''); }} className="w-full text-[10px] text-steppe-muted hover:text-steppe-gold transition-colors text-center">Sifremi Unuttum</button>
                   {QRTIM_ENABLED && (<>
                   <div className="flex items-center gap-3 py-1"><div className="flex-1 h-px bg-steppe-border" /><span className="text-[9px] uppercase tracking-widest text-steppe-muted">veya</span><div className="flex-1 h-px bg-steppe-border" /></div>
@@ -3680,9 +3809,9 @@ export default function App() {
                   <input type="text" placeholder="AD SOYAD" className="input-field" value={displayName} onChange={e => setDisplayName(e.target.value)} />
                   <input type="email" placeholder="E-POSTA" className="input-field" value={email} onChange={e => setEmail(e.target.value)} />
                   <input type="tel" placeholder="TELEFON (Istege bagli)" className="input-field" value={phone} onChange={e => setPhone(e.target.value)} />
-                  <input type="password" placeholder="SIFRE (min. 6 karakter)" className="input-field" value={password} onChange={e => setPassword(e.target.value)} />
+                  <input type="password" placeholder="SIFRE (min. 10 karakter)" className="input-field" value={password} onChange={e => setPassword(e.target.value)} />
                   {authError && <p className="text-[10px] text-red-400">{authError}</p>}
-                  <button onClick={handleRegister} className="btn-primary">Kayit Ol</button>
+                  <button onClick={handleRegister} disabled={authBusy} className="btn-primary disabled:opacity-50">{authBusy ? 'Kaydediliyor...' : 'Kayit Ol'}</button>
                   <p className="text-[10px] text-center text-steppe-muted">Zaten hesabiniz var mi?{' '}<button onClick={() => { setAuthMode('login'); setAuthError(''); }} className="text-steppe-gold underline underline-offset-2">Giris Yap</button></p>
                 </div></>
               )}
@@ -3700,13 +3829,39 @@ export default function App() {
                   <button onClick={validateMfa} disabled={isMfaValidating} className="btn-primary disabled:opacity-50">{isMfaValidating ? 'Dogrulanıyor...' : 'Dogrula'}</button>
                 </div></>
               )}
+              {authMode === 'checkmail' && (
+                <><h2 className="text-lg text-steppe-gold mb-4">E-postanizi Dogrulayin</h2>
+                <div className="space-y-4">
+                  <p className="text-[11px] text-steppe-muted leading-relaxed">
+                    <span className="text-steppe-gold">{unconfirmedEmail}</span> adresine bir dogrulama baglantisi gonderdik.
+                  </p>
+                  <ol className="text-[11px] text-steppe-muted leading-relaxed list-decimal pl-4 space-y-1">
+                    <li>E-postadaki baglantiya <strong>bir kez</strong> tiklayin. Baglanti tek kullanimliktir.</li>
+                    <li>Acilan sayfada "dogrulandi" mesajini gorun.</li>
+                    <li>Buraya donup e-posta ve sifrenizle giris yapin.</li>
+                  </ol>
+                  {authNotice && <p className="text-[10px] text-green-400">{authNotice}</p>}
+                  {authError && <p className="text-[10px] text-red-400">{authError}</p>}
+                  <button onClick={() => { setAuthMode('login'); setAuthError(''); setAuthNotice(''); }} className="btn-primary">Dogruladim, giris yap</button>
+                  <button onClick={handleResendConfirmation} disabled={authBusy} className="w-full text-[10px] text-steppe-gold underline underline-offset-2 disabled:opacity-50">E-posta gelmedi, yeniden gonder</button>
+                </div></>
+              )}
+              {authMode === 'newpass' && (
+                <><h2 className="text-lg text-steppe-gold mb-4">Yeni Sifre Belirleyin</h2>
+                <div className="space-y-4">
+                  <input type="password" placeholder="YENI SIFRE (min. 10 karakter)" className="input-field" value={newPassValue} onChange={e => setNewPassValue(e.target.value)} />
+                  <input type="password" placeholder="YENI SIFRE (tekrar)" className="input-field" value={newPassConfirm} onChange={e => setNewPassConfirm(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') handleSetNewPassword(); }} />
+                  {authError && <p className="text-[10px] text-red-400">{authError}</p>}
+                  <button onClick={handleSetNewPassword} disabled={authBusy} className="btn-primary disabled:opacity-50">{authBusy ? 'Kaydediliyor...' : 'Sifreyi Kaydet'}</button>
+                </div></>
+              )}
               {authMode === 'reset' && (
                 <><h2 className="text-lg text-steppe-gold mb-2">Sifre Sifirla</h2>
                 <div className="space-y-4">
                   {!resetSent ? (
                     <><input type="email" placeholder="E-POSTA ADRESINIZ" className="input-field" value={resetEmail} onChange={e => setResetEmail(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') handlePasswordReset(); }} />
                     {authError && <p className="text-[10px] text-red-400">{authError}</p>}
-                    <button onClick={handlePasswordReset} className="btn-primary">Sifirlama Baglantisi Gonder</button></>
+                    <button onClick={handlePasswordReset} disabled={authBusy} className="btn-primary disabled:opacity-50">{authBusy ? 'Gonderiliyor...' : 'Sifirlama Baglantisi Gonder'}</button></>
                   ) : (
                     <div className="text-center py-6">
                       <CheckCircle size={28} className="text-green-400 mx-auto mb-3" />

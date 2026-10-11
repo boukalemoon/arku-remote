@@ -18,3 +18,5 @@ firebase.json
 
 # Vercel yerel proje baglantisi (proje/takim kimligi) — depoda durmamali
 .vercel/
+test-results/
+playwright-report/
