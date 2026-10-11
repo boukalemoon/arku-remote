@@ -11,7 +11,7 @@ import {
   fetchPresence, sendHeartbeat, bindOrgInvites,
 } from './lib/enterprise';
 import type { Organization, OrgMember, ContactCategory, SavedContact, OrgRole, PresenceRow } from './lib/enterprise';
-import type { User as SupabaseUser } from '@supabase/supabase-js';
+import type { User as SupabaseUser, Session } from '@supabase/supabase-js';
 import { WebRTCManager } from './lib/webrtc';
 import type { ConnectionState, InputEventMsg, RtcQuality, ControlMsg, RemoteScreen, FileOffer } from './lib/webrtc';
 import { EMBED, postSessionEvent, resetSessionEvents } from './lib/embed';
@@ -859,13 +859,30 @@ export default function App() {
     return () => subscription.unsubscribe();
   }, []);
 
-  React.useEffect(() => {
-    const { data: { subscription } } = supabase.auth.onAuthStateChange(async (_e, session) => {
-      // Realtime WebSocket'i kendi JWT'sini taşır ve RLS'i onunla değerlendirir.
-      // Politikalar auth.uid()'e bağlandığında bu çağrı yapılmazsa postgres_changes
-      // olayları SESSİZCE hiç gelmez — 2026-07-27'de bağlantıyı bozan tam olarak buydu.
-      supabase.realtime.setAuth(session?.access_token ?? null);
+  // Son işlenen oturumun kullanıcısı ve sırası: eski bir olayın geç biten işi
+  // yenisinin üstüne yazmasın.
+  const authSeqRef = React.useRef(0);
+  const authUserRef = React.useRef<string | null>(null);
 
+  React.useEffect(() => {
+    /**
+     * Oturum değişince profili, kimliği ve geçmişi yükler.
+     *
+     * NEDEN AYRI VE ERTELENMİŞ (saha bildirimi 2026-10-11, "dışarıdan
+     * bağlanamıyor"): Bu gövde eskiden doğrudan `onAuthStateChange(async ...)`
+     * içindeydi. supabase-js dinleyiciyi OTURUM KİLİDİNİ TUTARKEN çağırır ve
+     * bekler; içerideki her `supabase.from()/rpc()` çağrısı da aynı kilidi
+     * ister. Sonuç kalıcı kilitlenme: TURN kimliği, bağlantı isteği, kabul —
+     * oturum isteyen her şey sonsuza dek bekler. Tetikleyen olaylar: anonim
+     * giriş ("Hesap açmadan devam et"), giriş ve SAATTE BİR otomatik jeton
+     * yenileme. Uygulamayı açıp hemen bağlananlar (ofis içi testler) etkilenmez;
+     * açık bırakıp bekleyen müşteri cihazı sessizce çalışmaz hale gelir.
+     * Canlıda iki sekmede yeniden üretildi (Web Locks kilidi kalıcı tutuluyordu).
+     * Supabase'in önerdiği çözüm: dinleyicide yalnızca eşzamanlı iş, gerisi
+     * setTimeout(…, 0) ile kilit bırakıldıktan sonra.
+     */
+    const applySession = async (session: Session | null, seq: number) => {
+      const stale = () => seq !== authSeqRef.current;
       const user = session?.user ?? null;
       const anon = !!user?.is_anonymous;
       setCurrentUser(user);
@@ -884,6 +901,7 @@ export default function App() {
         // hash'ti; çakışan kullanıcının upsert'ü sessizce başarısız oluyor ve
         // o kullanıcı kimliksiz — yani ulaşılamaz — kalıyordu.
         const bound = await bindServerIdentity(user, fp);
+        if (stale()) return;
         setConnectionId(bound.id);
         setIdentityReady(bound.ready);
         setIdentityError(bound.error);
@@ -895,6 +913,7 @@ export default function App() {
           return;
         }
         const { data: prof } = await supabase.from('users').select('*').eq('id', user.id).single();
+        if (stale()) return;
         if (prof) {
           setUserProfile(prof as UserProfile);
           if (prof.theme) setTheme(prof.theme as Theme);
@@ -905,10 +924,14 @@ export default function App() {
           }
         }
         const { data: lgData } = await supabase.from('logs').select('*').eq('user_id', user.id).order('created_at', { ascending: false }).limit(50);
+        if (stale()) return;
         if (lgData) setLogs(lgData.map(l => ({ time: new Date(l.created_at).toLocaleTimeString('tr-TR'), msg: l.msg, type: l.type as LogType })));
         const { data: cxData } = await supabase.from('connections').select('*').eq('caller_id', user.id).order('created_at', { ascending: false }).limit(20);
+        if (stale()) return;
         if (cxData) setConnectionHistory(cxData as ConnectionEntry[]);
-        setEntitlements(await fetchEntitlements());
+        const ent = await fetchEntitlements();
+        if (stale()) return;
+        setEntitlements(ent);
         // Kurumsal davetleri hesaba bagla. Bu cagri olmadan admin'in ekledigi
         // cihaz etiketleri hicbir zaman cozumlenmez ve kurumsal vanity kimlik
         // (acme-01) calismaz — organization_members.user_id NULL kalirdi.
@@ -922,6 +945,28 @@ export default function App() {
         setEntitlements(FREE_ENTITLEMENTS);
         setLogs([{ time: ts(), msg: `Arku Remote v${__APP_VERSION__} baslatildi...`, type: 'sys' }, { time: ts(), msg: 'Lutfen giris yapin.', type: 'warn' }]);
       }
+    };
+
+    // DİKKAT: Bu dinleyici async OLMAMALI ve içinde supabase çağrısı
+    // BEKLENMEMELİ (yukarıdaki açıklama). Yalnızca eşzamanlı iş burada.
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
+      // Realtime WebSocket'i kendi JWT'sini taşır ve RLS'i onunla değerlendirir.
+      // Politikalar auth.uid()'e bağlandığında bu çağrı yapılmazsa postgres_changes
+      // olayları SESSİZCE hiç gelmez — 2026-07-27'de bağlantıyı bozan tam olarak buydu.
+      // Jeton verildiği için supabase-js oturum kilidine dokunmaz.
+      void supabase.realtime.setAuth(session?.access_token ?? null);
+
+      const uid = session?.user?.id ?? null;
+      // Aynı kullanıcının saatlik jeton yenilemesi: kimlik, profil ve oturum
+      // parolası DEĞİŞMEZ. Eskiden her yenilemede hepsi yeniden yükleniyor,
+      // ekrandaki oturum parolası da saatte bir sessizce değişiyordu.
+      if (event === 'TOKEN_REFRESHED' && uid && uid === authUserRef.current) {
+        setCurrentUser(session!.user);
+        return;
+      }
+      authUserRef.current = uid;
+      const seq = ++authSeqRef.current;
+      setTimeout(() => { void applySession(session, seq); }, 0);
     });
     return () => subscription.unsubscribe();
   }, []);
