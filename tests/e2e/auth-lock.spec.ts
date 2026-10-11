@@ -39,6 +39,8 @@ async function mock(page: Page) {
     if (url.pathname === '/auth/v1/user' && req.method() === 'PUT') {
       return json(200, { id: 'real-1', email: 'real@example.com', aud: 'authenticated', role: 'authenticated', is_anonymous: false });
     }
+    // Canlıdaki gibi: sunucu kimliği atar (bağlama "hazır" olur).
+    if (url.pathname === '/rest/v1/rpc/arku_ensure_connection_id') return json(200, '123-456-789');
     if (url.pathname.startsWith('/rest/v1/rpc/')) return json(200, null);
     if (url.pathname.startsWith('/rest/v1/')) return json(200, []);
     if (url.pathname.startsWith('/functions/v1/')) return json(200, { iceServers: [] });
@@ -74,7 +76,8 @@ test('saatlik jeton yenilemesinden sonra oturum kilidi bırakılır', async ({ p
     const s = JSON.parse(localStorage.getItem(k)!);
     s.expires_at = Math.floor(Date.now() / 1000) + 20;
     localStorage.setItem(k, JSON.stringify(s));
-    document.dispatchEvent(new Event('visibilitychange'));
+    // bubbles: supabase-js dinleyicisi window'da; kabarcıklanmayan olay oraya ulaşmaz.
+    document.dispatchEvent(new Event('visibilitychange', { bubbles: true }));
   }, STORE);
   await expect.poll(() => calls.filter((c) => c.url.includes('grant_type=refresh_token')).length, { timeout: 10_000 }).toBeGreaterThan(0);
 
@@ -98,4 +101,24 @@ test('yeni şifre kaydedildikten sonra (USER_UPDATED) oturum kilidi bırakılır
   await page.getByRole('button', { name: 'Sifreyi Kaydet' }).click();
   await expect(page.getByText('Yeni Sifre Belirleyin')).toBeHidden();
   expect(await lockReleasedWithin(page, 3000), 'oturum kilidi kalıcı tutuluyor (kilitlenme)').toBe(true);
+});
+
+test('pencere tekrar görünür olunca (SIGNED_IN) kimlik yeniden bağlanmaz, günlük silinmez', async ({ page }) => {
+  const calls = await mock(page);
+  await page.goto('/');
+  const binds = () => calls.filter((c) => c.path.startsWith('/rest/v1/rpc/arku_ensure_connection_id')).length;
+  await expect.poll(binds).toBeGreaterThan(0);
+  await page.waitForTimeout(1500);
+  const before = binds();
+  const logBefore = await page.evaluate(() => document.body.innerText.includes('Misafir olarak devam ediliyor.'));
+  // Electron'da küçültülmüş pencereyi açmak ya da sekmeye dönmek budur:
+  // supabase-js oturumu yeniden okur ve SIGNED_IN yayınlar.
+  for (let i = 0; i < 3; i++) {
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange', { bubbles: true })));
+    await page.waitForTimeout(500);
+  }
+  await page.waitForTimeout(1000);
+  expect(binds(), 'kimlik RPC her görünürlükte yeniden çalıştı').toBe(before);
+  expect(logBefore).toBe(true);
+  expect(await lockReleasedWithin(page, 3000)).toBe(true);
 });

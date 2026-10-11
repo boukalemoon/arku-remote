@@ -147,6 +147,9 @@ function setupUpdates() {
 
 function createWindow(opts = {}) {
   const win = new BrowserWindow({
+    // Küçültülmüş başlatmada pencere önce GÖSTERİLMEZ (açılışta odak çalıp
+    // boş pencere göstermesin); ready-to-show'da küçültülür.
+    show: !opts.startMinimized,
     width: 1280,
     height: 820,
     minWidth: 960,
@@ -293,8 +296,14 @@ if (isDev) {
   // seçiliyse görev çubuğuna küçültülür — GİZLENMEZ: tepsi simgesi olmadığı
   // için gizli pencereye kullanıcı ulaşamazdı.
   win.once('ready-to-show', () => {
-    if (opts.startMinimized) win.minimize();
-    else win.show();
+    if (opts.startMinimized) {
+      win.minimize();
+      // Bazı sürücülerde gizli pencereye minimize() görünürlük vermez: o
+      // durumda etkinleştirmeden gösterip tekrar küçült. Pencere ASLA gizli kalmaz.
+      if (!win.isVisible()) { win.showInactive(); win.minimize(); }
+    } else {
+      win.show();
+    }
   });
   return win;
 }
@@ -327,9 +336,20 @@ function writeAutoStartPrefs(prefs) {
   fs.writeFileSync(AUTOSTART_CONFIG_FILE(), JSON.stringify({ minimized: prefs.minimized === true }), 'utf8');
 }
 
-/** Windows'ta kayıt yol+argümanla eşleştirilir; okurken de aynısı verilmeli. */
+/**
+ * Başlangıca yazılacak program. Taşınabilir (portable) sürümde
+ * process.execPath %TEMP%'e açılan ve kapanınca silinen kopyadır; kaydı
+ * kullanıcının çalıştırdığı asıl .exe'ye (PORTABLE_EXECUTABLE_FILE) yapmalıyız.
+ */
+function autoStartExe() {
+  return process.env.PORTABLE_EXECUTABLE_FILE || process.execPath;
+}
+
+/** Windows'ta kayıt ad+yol+argümanla eşleştirilir; okurken de aynısı verilmeli. */
 function loginItemTarget() {
-  return process.platform === 'win32' ? { path: process.execPath, args: [AUTOSTART_ARG] } : {};
+  return process.platform === 'win32'
+    ? { path: autoStartExe(), args: [AUTOSTART_ARG], name: 'Arku Remote' }
+    : {};
 }
 
 function autoStartState() {
@@ -1038,7 +1058,28 @@ ipcMain.handle('check-for-updates', async () => {
   return found ? { status: 'available' } : { status: 'current', version: current };
 });
 
+// ── Tek kopya ────────────────────────────────────────────────────────────────
+// Açılışta otomatik başlayan (belki küçültülmüş) uygulama varken kullanıcı
+// kısayola tıklarsa İKİNCİ bir süreç aynı kimlik ve oturum belirteçleriyle
+// açılıyordu. Artık mevcut pencere öne getirilir. Aynı süreçte birden fazla
+// oturum penceresi (Ctrl+N / Yeni Oturum) etkilenmez.
+const gotSingleInstanceLock = typeof app.requestSingleInstanceLock === 'function'
+  ? app.requestSingleInstanceLock()
+  : true;
+if (!gotSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    const win = BrowserWindow.getAllWindows()[0];
+    if (!win) { if (app.isReady()) createWindow(); return; }
+    if (win.isMinimized()) win.restore();
+    win.show();
+    win.focus();
+  });
+}
+
 app.whenReady().then(() => {
+  if (!gotSingleInstanceLock) return;
   // ── İzinler: varsayılan REDDET ──────────────────────────────────────────
   // Electron, işleyici tanımlanmazsa izin isteklerini VERİR. Arku kamera,
   // mikrofon, bildirim, konum veya pano-okuma izni kullanmıyor; ekran

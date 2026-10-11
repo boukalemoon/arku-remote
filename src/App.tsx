@@ -867,6 +867,9 @@ export default function App() {
   // yenisinin üstüne yazmasın.
   const authSeqRef = React.useRef(0);
   const authUserRef = React.useRef<string | null>(null);
+  const authAnonRef = React.useRef<boolean | null>(null);
+  // Bu kullanıcı için yükleme başarıyla bitti mi (kimlik sunucuda bağlandı)?
+  const authAppliedRef = React.useRef<string | null>(null);
 
   React.useEffect(() => {
     /**
@@ -887,6 +890,7 @@ export default function App() {
      */
     const applySession = async (session: Session | null, seq: number) => {
       const stale = () => seq !== authSeqRef.current;
+      if (stale()) return;
       const user = session?.user ?? null;
       const anon = !!user?.is_anonymous;
       setCurrentUser(user);
@@ -909,6 +913,8 @@ export default function App() {
         setConnectionId(bound.id);
         setIdentityReady(bound.ready);
         setIdentityError(bound.error);
+        // Kimlik bağlanamadıysa bir sonraki oturum olayı yeniden denesin.
+        authAppliedRef.current = bound.ready ? user.id : null;
         if (anon) {
           // Misafir: profil/geçmiş/abonelik yüklenmez, kayıt tutulmaz.
           setUserProfile(null);
@@ -961,14 +967,23 @@ export default function App() {
       void supabase.realtime.setAuth(session?.access_token ?? null);
 
       const uid = session?.user?.id ?? null;
-      // Aynı kullanıcının saatlik jeton yenilemesi: kimlik, profil ve oturum
-      // parolası DEĞİŞMEZ. Eskiden her yenilemede hepsi yeniden yükleniyor,
-      // ekrandaki oturum parolası da saatte bir sessizce değişiyordu.
-      if (event === 'TOKEN_REFRESHED' && uid && uid === authUserRef.current) {
+      const anon = !!session?.user?.is_anonymous;
+      // Aynı kullanıcı için tekrar eden olaylar: kimlik ve profil yeniden
+      // YÜKLENMEZ. supabase-js saatlik yenilemede TOKEN_REFRESHED, pencere/sekme
+      // tekrar görünür olunca (Electron'da küçültülmüş pencereyi açınca) ve
+      // başka sekmeden yayınla SIGNED_IN gönderir. Eskiden her birinde kimlik
+      // RPC'si yeniden çalışıyor, günlük siliniyor, oturum etiketi değişiyordu;
+      // o anda ağ kesikse gösterilen kimlik bile değişebiliyordu
+      // (bağımsız inceleme bulgusu, 2026-10-11).
+      const sameUser = !!uid && uid === authUserRef.current && anon === authAnonRef.current;
+      if (sameUser && authAppliedRef.current === uid
+          && (event === 'TOKEN_REFRESHED' || event === 'SIGNED_IN' || event === 'USER_UPDATED' || event === 'INITIAL_SESSION')) {
         setCurrentUser(session!.user);
         return;
       }
       authUserRef.current = uid;
+      authAnonRef.current = uid ? anon : null;
+      if (!uid) authAppliedRef.current = null;
       const seq = ++authSeqRef.current;
       setTimeout(() => { void applySession(session, seq); }, 0);
     });
@@ -2736,6 +2751,11 @@ export default function App() {
       const st: AutoStartState = await api.setAutoStart(next);
       setAutoStart(st);
       if (st.error) addLocalLog(`Otomatik baslatma ayarlanamadi: ${st.error}`, 'error');
+      // İşletim sistemi isteği uygulamadıysa (macOS onay bekliyor, ilke engeli)
+      // "kapatıldı" demek yanlış olur: istenenle olanı karşılaştır.
+      else if (st.enabled !== next.enabled) addLocalLog(next.enabled
+        ? 'Otomatik baslatma sistem tarafindan uygulanmadi (izin veya onay gerekebilir).'
+        : 'Otomatik baslatma kapatilamadi.', 'error');
       else addLocalLog(st.enabled
         ? `Bilgisayar acilinca Arku Remote otomatik baslayacak${st.minimized ? ' (kucultulmus)' : ''}.`
         : 'Otomatik baslatma kapatildi.', 'sys');

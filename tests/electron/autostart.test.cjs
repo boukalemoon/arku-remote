@@ -25,6 +25,7 @@ function loadMain({ platform = 'win32', packaged = true } = {}) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), 'arku-autostart-'));
   const ipc = new Map();
   const loginCalls = [];
+  const readQueries = [];
   let loginState = { openAtLogin: false };
   const noop = () => {};
   const evt = { on: noop, once: noop };
@@ -33,7 +34,7 @@ function loadMain({ platform = 'win32', packaged = true } = {}) {
       isPackaged: packaged, whenReady: () => new Promise(noop), on: noop, getPath: () => userData,
       getVersion: () => '0.0.0', requestSingleInstanceLock: () => true, quit: noop,
       setLoginItemSettings: (s) => { loginCalls.push(s); loginState = { openAtLogin: !!s.openAtLogin }; },
-      getLoginItemSettings: () => ({ ...loginState }),
+      getLoginItemSettings: (q) => { readQueries.push(q); return { ...loginState }; },
     },
     BrowserWindow: Object.assign(function () {}, { fromWebContents: () => null, getAllWindows: () => [] }),
     session: { defaultSession: evt },
@@ -60,7 +61,7 @@ function loadMain({ platform = 'win32', packaged = true } = {}) {
     try { return await ipc.get(ch)({ sender: { id: 1 } }, arg); }
     finally { Object.defineProperty(process, 'platform', realPlatform); }
   };
-  return { call, loginCalls, userData };
+  return { call, loginCalls, readQueries, userData };
 }
 
 test('Windows: varsayılan kapalı; açınca uygulamanın kendisi sabit argümanla kaydedilir', async () => {
@@ -72,6 +73,10 @@ test('Windows: varsayılan kapalı; açınca uygulamanın kendisi sabit argüman
   assert.equal(m.loginCalls[0].openAtLogin, true);
   assert.equal(m.loginCalls[0].path, process.execPath);
   assert.deepEqual(m.loginCalls[0].args, ['--arku-autostart']);
+  assert.equal(m.loginCalls[0].name, 'Arku Remote');
+  // Windows kaydı ad+yol+argümanla eşleştirir: okuma da aynı hedefle yapılmalı.
+  const q = m.readQueries.at(-1);
+  assert.deepEqual({ path: q.path, args: q.args, name: q.name }, { path: process.execPath, args: ['--arku-autostart'], name: 'Arku Remote' });
   // Tercih kalıcı: yeni süreç de okur.
   const saved = JSON.parse(fs.readFileSync(path.join(m.userData, 'arku-autostart.json'), 'utf8'));
   assert.deepEqual(saved, { minimized: true });
@@ -110,5 +115,16 @@ test('geliştirme kipinde (paketlenmemiş) ve Linux\'ta desteklenmez, kayda doku
     assert.equal((await m.call('autostart:get')).supported, false);
     await m.call('autostart:set', { enabled: true });
     assert.equal(m.loginCalls.length, 0, JSON.stringify(opts));
+  }
+});
+
+test('taşınabilir sürümde %TEMP% kopyası değil asıl .exe kaydedilir', async () => {
+  process.env.PORTABLE_EXECUTABLE_FILE = 'D:\\Araclar\\ArkuRemote.exe';
+  try {
+    const m = loadMain();
+    await m.call('autostart:set', { enabled: true });
+    assert.equal(m.loginCalls[0].path, 'D:\\Araclar\\ArkuRemote.exe');
+  } finally {
+    delete process.env.PORTABLE_EXECUTABLE_FILE;
   }
 });
