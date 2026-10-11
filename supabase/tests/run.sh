@@ -14,5 +14,7 @@ $P -f "$here/01_prefix_functions.sql"
 if [[ "${1:-}" != "--baseline" ]]; then
   $P -f "$mig/20261007000100_fix_ensure_connection_id.sql"
   $P -f "$mig/20261007000200_org_takeover_and_seat_limit.sql"
+  $P -f "$mig/20261011000100_ensure_connection_id_atomic.sql"
 fi
 $P -f "$here/10_denetim_20261007.sql"
+bash "$here/20_connection_id_race.sh" "$db"
