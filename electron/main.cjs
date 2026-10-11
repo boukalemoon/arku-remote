@@ -145,7 +145,7 @@ function setupUpdates() {
   setInterval(check, UPDATE_CHECK_INTERVAL);
 }
 
-function createWindow() {
+function createWindow(opts = {}) {
   const win = new BrowserWindow({
     width: 1280,
     height: 820,
@@ -289,11 +289,80 @@ if (isDev) {
   win.webContents.on('render-process-gone', dropGrant);
   win.on('closed', dropGrant);
 
-  // Pencere hazır olduğunda göster
+  // Pencere hazır olduğunda göster. Windows açılışında "küçültülmüş başlat"
+  // seçiliyse görev çubuğuna küçültülür — GİZLENMEZ: tepsi simgesi olmadığı
+  // için gizli pencereye kullanıcı ulaşamazdı.
   win.once('ready-to-show', () => {
-    win.show();
+    if (opts.startMinimized) win.minimize();
+    else win.show();
   });
+  return win;
 }
+
+// ── Bilgisayar açılınca otomatik başlat (isteğe bağlı) ───────────────────────
+// Ayarlar'dan açılır; varsayılan KAPALI. Uzaktan erişilecek cihazın (ofis
+// bilgisayarı, müşteri makinesi) yeniden başlatmadan sonra da ulaşılabilir
+// kalması için.
+//
+// Güvenlik: başlangıç kaydının YOLU ve ARGÜMANLARI ana süreçte belirlenir.
+// Renderer yalnızca iki boolean gönderebilir (açık/kapalı, küçültülmüş); web
+// içeriği ele geçirilse bile başlangıca başka bir program ya da argüman
+// yazdıramaz. Geliştirme kipinde (paketlenmemiş) kayıt yapılmaz: orada
+// process.execPath çıplak electron.exe'dir.
+const AUTOSTART_ARG = '--arku-autostart';
+const AUTOSTART_CONFIG_FILE = () => path.join(app.getPath('userData'), 'arku-autostart.json');
+
+function autoStartSupported() {
+  return app.isPackaged && (process.platform === 'win32' || process.platform === 'darwin');
+}
+
+function readAutoStartPrefs() {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(AUTOSTART_CONFIG_FILE(), 'utf8'));
+    return { minimized: cfg && cfg.minimized === true };
+  } catch { return { minimized: false }; }
+}
+
+function writeAutoStartPrefs(prefs) {
+  fs.writeFileSync(AUTOSTART_CONFIG_FILE(), JSON.stringify({ minimized: prefs.minimized === true }), 'utf8');
+}
+
+/** Windows'ta kayıt yol+argümanla eşleştirilir; okurken de aynısı verilmeli. */
+function loginItemTarget() {
+  return process.platform === 'win32' ? { path: process.execPath, args: [AUTOSTART_ARG] } : {};
+}
+
+function autoStartState() {
+  if (!autoStartSupported()) return { supported: false, enabled: false, minimized: false };
+  let enabled = false;
+  try { enabled = !!app.getLoginItemSettings(loginItemTarget()).openAtLogin; } catch { /* okunamadı */ }
+  return { supported: true, enabled, minimized: readAutoStartPrefs().minimized };
+}
+
+/** Bu süreç bilgisayar açılışında mı başlatıldı? */
+function launchedAtLogin() {
+  if (process.argv.includes(AUTOSTART_ARG)) return true;
+  if (process.platform === 'darwin') {
+    try { return !!app.getLoginItemSettings().wasOpenedAtLogin; } catch { return false; }
+  }
+  return false;
+}
+
+ipcMain.handle('autostart:get', () => autoStartState());
+
+ipcMain.handle('autostart:set', (_e, opts) => {
+  if (!autoStartSupported()) return autoStartState();
+  // Yalnızca gerçek boolean true kabul edilir; başka her şey "kapalı".
+  const enabled = !!opts && opts.enabled === true;
+  const minimized = !!opts && opts.minimized === true;
+  try {
+    app.setLoginItemSettings({ openAtLogin: enabled, ...loginItemTarget() });
+    writeAutoStartPrefs({ minimized });
+  } catch (err) {
+    return { ...autoStartState(), error: String((err && err.message) || err) };
+  }
+  return autoStartState();
+});
 
 // ── Ekran paylaşım kaynağı seçici ────────────────────────────────────────────
 // Eskiden `sources[0]` (birincil ekranın tamamı) + `audio: 'loopback'` sorgusuz
@@ -984,7 +1053,8 @@ app.whenReady().then(() => {
 
   // Oturum genelinde bir kez bağlanır (pencere başına değil).
   setupDisplayMediaHandler();
-  createWindow();
+  // Bilgisayar açılışında başlatıldıysa ve kullanıcı istediyse küçültülmüş aç.
+  createWindow({ startMinimized: launchedAtLogin() && autoStartSupported() && readAutoStartPrefs().minimized });
   setupUpdates();
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();

@@ -403,6 +403,10 @@ export default function App() {
   // Elle güncelleme kontrolü (yalnızca masaüstü uygulamasında anlamlı)
   const [updateCheck, setUpdateCheck] = React.useState<{ status: string; version?: string; message?: string } | null>(null);
   const [updateChecking, setUpdateChecking] = React.useState(false);
+  // Bilgisayar açılınca otomatik başlat (yalnızca paketli masaüstü; Windows/macOS).
+  type AutoStartState = { supported: boolean; enabled: boolean; minimized: boolean; error?: string };
+  const [autoStart, setAutoStart] = React.useState<AutoStartState | null>(null);
+  const [autoStartBusy, setAutoStartBusy] = React.useState(false);
   const [qrtimUser, setQrtimUser] = React.useState<QrtimUser | null>(null);
   const [qrtimLinking, setQrtimLinking] = React.useState(false);
   const [entitlements, setEntitlements] = React.useState<Entitlements>(FREE_ENTITLEMENTS);
@@ -2716,6 +2720,32 @@ export default function App() {
     return `Kontrol edilemedi: ${r.message ?? 'bilinmeyen hata'}`;
   };
 
+  React.useEffect(() => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const api = (window as any).electronAPI;
+    if (!api?.getAutoStart) return;
+    api.getAutoStart().then((st: AutoStartState) => setAutoStart(st)).catch(() => { /* yok say */ });
+  }, []);
+
+  const changeAutoStart = async (next: { enabled: boolean; minimized: boolean }) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const api = (window as any).electronAPI;
+    if (!api?.setAutoStart || autoStartBusy) return;
+    setAutoStartBusy(true);
+    try {
+      const st: AutoStartState = await api.setAutoStart(next);
+      setAutoStart(st);
+      if (st.error) addLocalLog(`Otomatik baslatma ayarlanamadi: ${st.error}`, 'error');
+      else addLocalLog(st.enabled
+        ? `Bilgisayar acilinca Arku Remote otomatik baslayacak${st.minimized ? ' (kucultulmus)' : ''}.`
+        : 'Otomatik baslatma kapatildi.', 'sys');
+    } catch (err) {
+      addLocalLog(`Otomatik baslatma ayarlanamadi: ${String(err)}`, 'error');
+    } finally {
+      setAutoStartBusy(false);
+    }
+  };
+
   const isLight = theme === 'umay';
 
   // ── Bağlantı kalitesi göstergesi ───────────────────────────────────────────
@@ -3457,6 +3487,42 @@ export default function App() {
                 </p>
               </div>
             </section>
+            {autoStart?.supported && (
+              <section className="gokturk-border surface-card p-8">
+                <h3 className="text-[10px] uppercase tracking-widest text-steppe-muted mb-6 flex items-center gap-2"><Monitor size={12} className="text-steppe-gold" /> Baslangic</h3>
+                <div className="space-y-4">
+                  <label className="flex items-start justify-between gap-4 cursor-pointer">
+                    <div>
+                      <p className="text-[11px] text-steppe-paper">Bilgisayar acilinca otomatik baslat</p>
+                      <p className="text-[9px] text-steppe-muted">Bu cihaza uzaktan erisilecekse yeniden baslatmadan sonra da ulasilabilir kalir.</p>
+                    </div>
+                    <input
+                      type="checkbox"
+                      aria-label="Bilgisayar acilinca otomatik baslat"
+                      className="mt-1 h-4 w-4 accent-[var(--steppe-gold,#c5a059)]"
+                      checked={autoStart.enabled}
+                      disabled={autoStartBusy}
+                      onChange={e => changeAutoStart({ enabled: e.target.checked, minimized: autoStart.minimized })}
+                    />
+                  </label>
+                  <label className={`flex items-start justify-between gap-4 ${autoStart.enabled ? 'cursor-pointer' : 'opacity-40'}`}>
+                    <div>
+                      <p className="text-[11px] text-steppe-paper">Kucultulmus baslat</p>
+                      <p className="text-[9px] text-steppe-muted">Pencere acilmaz, gorev cubugunda bekler.</p>
+                    </div>
+                    <input
+                      type="checkbox"
+                      aria-label="Kucultulmus baslat"
+                      className="mt-1 h-4 w-4 accent-[var(--steppe-gold,#c5a059)]"
+                      checked={autoStart.minimized}
+                      disabled={autoStartBusy || !autoStart.enabled}
+                      onChange={e => changeAutoStart({ enabled: autoStart.enabled, minimized: e.target.checked })}
+                    />
+                  </label>
+                  {autoStart.error && <p className="text-[10px] text-red-400">Ayarlanamadi: {autoStart.error}</p>}
+                </div>
+              </section>
+            )}
             <section className="gokturk-border surface-card p-8">
               <h3 className="text-[10px] uppercase tracking-widest text-steppe-muted mb-6 flex items-center gap-2"><User size={12} className="text-steppe-gold" /> Profil Bilgileri</h3>
               {isRegistered ? (

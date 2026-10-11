@@ -45,4 +45,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Girdi enjeksiyonu bu makinede çalışabilir mi (nut-js yüklü mü, macOS
   // erişilebilirlik izni var mı). Arayüz sessiz başarısızlık yerine sebebi gösterir.
   remoteControlStatus: () => ipcRenderer.invoke('remote-control:status'),
+  // Bilgisayar açılınca otomatik başlat. Dönüş: { supported, enabled, minimized, error? }
+  // Kayıt yolu ve argümanı ana süreçte belirlenir; buradan yalnızca boolean gider.
+  getAutoStart: () => ipcRenderer.invoke('autostart:get'),
+  setAutoStart: (opts) => ipcRenderer.invoke('autostart:set', {
+    enabled: !!(opts && opts.enabled), minimized: !!(opts && opts.minimized),
+  }),
 });
