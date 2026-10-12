@@ -9,6 +9,15 @@ contextBridge.exposeInMainWorld('electronAPI', {
   newWindow: () => ipcRenderer.send('new-window'),
   // Ayarlar'dan elle güncelleme kontrolü
   checkForUpdates: () => ipcRenderer.invoke('check-for-updates'),
+  // Zorunlu güncelleme: indir ve kur (Windows kurulumu / AppImage) ya da
+  // indirme sayfasını aç. İlerleme onUpdateProgress ile gelir.
+  installUpdateNow: () => ipcRenderer.invoke('update:install-now'),
+  onUpdateProgress: (cb) => {
+    if (typeof cb !== 'function') return () => {};
+    const h = (_e, p) => cb(p);
+    ipcRenderer.on('update:progress', h);
+    return () => ipcRenderer.removeListener('update:progress', h);
+  },
   // Uzaktan kontrol izni: onayı ana süreç kendi penceresinde sorar, kararı
   // kendisi saklar. Web içeriği izni tek başına veremez.
   // Dönüş: { granted, pointer, reason?, error? }

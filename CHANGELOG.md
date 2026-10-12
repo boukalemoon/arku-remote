@@ -8,7 +8,29 @@ Sürümleme: [Semantic Versioning](https://semver.org/lang/tr/)
 
 ---
 
-## [1.6.0] — 2026-10-06
+## [1.6.0] — 2026-10-12
+
+### ⚠ Zorunlu güncelleme
+
+Bu sürümden itibaren oturum parolası ağda düz metin olarak gitmiyor. v1.4.0
+bu yeni doğrulamayı tanımadığı için **v1.6.0'dan bir v1.4.0'a parolayla
+bağlanılamaz** (karşı tarafa "parola reddedildi, karşı taraf eski sürüm
+kullanıyor" yazar). Eski parola biçimine geri dönülmedi; herkesin
+güncellemesi gerekiyor:
+
+- **Windows (kurulum):** v1.4.0 yeni sürümü arka planda kendisi indirir ve
+  sorar; "Daha Sonra" denirse uygulama kapanırken kurar.
+- **Windows portable (`Arku-Remote.exe`):** kendini güncelleyemez. v1.4.0
+  portable arka planda ayrıca bir kurulum sürümü kurabilir, ama açtığınız
+  portable dosya eski kalır: yeni portable dosyayı indirip eskisinin yerine
+  koyun. v1.6.0 portable artık doğrudan indirme sayfasına yönlendirir.
+- **macOS, Linux `.deb`:** uygulama yeni sürüm uyarısı gösterir; indirme
+  sayfasından kurulmalı. Linux AppImage kendini günceller.
+- **v1.6.0 ve sonrası:** sunucudan en düşük sürüm zorunlu kılınabiliyor
+  (`app_config.min_desktop_version`). Altındaki uygulama bağlantı kurmaz,
+  çağrı kabul etmez ve "Güncelleme gerekli" ekranı gösterir; tek tuşla
+  indirip kurar.
+
 
 ### ⚠ Bu sürüm v1.5.0'ı da içerir
 
@@ -19,6 +41,12 @@ bölümü de bu sürümün parçasıdır.
 
 ### Eklendi
 
+- **Bilgisayar açılınca otomatik başlat (isteğe bağlı).** Ayarlar >
+  Başlangıç. Küçültülmüş başlatma seçeneği var; ikinci kez açılınca yeni
+  kopya yerine mevcut pencere öne gelir (Windows ve macOS).
+- **Zorunlu güncelleme ekranı** (yukarıya bakın).
+- **Daha görünür logo.** Uygulama başlığında ve web sitesinde zeminsiz,
+  daha büyük logo.
 - **Hizmet süresi ölçümü.** Bir müşteriye ne kadar süre hizmet verildiği artık
   sunucu saatiyle ölçülüyor ve müşteri bazında raporlanabiliyor. Oturum
   sürerken dakikada bir "hâlâ bağlıyım" işareti gidiyor; uygulama çökse bile
@@ -48,6 +76,15 @@ bölümü de bu sürümün parçasıdır.
 
 ### Düzeltildi
 
+- **Farklı ağlardaki kullanıcılar birbirine bağlanamıyordu.** Uygulama bir
+  saatten uzun açık kaldığında ya da bir süre sonra yeniden açıldığında
+  oturum yenilemesi kilitleniyor, kimlik sunucuya bağlanamıyor ve çağrılar
+  karşıya ulaşmıyordu.
+- **Kayıt ve şifre sıfırlama bağlantıları** masaüstü uygulamasından
+  açıldığında `localhost`a dönüyordu; artık web uygulamasına döner, süresi
+  dolan bağlantıda Türkçe açıklama ve yeniden gönderme seçeneği çıkar.
+- **Hesaplı kullanıcının bağlantı kimliği** aynı anda açılan iki oturumda
+  farklılaşamıyor (migration `20261011000100`).
 - **Linux'ta ekran paylaşımı (Wayland).** Ubuntu 22.04 ve Fedora'nın varsayılan
   oturumunda ekran paylaşımı sessizce boş geliyordu: paylaşan taraf "başladı"
   görüyor, karşı taraf siyah ekran görüyordu. Düzeltildi.

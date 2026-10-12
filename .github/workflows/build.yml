@@ -198,7 +198,11 @@ jobs:
           VITE_TURN_CREDENTIAL: ${{ secrets.VITE_TURN_CREDENTIAL }}
 
       - name: Build Electron — ${{ matrix.name }}
-        run: npm run desktop:build:${{ matrix.platform }}
+        # Etiket DISI derlemelerde (main'e push, PR) yayimlama KAPALI. Aksi halde
+        # electron-builder CI'da "onTagOrDraft" kipine gecip son 2 saatte
+        # yayimlanmis ayni surumun dosyalarini bu derlemenin dosyalariyla
+        # degistiriyordu (once etiket, sonra PR birlestirme sirasinda).
+        run: npm run desktop:build:${{ matrix.platform }} -- ${{ startsWith(github.ref, 'refs/tags/v') && '--publish onTag' || '--publish never' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
@@ -211,11 +215,18 @@ jobs:
           # Sertifika eklemek için CSC_LINK ve CSC_KEY_PASSWORD secret'larını tanımlayın.
           CSC_IDENTITY_AUTO_DISCOVERY: false
 
+      # latest*.yml ve *.blockmap: kurulu uygulamalarin otomatik guncelleyicisi
+      # (electron-updater) yeni surumu BU dosyalardan bulur. v1.4.0'da bunlari
+      # electron-builder kendisi yukluyordu (GH_TOKEN + etiket); o yol bir gun
+      # kapanirsa guncelleme sessizce durur, istemciler yalnizca "yeni surum
+      # var" uyarisina duser. Zorunlu guncelleme buna dayandigi icin yedekli.
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.platform }}
           path: |
+            dist_electron/latest*.yml
+            dist_electron/*.blockmap
             dist_electron/*.exe
             dist_electron/*.dmg
             dist_electron/*.zip

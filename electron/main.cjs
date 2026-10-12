@@ -64,9 +64,24 @@ const RELEASES_LATEST_URL = `https://github.com/${GITHUB_REPO}/releases/latest`;
 const WEBSITE_DOWNLOAD_URL = 'https://www.arku.com.tr/#indir';
 const downloadPageUrl = () => WEBSITE_DOWNLOAD_URL || RELEASES_LATEST_URL;
 let updateNotified = false; // bildirim tabanlı yolda oturum başına tek uyarı
+// Zorunlu güncelleme (app_config.min_desktop_version). Kullanıcı engelleme
+// ekranında "Güncelle"ye bastığında true olur: indirme bitince onay
+// penceresi sorulmadan kurulur (kullanıcı zaten onay verdi).
+let updaterRef = null;
+let forcedInstall = false;
+let downloadedVersion = null;
+let installAttempted = false; // indirilmis dosyayla kurulum denendi mi
+
+function sendUpdateProgress(payload) {
+  for (const w of BrowserWindow.getAllWindows()) {
+    if (!w.isDestroyed()) w.webContents.send('update:progress', payload);
+  }
+}
 
 function canAutoInstallUpdates() {
-  if (process.platform === 'win32') return true;
+  // Portable .exe kendini guncelleyemez: electron-updater onun yerine AYRI bir
+  // kurulum surumu kurar, kullanicinin actigi portable dosya eski kalir.
+  if (process.platform === 'win32') return !process.env.PORTABLE_EXECUTABLE_FILE;
   if (process.platform === 'linux') return !!process.env.APPIMAGE; // .deb hariç
   return false; // macOS: imza olmadan Squirrel.Mac güncellemesi çalışmaz
 }
@@ -121,7 +136,19 @@ function setupUpdates() {
   // verdiğinde yapılıyor. Authenticode sertifikası eklendiğinde açılabilir.
   autoUpdater.autoInstallOnAppQuit = false;
 
+  updaterRef = autoUpdater;
+  autoUpdater.on('download-progress', (p) => {
+    if (forcedInstall) sendUpdateProgress({ state: 'downloading', percent: Math.round(p.percent || 0) });
+  });
   autoUpdater.on('update-downloaded', async (info) => {
+    downloadedVersion = info.version;
+    if (forcedInstall) {
+      installAttempted = true;
+      sendUpdateProgress({ state: 'installing', version: info.version });
+      // Pencere kapanma olayları bitsin diye bir tur bekle.
+      setTimeout(() => autoUpdater.quitAndInstall(), 300);
+      return;
+    }
     const win = BrowserWindow.getAllWindows()[0];
     const { response } = await guardedDialog.showMessageBox(win, {
       type: 'info',
@@ -138,7 +165,16 @@ function setupUpdates() {
   // Eskiden hatalar tamamen yutuluyordu: autoUpdater yapılandırması bozuksa
   // (örn. app-update.yml eksik) kullanıcı NE güncelleme NE de uyarı görüyordu.
   // Artık bildirim yoluna düşülüyor, böylece elle güncelleyebilir.
-  autoUpdater.on('error', () => { checkLatestAndNotify(); });
+  autoUpdater.on('error', (err) => {
+    if (forcedInstall) {
+      // Zorunlu kurulum yolunda hata: kullanıcı engelleme ekranında bekliyor;
+      // sessiz kalmak yerine elle indirme yoluna yönlendir.
+      forcedInstall = false;
+      sendUpdateProgress({ state: 'error', message: String((err && err.message) || err) });
+      return;
+    }
+    checkLatestAndNotify();
+  });
 
   const check = () => { autoUpdater.checkForUpdates().catch(() => {}); };
   check();
@@ -1030,6 +1066,58 @@ ipcMain.on('remote-control:revoke', (e) => {
 
 // Renderer'daki "Yeni Oturum" butonu
 ipcMain.on('new-window', () => createWindow());
+
+// Zorunlu güncelleme ekranındaki "Güncellemeyi indir ve kur" düğmesi.
+// Dönüş: { mode }
+//   'auto'   — indirme başladı / kurulum başlıyor; ilerleme 'update:progress' ile gelir
+//   'manual' — bu kurulum türü kendini güncelleyemiyor; indirme sayfası açıldı
+//   'none'   — sunucuda daha yeni sürüm yok (yayın henüz çıkmamış olabilir)
+//   'dev'    — geliştirme ortamı
+ipcMain.handle('update:install-now', async () => {
+  if (!app.isPackaged) return { mode: 'dev' };
+  if (!canAutoInstallUpdates() || !updaterRef) {
+    shell.openExternal(downloadPageUrl());
+    return { mode: 'manual' };
+  }
+  const current = app.getVersion();
+  // Inmis dosya varsa onu kur. Ikinci basista (kurulum basarisiz olmus,
+  // uygulama hala acik) onbellege guvenme: yeniden kontrol et / indir.
+  if (downloadedVersion && !installAttempted
+      && downloadedVersion.localeCompare(current, undefined, { numeric: true }) > 0) {
+    installAttempted = true;
+    forcedInstall = true;
+    sendUpdateProgress({ state: 'installing', version: downloadedVersion });
+    setTimeout(() => updaterRef.quitAndInstall(), 300);
+    return { mode: 'auto' };
+  }
+  downloadedVersion = null;
+  installAttempted = false;
+  forcedInstall = true;
+  try {
+    const result = await updaterRef.checkForUpdates();
+    const latest = result && result.updateInfo && result.updateInfo.version;
+    if (!latest || latest.localeCompare(current, undefined, { numeric: true }) <= 0) {
+      forcedInstall = false;
+      return { mode: 'none', version: current };
+    }
+    // Daha yeni surum var ama guncelleyici indirmeyi reddetti (kademeli
+    // dagitim, asgari sistem surumu vb.): ekranda "Indiriliyor %0"da
+    // bekletmek yerine indirme sayfasina yonlendir.
+    if (result.isUpdateAvailable === false || !result.downloadPromise) {
+      forcedInstall = false;
+      shell.openExternal(downloadPageUrl());
+      return { mode: 'manual', version: latest };
+    }
+    // autoDownload açık: indirme kendiliğinden başlar, bitince
+    // 'update-downloaded' (forcedInstall) kurulumu başlatır.
+    sendUpdateProgress({ state: 'downloading', percent: 0, version: latest });
+    return { mode: 'auto', version: latest };
+  } catch {
+    forcedInstall = false;
+    shell.openExternal(downloadPageUrl());
+    return { mode: 'manual' };
+  }
+});
 
 // Ayarlar'daki "Güncellemeleri Kontrol Et" butonu. Otomatik kontrol açılışta ve
 // 4 saatte bir çalışır; bu, kullanıcının beklemeden kontrol etmesini sağlar.

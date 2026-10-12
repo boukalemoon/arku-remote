@@ -18,6 +18,8 @@ import { EMBED, postSessionEvent, resetSessionEvents } from './lib/embed';
 import { resetIceCache } from './lib/ice';
 import { recordAudit, listAudit, verifyAuditChain, setDeviceIdPolicy } from './lib/audit';
 import { verifyOfferPassword } from './lib/verify';
+import { isVersionBelow } from './lib/version';
+import { describeHangup, HANGUP_PROTO } from './lib/hangup';
 import type { AuditRow, AuditVerifyResult } from './lib/audit';
 import { authRedirectUrl, parseAuthReturn, describeAuthError } from './lib/authRedirect';
 
@@ -352,6 +354,11 @@ export default function App() {
   const requirePasswordRef = React.useRef(requirePassword);
   // Kaba kuvvet frenleme: from_id basina yanlis deneme sayisi.
   const badPasswordTriesRef = React.useRef(new Map<string, number>());
+  // Zorunlu guncelleme kapisi (app_config.min_desktop_version). Yalnizca
+  // masaustu uygulamasinda; web her zaman son surumdur. null = kapi kapali.
+  const [requiredVersion, setRequiredVersion] = React.useState<string | null>(null);
+  const updateRequiredRef = React.useRef(false);
+  const [updateProgress, setUpdateProgress] = React.useState<{ state: string; percent?: number; message?: string; mode?: string } | null>(null);
   const [connectionHistory, setConnectionHistory] = React.useState<ConnectionEntry[]>([]);
   const [copied, setCopied] = React.useState(false);
   const [sessionToken, setSessionToken] = React.useState('');
@@ -671,7 +678,10 @@ export default function App() {
     try {
       await supabase.from('signals').insert({
         from_id: addressedAs || currentUser?.id || connectionId,
-        to_id: toId, type: 'hangup', payload: { reason },
+        // proto: 2 -> bu alici HMAC parola kanitini (pwh) taniyor. v1.4.0
+        // alicilar bu alani gondermez; arayan "parola hatali" cevabinin eski
+        // surumden gelip gelmedigini buradan ayirt eder.
+        to_id: toId, type: 'hangup', payload: { reason, proto: HANGUP_PROTO },
       });
     } catch { /* bildirim gönderilemedi — arayan zaman aşımına düşer */ }
   };
@@ -720,6 +730,14 @@ export default function App() {
       }
       badPasswordTriesRef.current.delete(sig.from_id);
     }
+    // Zorunlu guncelleme bekleyen surum cagri kabul etmez; arayana sebebi
+    // bildirilir (karsi tarafta "guncellemesi gerekiyor" yazar). Parola
+    // kontrolunden SONRA: parolayi bilmeyen bu bilgiyi de alamaz.
+    if (updateRequiredRef.current) {
+      addLocalLog(`${sig.from_id} baglanmak istedi; once uygulamayi guncellemeniz gerekiyor.`, 'warn');
+      await sendBusySignal(sig.from_id, sig.to_id, 'outdated');
+      return;
+    }
     if (decision === 'busy') {
       addLocalLog(`${sig.from_id} baglanmak istedi, mesgul oldugunuz bildirildi.`, 'warn');
       await sendBusySignal(sig.from_id, sig.to_id);
@@ -752,15 +770,8 @@ export default function App() {
             // Karşı taraf bize hangi kimlikle cevap veriyorsa onu tanı (UUID veya
             // profil kimliği); isPeer bu eş anlamlıların hepsini kapsar.
             if (!webrtcRef.current?.isPeer(sig.from_id)) return;
-            const reason = (sig.payload as { reason?: string } | null)?.reason;
-            addLocalLog(
-              reason === 'busy' ? 'Karsi taraf mesgul, su an baska bir oturumda.'
-              : reason === 'rejected' ? 'Baglanti istegi reddedildi.'
-              : reason === 'badpass' ? 'Oturum parolasi hatali. Karsi tarafin ekranindaki parolayi kontrol edin.'
-              : reason === 'unsupported' ? 'Karsi cihaz ekranini paylasamiyor: mobil tarayicilar (Android/iOS) ekran paylasimini desteklemiyor. Paylasan taraf bilgisayar olmali.'
-              : 'Karsi taraf baglantıyi kesti.',
-              'warn',
-            );
+            // badpass + proto yok -> v1.4.0 alici; ayrinti lib/hangup.ts
+            addLocalLog(describeHangup(sig.payload), 'warn');
             // Bekleyen 30 sn zaman aşımını iptal et. Aksi halde reddedilen veya
             // yanlış parolayla düşen bir çağrıdan 30 sn SONRA "yanit vermedi
             // (zaman asimi)" satırı düşüyor ve gerçek sebebin üstünü örtüyordu.
@@ -2544,8 +2555,57 @@ export default function App() {
     return m;
   };
 
+  // ── Zorunlu guncelleme kapisi ─────────────────────────────────────────────
+  // Masaustu uygulamasi, sunucudaki en dusuk surumun (app_config) altindaysa
+  // baglanti kurmaz, cagri kabul etmez ve guncelleme ekrani gosterir.
+  // Okuma hatasinda (ag, tablo yok) kapi ACILMAZ: kimse yanlislikla kilitlenmez.
+  // Not: onAuthStateChange icinde DEGIL (kilit kilitlenmesi, bkz. applySession).
+  React.useEffect(() => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    if (!(window as any).electronAPI?.isElectron || !currentUser?.id) return;
+    let stopped = false;
+    const check = async () => {
+      try {
+        const { data, error } = await supabase
+          .from('app_config').select('value').eq('key', 'min_desktop_version').maybeSingle();
+        if (stopped || error || !data) return;
+        const min = String((data as { value?: unknown }).value ?? '').trim();
+        const need = isVersionBelow(__APP_VERSION__, min);
+        updateRequiredRef.current = need;
+        setRequiredVersion(need ? min.replace(/^v/i, '') : null);
+      } catch { /* ag hatasi: kapiyi degistirme */ }
+    };
+    void check();
+    const t = setInterval(check, 60 * 60 * 1000);
+    return () => { stopped = true; clearInterval(t); };
+  }, [currentUser?.id]);
+
+  React.useEffect(() => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const api = (window as any).electronAPI;
+    if (!api?.onUpdateProgress) return;
+    return api.onUpdateProgress((p: { state: string; percent?: number; message?: string }) => {
+      setUpdateProgress(prev => ({ ...(prev ?? {}), ...p }));
+    });
+  }, []);
+
+  const startForcedUpdate = async () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const api = (window as any).electronAPI;
+    if (!api?.installUpdateNow) return;
+    setUpdateProgress({ state: 'checking' });
+    try {
+      const r = await api.installUpdateNow();
+      if (r?.mode === 'auto') setUpdateProgress(prev => (prev && prev.state !== 'checking') ? prev : { state: 'downloading', percent: 0 });
+      else setUpdateProgress({ state: r?.mode || 'error', mode: r?.mode });
+    } catch (e) {
+      setUpdateProgress({ state: 'error', message: e instanceof Error ? e.message : String(e) });
+    }
+  };
+
   const handleConnect = async () => {
     if (!isRegistered && !isGuest) { setShowAuth(true); setAuthMode('login'); return; }
+    if (updateRequiredRef.current) { addLog('Baglanmak icin once uygulamayi guncellemeniz gerekiyor.', 'error'); return; }
     // Kimlik sunucuda yoksa baglanti kurulamaz: karsi taraf cevap verse bile
     // yanit bize ulasmaz (RLS okumaya izin vermez). Zaman asimini beklemek
     // yerine sebebi simdi soyleyelim.
@@ -2626,6 +2686,14 @@ export default function App() {
 
   const handleAcceptCall = async () => {
     if (!incomingCall) return;
+    // Kapi, cagri penceresi acildiktan sonra kapanmis olabilir.
+    if (updateRequiredRef.current) {
+      const { fromId, toId } = incomingCall;
+      setIncomingCall(null);
+      addLog('Cagriyi kabul etmek icin once uygulamayi guncellemeniz gerekiyor.', 'error');
+      await sendBusySignal(fromId, toId, 'outdated');
+      return;
+    }
     const { fromId, toId, offerPayload, sessionId, signalId } = incomingCall;
     // getDisplayMedia must be called while still in the user gesture context
     // (button click). Closing the modal first breaks the gesture chain in Chrome.
@@ -2815,6 +2883,61 @@ export default function App() {
 
   return (
     <div className="min-h-screen flex flex-col selection:bg-steppe-gold selection:text-steppe-stone">
+      {/* Suren bir oturum (kapi acilmadan baslamis; yeniden baglanma sirasinda
+          'connecting'e duser) kesilmez; oturum bitince ekran gelir. */}
+      {requiredVersion && rtcState !== 'connected' && rtcState !== 'connecting' && (
+        <div role="alertdialog" aria-modal="true" aria-labelledby="arku-update-title"
+          data-testid="forced-update"
+          className="fixed inset-0 z-[300] flex items-center justify-center p-6"
+          style={{ background: isLight ? 'rgba(240,244,248,0.97)' : 'rgba(10,10,10,0.96)' }}>
+          <div className="max-w-md w-full surface-card border border-steppe-border p-8 text-center">
+            <img src="./brand/arku-mark-96.webp" srcSet="./brand/arku-mark-96.webp 1x, ./brand/arku-mark-192.webp 2x"
+              alt="" width={64} height={64} className="w-16 h-16 mx-auto mb-4 object-contain" />
+            <h2 id="arku-update-title" className="text-lg font-display text-steppe-gold mb-2">Guncelleme gerekli</h2>
+            <p className="text-[12px] text-steppe-paper leading-relaxed mb-1">
+              {`Kurulu surum v${__APP_VERSION__} artik desteklenmiyor. Baglanti kurabilmek ve cagri alabilmek icin v${requiredVersion} veya ustune guncelleyin.`}
+            </p>
+            <p className="text-[10px] text-steppe-muted leading-relaxed mb-6">
+              Ayarlariniz, kimliginiz ve kayitli kisileriniz korunur.
+            </p>
+            {(() => {
+              const st = updateProgress?.state;
+              const link = (
+                <a href="https://www.arku.com.tr/#indir" target="_blank" rel="noreferrer"
+                  className="block mt-3 text-[10px] text-steppe-muted underline">Indirme sayfasini ac</a>
+              );
+              if (st === 'downloading') {
+                const pct = Math.max(0, Math.min(100, updateProgress?.percent ?? 0));
+                return (
+                  <div className="text-left" data-testid="forced-update-progress">
+                    <div className="h-2 w-full border border-steppe-border overflow-hidden mb-2">
+                      <div className="h-full" style={{ width: `${pct}%`, background: 'var(--accent-primary)' }} />
+                    </div>
+                    <p className="text-[10px] text-steppe-muted uppercase tracking-widest text-center">{`Indiriliyor %${pct}`}</p>
+                    <div className="text-center">{link}</div>
+                  </div>
+                );
+              }
+              if (st === 'installing') return <><p className="text-[11px] text-steppe-gold">Kuruluyor, uygulama yeniden baslayacak...</p>{link}</>;
+              if (st === 'checking') return <><p className="text-[11px] text-steppe-muted">Yeni surum araniyor...</p>{link}</>;
+              const note = st === 'manual' ? 'Indirme sayfasi tarayicida acildi. Yeni surumu kurup uygulamayi yeniden acin.'
+                : st === 'none' ? 'Yeni surum henuz yayinlanmamis gorunuyor. Biraz sonra tekrar deneyin ya da indirme sayfasini kullanin.'
+                : st === 'error' ? 'Otomatik guncelleme basarisiz oldu. Indirme sayfasindan yeni surumu kurabilirsiniz.'
+                : st === 'dev' ? 'Gelistirme ortami: otomatik guncelleme yok.' : '';
+              return (
+                <>
+                  {note && <p className="text-[11px] text-steppe-muted mb-4" data-testid="forced-update-note">{note}</p>}
+                  <button type="button" onClick={() => { void startForcedUpdate(); }}
+                    className="w-full py-3 text-[11px] uppercase tracking-widest font-bold border border-steppe-gold text-steppe-gold hover:bg-steppe-gold hover:text-steppe-stone transition-colors">
+                    {st ? 'Tekrar dene' : 'Guncellemeyi indir ve kur'}
+                  </button>
+                  {link}
+                </>
+              );
+            })()}
+          </div>
+        </div>
+      )}
       {!EMBED.embed && (
       <header className="border-b border-steppe-border sticky top-0 z-50 backdrop-blur-md" style={{ background: isLight ? 'rgba(240,244,248,0.92)' : 'rgba(17,16,16,0.85)' }}>
         <div className="max-w-7xl mx-auto px-6 py-4 flex justify-between items-center">
