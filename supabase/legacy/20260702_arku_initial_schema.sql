@@ -3,7 +3,25 @@
 -- Tarih: 2026-07-02
 -- Kapsam: users, logs, connections, signals tabloları,
 --         RLS politikaları ve Realtime yayını (signals).
--- Yeni/boş projede bir kez çalıştırılır; tekrar çalıştırmak güvenlidir.
+--
+-- ⛔ YALNIZCA BOŞ/YENİ PROJEDE ÇALIŞTIRIN — MEVCUT PROJEDE ASLA.
+--
+-- Dosyanın başında bir zamanlar "tekrar çalıştırmak güvenlidir" yazıyordu;
+-- ARTIK DOĞRU DEĞİL. Bu dosya aşağıdaki izinli politikaları YENİDEN
+-- OLUŞTURUR ve sonraki migration'ların kapattığı açıkları geri açar:
+--
+--   users_select_authenticated  using (true)   -> her kullanıcı herkesin
+--     e-posta/telefon/cihaz parmak izini okur (20260702_users_rls_tighten
+--     bunu kapatmıştı)
+--   signals_select  using (true) + anon        -> tüm sinyaller okunabilir,
+--     ICE adaylarındaki IP adresleri sızar (S1)
+--   signals_insert  anon + kimlik kontrolü yok -> sahte kimlikle çağrı
+--     üretilebilir (S2) — 20260801_signals_rls_identity bunu kapatmıştı
+--
+-- Mevcut bir projeye uygulamanız gerekiyorsa, ARDINDAN şu sırayla tekrar
+-- çalıştırın: 20260702_users_rls_tighten, 20260801_signals_rls_identity,
+-- 20260801_harden_function_grants, 20260912_authz_hardening.
+-- Son geçerli durumu görmek için: supabase/verify_security_state.sql
 -- =========================================================
 
 begin;

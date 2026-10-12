@@ -9,6 +9,15 @@ contextBridge.exposeInMainWorld('electronAPI', {
   newWindow: () => ipcRenderer.send('new-window'),
   // Ayarlar'dan elle güncelleme kontrolü
   checkForUpdates: () => ipcRenderer.invoke('check-for-updates'),
+  // Zorunlu güncelleme: indir ve kur (Windows kurulumu / AppImage) ya da
+  // indirme sayfasını aç. İlerleme onUpdateProgress ile gelir.
+  installUpdateNow: () => ipcRenderer.invoke('update:install-now'),
+  onUpdateProgress: (cb) => {
+    if (typeof cb !== 'function') return () => {};
+    const h = (_e, p) => cb(p);
+    ipcRenderer.on('update:progress', h);
+    return () => ipcRenderer.removeListener('update:progress', h);
+  },
   // Uzaktan kontrol izni: onayı ana süreç kendi penceresinde sorar, kararı
   // kendisi saklar. Web içeriği izni tek başına veremez.
   // Dönüş: { granted, pointer, reason?, error? }
@@ -23,7 +32,17 @@ contextBridge.exposeInMainWorld('electronAPI', {
   saveRecording: (payload) => ipcRenderer.invoke('recording:save', payload),
   openRecordingFolder: () => ipcRenderer.invoke('recording:open-folder'),
   // Alinan dosyayi diske kaydet (kaydetme penceresi ana surecte acilir).
+  // NOT: kucuk dosyalar icin duruyor; buyuk transferler artik stream* ile
+  // akis halinde yaziliyor (bellekte birikme yok).
   saveFile: (payload) => ipcRenderer.invoke('file:save', payload),
+  // Akis halinde diske yazma. Hedef yolu ANA SUREC belirler; renderer
+  // yalnizca "bu turden bir akis ac" diyebilir.
+  //   kind: 'recording' -> kayit klasorune, ad ana surecte uretilir
+  //   kind: 'file'      -> kaydetme penceresi, ad path.basename'den gecer
+  streamBegin: (opts) => ipcRenderer.invoke('stream:begin', opts),
+  streamWrite: (id, chunk) => ipcRenderer.send('stream:write', { id, chunk }),
+  streamEnd: (id) => ipcRenderer.invoke('stream:end', id),
+  streamAbort: (id) => ipcRenderer.invoke('stream:abort', id),
   // Coklu monitor: paylasilan ekrani oturum ortasinda degistirme.
   // Ikisi de ana surecte kontrol iznine baglidir.
   listScreens: () => ipcRenderer.invoke('screens:list'),
@@ -35,4 +54,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Girdi enjeksiyonu bu makinede çalışabilir mi (nut-js yüklü mü, macOS
   // erişilebilirlik izni var mı). Arayüz sessiz başarısızlık yerine sebebi gösterir.
   remoteControlStatus: () => ipcRenderer.invoke('remote-control:status'),
+  // Bilgisayar açılınca otomatik başlat. Dönüş: { supported, enabled, minimized, error? }
+  // Kayıt yolu ve argümanı ana süreçte belirlenir; buradan yalnızca boolean gider.
+  getAutoStart: () => ipcRenderer.invoke('autostart:get'),
+  setAutoStart: (opts) => ipcRenderer.invoke('autostart:set', {
+    enabled: !!(opts && opts.enabled), minimized: !!(opts && opts.minimized),
+  }),
 });

@@ -1,0 +1,2 @@
+# Kabuk betikleri Windows checkout'unda da LF kalmali
+*.sh text eol=lf

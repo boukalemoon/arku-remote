@@ -11,17 +11,36 @@ import {
   fetchPresence, sendHeartbeat, bindOrgInvites,
 } from './lib/enterprise';
 import type { Organization, OrgMember, ContactCategory, SavedContact, OrgRole, PresenceRow } from './lib/enterprise';
-import type { User as SupabaseUser } from '@supabase/supabase-js';
+import type { User as SupabaseUser, Session } from '@supabase/supabase-js';
 import { WebRTCManager } from './lib/webrtc';
 import type { ConnectionState, InputEventMsg, RtcQuality, ControlMsg, RemoteScreen, FileOffer } from './lib/webrtc';
 import { EMBED, postSessionEvent, resetSessionEvents } from './lib/embed';
 import { resetIceCache } from './lib/ice';
-import { recordAudit, listAudit, verifyAuditChain } from './lib/audit';
+import { recordAudit, listAudit, verifyAuditChain, setDeviceIdPolicy } from './lib/audit';
+import { verifyOfferPassword } from './lib/verify';
+import { isVersionBelow } from './lib/version';
+import { describeHangup, HANGUP_PROTO } from './lib/hangup';
 import type { AuditRow, AuditVerifyResult } from './lib/audit';
+import { authRedirectUrl, parseAuthReturn, describeAuthError } from './lib/authRedirect';
 
 type Theme = 'otuken' | 'umay' | 'gok' | 'gece';
 type Tab = 'dashboard' | 'connections' | 'contacts' | 'organization' | 'settings';
-type AuthMode = 'login' | 'register' | 'mfa' | 'reset';
+type AuthMode = 'login' | 'register' | 'mfa' | 'reset' | 'checkmail' | 'newpass';
+
+// E-posta bağlantısından dönüşün sonucu (doğrulandı / şifre sıfırlama / hata).
+// MODÜL YÜKLENİRKEN okunur: supabase-js oturumu adresten alıp adresi
+// temizlediği için bir useEffect içinde okumak çok geç kalabilir.
+const INITIAL_AUTH_RETURN = typeof window !== 'undefined'
+  ? parseAuthReturn(window.location.hash, window.location.search)
+  : null;
+
+/** E-posta bağlantılarının döneceği adres (bkz. lib/authRedirect.ts). */
+const emailRedirectTo = (): string => authRedirectUrl(
+  window.location,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  !!(window as any).electronAPI?.isElectron,
+  import.meta.env.VITE_AUTH_REDIRECT_URL as string | undefined,
+);
 interface LogEntryLocal { time: string; msg: string; type: LogType; }
 // toId: arayanın bize ulaşmak için kullandığı kimlik (UUID veya 123-456-789).
 // Cevabı bu kimlikle imzalamamız gerekir, yoksa arayan yanıtı tanıyamaz.
@@ -29,21 +48,24 @@ interface IncomingCall { fromId: string; toId?: string; offerPayload: Record<str
 interface QrtimUser { qrtim_id: string; email: string; name: string; username: string; photo_url: string | null; title: string | null; company: string | null; plan: string; }
 
 /**
- * QRtim SSO ASKIYA ALINDI (2026-09-08).
+ * QRtim SSO KAPALI (2026-09-08'den beri).
  *
- * IKI SEBEP:
+ * IKI SEBEP VARDI:
  *  1) URUN: QRtim dijital kimlik yapisina gecirilmek uzere bastan tasarlaniyor.
  *     Entegrasyon, yeni kimlik modeli netlestikten sonra yeniden kurulacak.
- *  2) GUVENLIK (S1): qrtim-auth, QRtim'in dondurdugu e-postayi dogrulanmis
- *     kabul edip o e-posta icin oturum uretiyordu. QRtim tarafinda e-posta
- *     dogrulamasi zorunlu degilse, saldirgan kurban@firma.com ile QRtim
- *     hesabi acip AYNI e-postaya ait Arku hesabini devralabilirdi.
- *     Cozum QRtim tarafinda `email_verified` iddiasini eklemek; o gelene
- *     kadar yol kapali.
+ *  2) GUVENLIK (S1 — KAPANDI 2026-09-21): qrtim-auth, QRtim'in dondurdugu
+ *     e-postayi dogrulanmis kabul edip o e-posta icin oturum uretiyordu.
+ *     Saldirgan kurban@firma.com ile QRtim hesabi acip AYNI e-postaya ait
+ *     Arku hesabini devralabilirdi.
  *
- * Kod SILINMEDI: bayrak true yapilinca akis geri gelir. Sunucu tarafinda da
- * ayri bir kill switch var (qrtim-auth / QRTIM_SSO_ENABLED) — arayuzu acmak
- * tek basina yetmez, ikisi birden acilmalidir.
+ *     QRtim 10.09.2026'dan beri dogrulanmamis hesaba belirtec vermiyor ve
+ *     `email_verified` donduruyor. Arku tarafinda da kapatildi: qrtim-auth
+ *     bu alani SART KOSUYOR ve hesap eslestirmesi artik e-postayla degil
+ *     kalici kimlikle (qrtim_uid) yapiliyor.
+ *
+ * KALAN TEK ENGEL BIRINCI MADDE — yani urun karari. Acmaya karar verilirse
+ * IKISI BIRDEN acilmalidir: burada QRTIM_ENABLED = true ve sunucuda Supabase
+ * secret QRTIM_SSO_ENABLED=true. Biri tek basina yetmez.
  */
 const QRTIM_ENABLED = false;
 
@@ -54,6 +76,8 @@ const QRTIM_BASE_URL = import.meta.env.VITE_QRTIM_URL ?? 'https://qartim.com';
 // client'ın QRtım anon key'ini tutmasına gerek kalmadı.
 const QRTIM_AUTH_URL = 'https://jpmbttlxyxrqmpghymbq.supabase.co/functions/v1/qrtim-auth';
 const QRTIM_SYNC_URL = 'https://jpmbttlxyxrqmpghymbq.supabase.co/functions/v1/qrtim-sync';
+// Plan tazeleme: QRtım aboneliğinin hâlâ geçerli olduğunu sunucudan doğrular.
+const QRTIM_PLAN_REFRESH_URL = 'https://jpmbttlxyxrqmpghymbq.supabase.co/functions/v1/qrtim-plan-refresh';
 
 const generateDeviceFingerprint = (): string => {
   const nav = window.navigator;
@@ -104,6 +128,15 @@ const formatId = (raw: string): string => { const c = raw.replace(/\D/g, '').pad
  * upsert sessizce başarısız olur ve kullanıcı ULAŞILAMAZ hâle gelir.
  * arku_ensure_connection_id RPC'si uygulandıktan sonra bu yol kullanılmaz.
  */
+/**
+ * Bu tarayıcı ekranını paylaşabilir mi? (denetim 2026-10-08, saha testi)
+ * Android ve iOS tarayıcıları web sayfalarına getDisplayMedia vermez. Eskiden
+ * böyle bir cihaz gelen çağrıda "Kabul Et"e bastığında ekran seçici hiç
+ * açılmıyor, hata sessizce yutuluyor ve arayan 30 sn zaman aşımını bekliyordu.
+ */
+const CAN_SHARE_SCREEN = typeof navigator !== 'undefined'
+  && typeof navigator.mediaDevices?.getDisplayMedia === 'function';
+
 const generateProfileId = (uid: string): string => formatId(Math.abs(uid.split('').reduce((a, c) => ((a << 5) - a + c.charCodeAt(0)) | 0, 0)).toString());
 
 /**
@@ -118,6 +151,47 @@ const resolveMyConnectionId = async (uid: string): Promise<{ id: string; fromSer
   } catch { /* fonksiyon yok / ağ hatası — yedek yola düş */ }
   return { id: generateProfileId(uid), fromServer: false };
 };
+/**
+ * Kimliği sunucuya bağlar ve GERÇEKTEN bağlanıp bağlanmadığını söyler.
+ *
+ * Hem oturum açıldığında hem "Tekrar Dene" düğmesinden çağrılır; ikisinin
+ * aynı kodu kullanması şart, aksi halde tekrar deneme yalnızca oturumu
+ * yeniliyor ama kimliği yeniden istemiyordu (oturum geçerliyse hiçbir şey
+ * olmuyordu).
+ *
+ * React durumuna DOKUNMAZ: çağıran taraf sonucu kendi state'ine yazar.
+ * Böylece useEffect içinden bayat closure riski olmadan çağrılabilir.
+ */
+const bindServerIdentity = async (
+  user: SupabaseUser,
+  fingerprint: string,
+): Promise<{ id: string; ready: boolean; error: string }> => {
+  const { id: pid, fromServer } = await resolveMyConnectionId(user.id);
+  const profileRow: Record<string, unknown> = {
+    id: user.id, email: user.email ?? null,
+    device_fingerprint: fingerprint, last_seen: new Date().toISOString(),
+  };
+  // Sunucu atadıysa kimliği tekrar yazmayız (RPC zaten yazdı).
+  if (!fromServer) profileRow.connection_id = pid;
+  const { error } = await supabase.from('users').upsert(profileRow, { onConflict: 'id' });
+
+  // Eskiden bayrak koşulsuz true yapılıyordu. Oysa arku_ensure_connection_id
+  // başarısız olup istemci eski 32-bit hash yedeğine düştüğünde kimlik
+  // yalnızca yerelde var olabiliyordu: unique çakışmasında upsert sessizce
+  // düşüyor, kontrol edilmeyen hatası yutuluyor ve kullanıcı ekranda geçerli
+  // görünen bir numarayı karşı tarafa okuyordu. signals RLS'i
+  // arku_owns_identity(to_id) istediği için o kimliğe gelen HİÇBİR sinyal
+  // okunamıyor; iki taraf da sebebini öğrenemiyordu.
+  if (fromServer && !error) return { id: pid, ready: true, error: '' };
+  return {
+    id: pid,
+    ready: false,
+    error: error
+      ? `Kimlik sunucuya baglanamadi: ${error.message}`
+      : 'Sunucu kimlik atayamadi (arku_ensure_connection_id yanit vermedi).',
+  };
+};
+
 /**
  * Oturumsuz misafir kimliği.
  *
@@ -172,6 +246,23 @@ export default function App() {
   const [mfaCode, setMfaCode] = React.useState(['','','','','','']);
   const [isMfaValidating, setIsMfaValidating] = React.useState(false);
   const [authError, setAuthError] = React.useState('');
+  // Hata olmayan bilgilendirme (ör. "e-postaniz dogrulandi").
+  const [authNotice, setAuthNotice] = React.useState('');
+  // Kayit/giris istegi surerken dugmeler kilitli: cift tiklama ayni kaydi iki
+  // kez gonderiyor, biri "duplicate key" ile sunucu hatasina dusuyordu (2026-10-11).
+  const [authBusy, setAuthBusy] = React.useState(false);
+  // State tek başına yetmiyor: aynı olay döngüsündeki iki tık, React yeniden
+  // çizmeden önce ikisi de authBusy=false görüyor (E2E testi yakaladı).
+  // Kilit eşzamanlı bir ref ile tutulur, state yalnızca düğme görünümü içindir.
+  const authBusyRef = React.useRef(false);
+  const lockAuth = (): boolean => {
+    if (authBusyRef.current) return false;
+    authBusyRef.current = true; setAuthBusy(true); return true;
+  };
+  const unlockAuth = () => { authBusyRef.current = false; setAuthBusy(false); };
+  const [unconfirmedEmail, setUnconfirmedEmail] = React.useState('');
+  const [newPassValue, setNewPassValue] = React.useState('');
+  const [newPassConfirm, setNewPassConfirm] = React.useState('');
   const [resetSent, setResetSent] = React.useState(false);
   const [resetEmail, setResetEmail] = React.useState('');
   const mfaRefs = React.useRef<(HTMLInputElement | null)[]>([]);
@@ -182,6 +273,17 @@ export default function App() {
   const [passwordChangeError, setPasswordChangeError] = React.useState('');
   const [passwordChangeDone, setPasswordChangeDone] = React.useState(false);
   const [profileUpdateDone, setProfileUpdateDone] = React.useState(false);
+  // ── Iki adimli dogrulama (TOTP) ──
+  // KAYIT AKISI ESKIDEN HIC YOKTU: mfa.enroll cagrilmadigi icin kullanici
+  // Arku icinden faktor ekleyemiyordu. Dogrulama ekrani (authMode='mfa')
+  // calisiyordu ama yalnizca baska bir yolla (API) kaydedilmis faktorler
+  // icin; yani ozellik pratikte ulasilamazdi.
+  const [mfaFactors, setMfaFactors] = React.useState<{ id: string; friendly_name?: string }[]>([]);
+  const [mfaEnroll, setMfaEnroll] = React.useState<{ factorId: string; qr: string; secret: string } | null>(null);
+  const [mfaEnrollCode, setMfaEnrollCode] = React.useState('');
+  const [mfaBusy, setMfaBusy] = React.useState(false);
+  const [mfaError, setMfaError] = React.useState('');
+  const [mfaNotice, setMfaNotice] = React.useState('');
   const [connectionId, setConnectionId] = React.useState(() => getOrCreateGuestId());
   /**
    * Kimlik SUNUCU tarafindan taniniyor mu?
@@ -224,8 +326,23 @@ export default function App() {
   const recStateRef = React.useRef(recState);
   React.useEffect(() => { recStateRef.current = recState; }, [recState]);
   const mediaRecorderRef = React.useRef<MediaRecorder | null>(null);
+  /**
+   * Kayit parcalari.
+   *
+   * MASAUSTUNDE KULLANILMAZ: parcalar dogrudan diske akitilir (recStreamRef).
+   * Yalnizca WEB surumunde, tarayici indirmesi icin bellekte birikir; orada
+   * da bir ust sinir var (REC_WEB_MAX_BYTES), aksi halde uzun bir oturum
+   * sekmeyi cokertiyordu.
+   */
   const recChunksRef = React.useRef<Blob[]>([]);
+  const recBytesRef = React.useRef(0);
+  /** Masaustunde acik kayit akisi: { id, path }. */
+  const recStreamRef = React.useRef<{ id: string; path: string } | null>(null);
+  /** Masaustunde acik gelen-dosya akisi. */
+  const fileStreamRef = React.useRef<{ id: string; path: string } | null>(null);
   const recStartedAtRef = React.useRef(0);
+  /** Web surumunde kayit icin bellek tavani (~512 MB). */
+  const REC_WEB_MAX_BYTES = 512 * 1024 * 1024;
   // Bu cihazin gecerli oturum parolasi. Her oturum bitiminde yenilenir.
   const [sessionPassword, setSessionPassword] = React.useState(() => generateSessionPassword());
   const [requirePassword, setRequirePassword] = React.useState(() => {
@@ -237,6 +354,11 @@ export default function App() {
   const requirePasswordRef = React.useRef(requirePassword);
   // Kaba kuvvet frenleme: from_id basina yanlis deneme sayisi.
   const badPasswordTriesRef = React.useRef(new Map<string, number>());
+  // Zorunlu guncelleme kapisi (app_config.min_desktop_version). Yalnizca
+  // masaustu uygulamasinda; web her zaman son surumdur. null = kapi kapali.
+  const [requiredVersion, setRequiredVersion] = React.useState<string | null>(null);
+  const updateRequiredRef = React.useRef(false);
+  const [updateProgress, setUpdateProgress] = React.useState<{ state: string; percent?: number; message?: string; mode?: string } | null>(null);
   const [connectionHistory, setConnectionHistory] = React.useState<ConnectionEntry[]>([]);
   const [copied, setCopied] = React.useState(false);
   const [sessionToken, setSessionToken] = React.useState('');
@@ -264,9 +386,34 @@ export default function App() {
   const [remoteControlAllowed, setRemoteControlAllowed] = React.useState(false);
   const remoteControlAllowedRef = React.useRef(false);
   const [captureFrameRate, setCaptureFrameRate] = React.useState(15);
+  /**
+   * Denetim kaydina MAC adresi ve isletim sistemi kullanici adi eklensin mi?
+   *
+   * VARSAYILAN KAPALI. Ikisi de tek baslarina KISISEL VERIDIR ve toplanmalari
+   * ayri bir isleme faaliyetidir; aydinlatma metninde yer almadan yazilmamali.
+   * Kaydin curutulemezligi zaten hash zincirinden geliyor, MAC'ten degil
+   * (MAC saniyeler icinde degistirilebilir ve Windows 10+ ile mobil cihazlarda
+   * Wi-Fi icin rastgelelestirme varsayilan olarak aciktir).
+   * Ayrinti: docs/KVKK.md
+   */
+  const [collectDeviceIds, setCollectDeviceIds] = React.useState(() => {
+    try { return localStorage.getItem('arku_collect_device_ids') === '1'; } catch { return false; }
+  });
+  const toggleCollectDeviceIds = (v: boolean) => {
+    setCollectDeviceIds(v);
+    try { localStorage.setItem('arku_collect_device_ids', v ? '1' : '0'); } catch { /* yok say */ }
+    setDeviceIdPolicy(v);
+    addLocalLog(v
+      ? 'Denetim kaydina MAC adresi ve kullanici adi da yazilacak.'
+      : 'Denetim kaydina MAC adresi ve kullanici adi yazilmayacak.', 'warn');
+  };
   // Elle güncelleme kontrolü (yalnızca masaüstü uygulamasında anlamlı)
   const [updateCheck, setUpdateCheck] = React.useState<{ status: string; version?: string; message?: string } | null>(null);
   const [updateChecking, setUpdateChecking] = React.useState(false);
+  // Bilgisayar açılınca otomatik başlat (yalnızca paketli masaüstü; Windows/macOS).
+  type AutoStartState = { supported: boolean; enabled: boolean; minimized: boolean; error?: string };
+  const [autoStart, setAutoStart] = React.useState<AutoStartState | null>(null);
+  const [autoStartBusy, setAutoStartBusy] = React.useState(false);
   const [qrtimUser, setQrtimUser] = React.useState<QrtimUser | null>(null);
   const [qrtimLinking, setQrtimLinking] = React.useState(false);
   const [entitlements, setEntitlements] = React.useState<Entitlements>(FREE_ENTITLEMENTS);
@@ -294,6 +441,26 @@ export default function App() {
   const [incomingFile, setIncomingFile] = React.useState<FileOffer | null>(null);
   const [fileProgress, setFileProgress] = React.useState<{ id: string; done: number; total: number; dir: 'in' | 'out' } | null>(null);
   const fileInputRef = React.useRef<HTMLInputElement>(null);
+  // Uygulama içi onay pencereleri (kayıt rızası, gelen dosya) açıkken uzaktan
+  // girdi işletilmez (denetim O3). Aksi halde kontrol izni olan karşı taraf
+  // "Onaylıyorum" düğmesine kendisi tıklayıp rızayı yerel kullanıcı adına
+  // verebiliyordu.
+  const consentPromptOpenRef = React.useRef(false);
+  React.useEffect(() => {
+    const open = recPrompt || !!incomingFile;
+    consentPromptOpenRef.current = open;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    if (open) (window as any).electronAPI?.sendInput?.({ type: 'release-all' });
+  }, [recPrompt, incomingFile]);
+  /**
+   * Gelen cagri kanallarinin WebSocket sagligi (kimlik -> abone mi).
+   *
+   * Buna gore HTTP yedek sorgusunun SIKLIGI degisiyor: kanal saglikliysa
+   * seyrek (30 sn) bir emniyet sorgusu, dustuyse sik (2 sn). Eskiden kanal
+   * saglikli olsa bile 2 saniyede bir sorgu atiliyordu ve bostaki her istemci
+   * saniyede ~1 REST istegi uretiyordu.
+   */
+  const callWsHealthyRef = React.useRef<Record<string, boolean>>({});
   // Polling fallback refs for when Supabase Realtime WebSocket is unavailable
   const incomingPollSinceRef = React.useRef(new Date().toISOString());
   const processedOfferIdsRef = React.useRef(new Set<string>());
@@ -402,6 +569,8 @@ export default function App() {
     await supabase.from('logs').insert({ user_id: currentUser.id, msg, type });
   };
 
+  // Cihaz oznitelik politikasini acilista audit katmanina bildir.
+  React.useEffect(() => { setDeviceIdPolicy(collectDeviceIds); }, []);
   React.useEffect(() => { rtcStateRef.current = rtcState; }, [rtcState]);
   React.useEffect(() => { webrtcRef.current = webrtc; }, [webrtc]);
   React.useEffect(() => { remoteControlAllowedRef.current = remoteControlAllowed; }, [remoteControlAllowed]);
@@ -509,7 +678,10 @@ export default function App() {
     try {
       await supabase.from('signals').insert({
         from_id: addressedAs || currentUser?.id || connectionId,
-        to_id: toId, type: 'hangup', payload: { reason },
+        // proto: 2 -> bu alici HMAC parola kanitini (pwh) taniyor. v1.4.0
+        // alicilar bu alani gondermez; arayan "parola hatali" cevabinin eski
+        // surumden gelip gelmedigini buradan ayirt eder.
+        to_id: toId, type: 'hangup', payload: { reason, proto: HANGUP_PROTO },
       });
     } catch { /* bildirim gönderilemedi — arayan zaman aşımına düşer */ }
   };
@@ -522,7 +694,14 @@ export default function App() {
     // yolundan gelebilir; iki kez işlenirse iki kez "meşgul" sinyali gönderilirdi.
     if (sig.id) {
       if (processedOfferIdsRef.current.has(sig.id)) return;
-      if (processedOfferIdsRef.current.size > 200) processedOfferIdsRef.current.clear();
+      // KIRP, TEMIZLEME. Eskiden kume 200'u asinca tamamen bosaltiliyordu;
+      // polling penceresi hala geriye baktigi icin ayni offer yeniden "yeni"
+      // sayilabiliyor ve ikinci bir "mesgul" sinyali ya da ikinci bir gelen
+      // cagri penceresi doguyordu. WebRTCManager.markProcessed ayni sorunu
+      // en yeni 250 kimligi koruyarak dogru cozuyor.
+      if (processedOfferIdsRef.current.size > 200) {
+        processedOfferIdsRef.current = new Set([...processedOfferIdsRef.current].slice(-100));
+      }
       processedOfferIdsRef.current.add(sig.id);
     }
 
@@ -534,8 +713,13 @@ export default function App() {
     // verebilir ne de cagri cakismasi uydurup bizi geri cekilmeye zorlayabilir.
     // Kimligi bilmek artik tek basina yetmiyor.
     if (requirePasswordRef.current) {
-      const given = String((sig.payload as { pw?: unknown } | null)?.pw ?? '').trim().toUpperCase();
-      if (given !== sessionPasswordRef.current) {
+      // Parola artik DUZ METIN gelmiyor: arayan HMAC(parola, oturum_kimligi)
+      // kaniti gonderiyor ve biz ayni kaniti kendi parolamizla uretip
+      // sabit surede karsilastiriyoruz. Boylece parola `signals` tablosuna
+      // hic yazilmiyor. v1.4.0 arayanlarin duz metin `pw` alani geriye
+      // donuk uyumluluk icin hala kabul ediliyor (bkz. lib/verify.ts).
+      const ok = await verifyOfferPassword(sig.payload, sig.session_id, sessionPasswordRef.current);
+      if (!ok) {
         const tries = (badPasswordTriesRef.current.get(sig.from_id) ?? 0) + 1;
         badPasswordTriesRef.current.set(sig.from_id, tries);
         addLocalLog(`${sig.from_id} yanlis parola ile baglanmak istedi (${tries}. deneme).`, 'warn');
@@ -545,6 +729,14 @@ export default function App() {
         return;
       }
       badPasswordTriesRef.current.delete(sig.from_id);
+    }
+    // Zorunlu guncelleme bekleyen surum cagri kabul etmez; arayana sebebi
+    // bildirilir (karsi tarafta "guncellemesi gerekiyor" yazar). Parola
+    // kontrolunden SONRA: parolayi bilmeyen bu bilgiyi de alamaz.
+    if (updateRequiredRef.current) {
+      addLocalLog(`${sig.from_id} baglanmak istedi; once uygulamayi guncellemeniz gerekiyor.`, 'warn');
+      await sendBusySignal(sig.from_id, sig.to_id, 'outdated');
+      return;
     }
     if (decision === 'busy') {
       addLocalLog(`${sig.from_id} baglanmak istedi, mesgul oldugunuz bildirildi.`, 'warn');
@@ -578,14 +770,8 @@ export default function App() {
             // Karşı taraf bize hangi kimlikle cevap veriyorsa onu tanı (UUID veya
             // profil kimliği); isPeer bu eş anlamlıların hepsini kapsar.
             if (!webrtcRef.current?.isPeer(sig.from_id)) return;
-            const reason = (sig.payload as { reason?: string } | null)?.reason;
-            addLocalLog(
-              reason === 'busy' ? 'Karsi taraf mesgul, su an baska bir oturumda.'
-              : reason === 'rejected' ? 'Baglanti istegi reddedildi.'
-              : reason === 'badpass' ? 'Oturum parolasi hatali. Karsi tarafin ekranindaki parolayi kontrol edin.'
-              : 'Karsi taraf baglantıyi kesti.',
-              'warn',
-            );
+            // badpass + proto yok -> v1.4.0 alici; ayrinti lib/hangup.ts
+            addLocalLog(describeHangup(sig.payload), 'warn');
             // Bekleyen 30 sn zaman aşımını iptal et. Aksi halde reddedilen veya
             // yanlış parolayla düşen bir çağrıdan 30 sn SONRA "yanit vermedi
             // (zaman asimi)" satırı düşüyor ve gerçek sebebin üstünü örtüyordu.
@@ -603,9 +789,14 @@ export default function App() {
               localVideoRef.current.srcObject = null;
             }
           }
-        }).subscribe()
+        }).subscribe((status: string) => {
+          callWsHealthyRef.current[rid] = status === 'SUBSCRIBED';
+        })
     );
-    return () => { channels.forEach(ch => supabase.removeChannel(ch)); };
+    return () => {
+      ids.forEach(rid => { delete callWsHealthyRef.current[rid]; });
+      channels.forEach(ch => supabase.removeChannel(ch));
+    };
   }, [currentUser?.id, connectionId]);
 
   // Polling fallback: detects incoming offers via HTTP when Realtime WebSocket is unavailable.
@@ -634,8 +825,19 @@ export default function App() {
       }
     };
 
-    const timer = setInterval(poll, 2000);
-    return () => clearInterval(timer);
+    // Kendini planlayan dongu: aralik kanal sagligina gore degisiyor.
+    // Saglikli  -> 30 sn (yalnizca emniyet agi; teslimat WebSocket'ten gelir)
+    // Dusmus    -> 2 sn  (tek teslimat yolu bu; cagri kacmamali)
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const tick = async () => {
+      await poll();
+      if (stopped) return;
+      const healthy = ids.every(rid => callWsHealthyRef.current[rid]);
+      timer = setTimeout(tick, healthy ? 30000 : 2000);
+    };
+    timer = setTimeout(tick, 2000);
+    return () => { stopped = true; clearTimeout(timer); };
   }, [currentUser?.id, connectionId]);
 
   // Gelen çağrı penceresi sonsuza kadar açık kalmasın: arayan vazgeçip sekmeyi
@@ -650,13 +852,56 @@ export default function App() {
     return () => clearTimeout(t);
   }, [incomingCall]);
 
+  // E-posta bağlantısından dönüş: sonucu kullanıcıya açıkça söyle ve adresi temizle.
   React.useEffect(() => {
-    const { data: { subscription } } = supabase.auth.onAuthStateChange(async (_e, session) => {
-      // Realtime WebSocket'i kendi JWT'sini taşır ve RLS'i onunla değerlendirir.
-      // Politikalar auth.uid()'e bağlandığında bu çağrı yapılmazsa postgres_changes
-      // olayları SESSİZCE hiç gelmez — 2026-07-27'de bağlantıyı bozan tam olarak buydu.
-      supabase.realtime.setAuth(session?.access_token ?? null);
+    const r = INITIAL_AUTH_RETURN;
+    if (!r) return;
+    if (r.kind === 'error') {
+      setShowAuth(true); setAuthMode('login'); setAuthError('');
+      setAuthNotice(describeAuthError(r.code));
+    } else if (r.kind === 'signup') {
+      setShowAuth(true); setAuthMode('login'); setAuthError('');
+      setAuthNotice('E-posta adresiniz dogrulandi. Bu tarayicida oturumunuz acildi; masaustu uygulamasini kullaniyorsaniz oraya donup e-posta ve sifrenizle giris yapin.');
+    } else if (r.kind === 'recovery') {
+      setShowAuth(true); setAuthMode('newpass'); setAuthError('');
+    }
+    try { window.history.replaceState(null, '', window.location.pathname); } catch { /* yok say */ }
+  }, []);
+  React.useEffect(() => {
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event) => {
+      if (event === 'PASSWORD_RECOVERY') { setShowAuth(true); setAuthMode('newpass'); setAuthError(''); }
+    });
+    return () => subscription.unsubscribe();
+  }, []);
 
+  // Son işlenen oturumun kullanıcısı ve sırası: eski bir olayın geç biten işi
+  // yenisinin üstüne yazmasın.
+  const authSeqRef = React.useRef(0);
+  const authUserRef = React.useRef<string | null>(null);
+  const authAnonRef = React.useRef<boolean | null>(null);
+  // Bu kullanıcı için yükleme başarıyla bitti mi (kimlik sunucuda bağlandı)?
+  const authAppliedRef = React.useRef<string | null>(null);
+
+  React.useEffect(() => {
+    /**
+     * Oturum değişince profili, kimliği ve geçmişi yükler.
+     *
+     * NEDEN AYRI VE ERTELENMİŞ (saha bildirimi 2026-10-11, "dışarıdan
+     * bağlanamıyor"): Bu gövde eskiden doğrudan `onAuthStateChange(async ...)`
+     * içindeydi. supabase-js dinleyiciyi OTURUM KİLİDİNİ TUTARKEN çağırır ve
+     * bekler; içerideki her `supabase.from()/rpc()` çağrısı da aynı kilidi
+     * ister. Sonuç kalıcı kilitlenme: TURN kimliği, bağlantı isteği, kabul —
+     * oturum isteyen her şey sonsuza dek bekler. Tetikleyen olaylar: anonim
+     * giriş ("Hesap açmadan devam et"), giriş ve SAATTE BİR otomatik jeton
+     * yenileme. Uygulamayı açıp hemen bağlananlar (ofis içi testler) etkilenmez;
+     * açık bırakıp bekleyen müşteri cihazı sessizce çalışmaz hale gelir.
+     * Canlıda iki sekmede yeniden üretildi (Web Locks kilidi kalıcı tutuluyordu).
+     * Supabase'in önerdiği çözüm: dinleyicide yalnızca eşzamanlı iş, gerisi
+     * setTimeout(…, 0) ile kilit bırakıldıktan sonra.
+     */
+    const applySession = async (session: Session | null, seq: number) => {
+      const stale = () => seq !== authSeqRef.current;
+      if (stale()) return;
       const user = session?.user ?? null;
       const anon = !!user?.is_anonymous;
       setCurrentUser(user);
@@ -674,21 +919,13 @@ export default function App() {
         // eder ve mevcut kimlik asla değişmez. Eski istemci üretimi 32-bit
         // hash'ti; çakışan kullanıcının upsert'ü sessizce başarısız oluyor ve
         // o kullanıcı kimliksiz — yani ulaşılamaz — kalıyordu.
-        const { id: pid, fromServer } = await resolveMyConnectionId(user.id);
-        setConnectionId(pid);
-        // Kimlik sunucuda kayitli: artik bu kimlige sinyal gelebilir.
-        setIdentityReady(true);
-        setIdentityError('');
-        // Kimlik bağlama: bu satır, display kimliğini (123-456-789) auth.uid()'e
-        // bağlar. signals RLS'ini kimliğe dayandırmanın ön koşulu budur —
-        // misafirler dahil herkes için yazılır.
-        const profileRow: Record<string, unknown> = {
-          id: user.id, email: user.email ?? null,
-          device_fingerprint: fp, last_seen: new Date().toISOString(),
-        };
-        // Sunucu atadıysa kimliği tekrar yazmayız (RPC zaten yazdı).
-        if (!fromServer) profileRow.connection_id = pid;
-        await supabase.from('users').upsert(profileRow, { onConflict: 'id' });
+        const bound = await bindServerIdentity(user, fp);
+        if (stale()) return;
+        setConnectionId(bound.id);
+        setIdentityReady(bound.ready);
+        setIdentityError(bound.error);
+        // Kimlik bağlanamadıysa bir sonraki oturum olayı yeniden denesin.
+        authAppliedRef.current = bound.ready ? user.id : null;
         if (anon) {
           // Misafir: profil/geçmiş/abonelik yüklenmez, kayıt tutulmaz.
           setUserProfile(null);
@@ -697,6 +934,7 @@ export default function App() {
           return;
         }
         const { data: prof } = await supabase.from('users').select('*').eq('id', user.id).single();
+        if (stale()) return;
         if (prof) {
           setUserProfile(prof as UserProfile);
           if (prof.theme) setTheme(prof.theme as Theme);
@@ -707,10 +945,14 @@ export default function App() {
           }
         }
         const { data: lgData } = await supabase.from('logs').select('*').eq('user_id', user.id).order('created_at', { ascending: false }).limit(50);
+        if (stale()) return;
         if (lgData) setLogs(lgData.map(l => ({ time: new Date(l.created_at).toLocaleTimeString('tr-TR'), msg: l.msg, type: l.type as LogType })));
         const { data: cxData } = await supabase.from('connections').select('*').eq('caller_id', user.id).order('created_at', { ascending: false }).limit(20);
+        if (stale()) return;
         if (cxData) setConnectionHistory(cxData as ConnectionEntry[]);
-        setEntitlements(await fetchEntitlements());
+        const ent = await fetchEntitlements();
+        if (stale()) return;
+        setEntitlements(ent);
         // Kurumsal davetleri hesaba bagla. Bu cagri olmadan admin'in ekledigi
         // cihaz etiketleri hicbir zaman cozumlenmez ve kurumsal vanity kimlik
         // (acme-01) calismaz — organization_members.user_id NULL kalirdi.
@@ -724,6 +966,37 @@ export default function App() {
         setEntitlements(FREE_ENTITLEMENTS);
         setLogs([{ time: ts(), msg: `Arku Remote v${__APP_VERSION__} baslatildi...`, type: 'sys' }, { time: ts(), msg: 'Lutfen giris yapin.', type: 'warn' }]);
       }
+    };
+
+    // DİKKAT: Bu dinleyici async OLMAMALI ve içinde supabase çağrısı
+    // BEKLENMEMELİ (yukarıdaki açıklama). Yalnızca eşzamanlı iş burada.
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
+      // Realtime WebSocket'i kendi JWT'sini taşır ve RLS'i onunla değerlendirir.
+      // Politikalar auth.uid()'e bağlandığında bu çağrı yapılmazsa postgres_changes
+      // olayları SESSİZCE hiç gelmez — 2026-07-27'de bağlantıyı bozan tam olarak buydu.
+      // Jeton verildiği için supabase-js oturum kilidine dokunmaz.
+      void supabase.realtime.setAuth(session?.access_token ?? null);
+
+      const uid = session?.user?.id ?? null;
+      const anon = !!session?.user?.is_anonymous;
+      // Aynı kullanıcı için tekrar eden olaylar: kimlik ve profil yeniden
+      // YÜKLENMEZ. supabase-js saatlik yenilemede TOKEN_REFRESHED, pencere/sekme
+      // tekrar görünür olunca (Electron'da küçültülmüş pencereyi açınca) ve
+      // başka sekmeden yayınla SIGNED_IN gönderir. Eskiden her birinde kimlik
+      // RPC'si yeniden çalışıyor, günlük siliniyor, oturum etiketi değişiyordu;
+      // o anda ağ kesikse gösterilen kimlik bile değişebiliyordu
+      // (bağımsız inceleme bulgusu, 2026-10-11).
+      const sameUser = !!uid && uid === authUserRef.current && anon === authAnonRef.current;
+      if (sameUser && authAppliedRef.current === uid
+          && (event === 'TOKEN_REFRESHED' || event === 'SIGNED_IN' || event === 'USER_UPDATED' || event === 'INITIAL_SESSION')) {
+        setCurrentUser(session!.user);
+        return;
+      }
+      authUserRef.current = uid;
+      authAnonRef.current = uid ? anon : null;
+      if (!uid) authAppliedRef.current = null;
+      const seq = ++authSeqRef.current;
+      setTimeout(() => { void applySession(session, seq); }, 0);
     });
     return () => subscription.unsubscribe();
   }, []);
@@ -791,19 +1064,41 @@ export default function App() {
     return () => { cancelled = true; };
   }, [ensureSession]);
 
-  /** Arayuzdeki "Tekrar Dene" dugmesi. */
+  /**
+   * Arayuzdeki "Tekrar Dene" dugmesi.
+   *
+   * Iki asamali: once oturum (yoksa anonim acilir), sonra KIMLIK. Ikincisi
+   * eskiden yoktu — oturum zaten gecerliyse ensureSession true donuyor,
+   * onAuthStateChange tetiklenmiyor ve dugme hicbir sey yapmiyordu.
+   */
   const retryIdentity = async () => {
     setIdentityError('');
     addLocalLog('Kimlik yeniden alinmaya calisiliyor...', 'info');
     anonBootstrapRef.current = true;
-    if (!(await ensureSession())) anonBootstrapRef.current = false;
+    if (!(await ensureSession())) { anonBootstrapRef.current = false; return; }
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) return; // signInAnonymously onAuthStateChange'i tetikleyecek
+    const bound = await bindServerIdentity(user, deviceFingerprint || generateDeviceFingerprint());
+    setConnectionId(bound.id);
+    setIdentityReady(bound.ready);
+    setIdentityError(bound.error);
+    addLocalLog(bound.ready ? 'Kimlik alindi.' : `Kimlik alinamadi: ${bound.error}`, bound.ready ? 'sys' : 'error');
   };
 
   // QRtım'den ?qrtim_token=... ile dönüşte tek noktadan işle:
   // oturum açıksa hesabı bağla, açık değilse QRtım ile giriş yap (SSO).
+  //
+  // ÇİFT ÇAĞRI KORUMASI: belirtec TEK KULLANIMLIKTIR, QRtim onu ilk istekte
+  // yakar ve ikinci istek 401 alir. React StrictMode gelistirme modunda
+  // efektleri iki kez calistiriyor; koruma olmadan giris BASARILI oldugu halde
+  // ekrana "QRtim ile giris basarisiz" yaziliyordu. Uctan uca testi tam olarak
+  // bu modda yapacagimiz icin onemli.
+  const qrtimTokenRef = React.useRef(false);
   React.useEffect(() => {
     const qrtimToken = new URLSearchParams(window.location.search).get('qrtim_token');
     if (!qrtimToken) return;
+    if (qrtimTokenRef.current) return;
+    qrtimTokenRef.current = true;
     if (!QRTIM_ENABLED) {
       // Askidayken gelen token islenmez; adres cubugundan da temizlenir.
       window.history.replaceState({}, '', window.location.pathname);
@@ -836,7 +1131,10 @@ export default function App() {
   React.useEffect(() => {
     if (!EMBED.embed) return;
     const onMsg = (e: MessageEvent) => {
-      if (EMBED.parentOrigin !== '*' && e.origin !== EMBED.parentOrigin) return;
+      // Koken cozulemediyse (trusted=false) hicbir komut kabul edilmez.
+      // Eskiden o durumda filtre devre disi kaliyor ve HERHANGI BIR koken
+      // oturumu kesebiliyordu.
+      if (!EMBED.trusted || e.origin !== EMBED.parentOrigin) return;
       const d = e.data as { type?: string; action?: string } | null;
       if (d?.type !== 'arku:command') return;
       if (d.action === 'end') handleDisconnectRef.current?.();
@@ -892,34 +1190,75 @@ export default function App() {
   };
 
   const handleRegister = async () => {
-    setAuthError('');
+    if (authBusyRef.current) return;
+    setAuthError(''); setAuthNotice('');
     if (!displayName.trim()) { setAuthError('Ad Soyad zorunludur.'); return; }
-    if (password.length < 6) { setAuthError('Sifre en az 6 karakter olmali.'); return; }
+    // Bu hesap, bir baskasinin bilgisayarina baglanma yetkisi tasiyor; esigin
+    // bir e-ticaret sitesiyle ayni olmamasi gerekir. Supabase panelinde de
+    // asgari uzunluk 10 yapilmali ve "Leaked password protection" acilmali
+    // (bkz. DEPLOYMENT.md > Supabase panel ayarlari).
+    if (password.length < 10) { setAuthError('Sifre en az 10 karakter olmali.'); return; }
     // Anonim oturum açıkken signUp, YENİ hesap açmak yerine mevcut anonim
     // kullanıcıya kimlik bağlar. Kayıt akışının öngörülebilir olması ve e-posta
     // doğrulamasının beklendiği gibi işlemesi için önce anonim oturumu kapatıyoruz.
     if (currentUser?.is_anonymous) {
       try { await supabase.auth.signOut({ scope: 'local' }); } catch { /* yok say */ }
     }
-    const { data, error } = await supabase.auth.signUp({ email, password, options: { data: { display_name: displayName, phone } } });
-    if (error) { setAuthError(error.message); await ensureAnonSession(); return; }
-    // "Confirm email" açıkken Supabase oturum DÖNDÜRMEZ; kullanıcı doğrulamadan giriş yapamaz.
-    const dogrulamaGerekli = !data.session;
-    setShowAuth(false);
-    addLog(dogrulamaGerekli
-      ? 'Kayit alindi. Hesabinizi kullanabilmek icin e-postanizdaki dogrulama baglantisina tiklayin.'
-      : 'Kayit basarili.', 'warn');
-    if (dogrulamaGerekli) await ensureAnonSession();
+    if (!lockAuth()) return;
+    try {
+      const { data, error } = await supabase.auth.signUp({
+        email, password,
+        // Dönüş adresi verilmezse Supabase panelindeki Site URL'e (localhost)
+        // yönlendiriyordu; müşteri doğrulandığı hâlde hata sayfası görüyordu.
+        options: { data: { display_name: displayName, phone }, emailRedirectTo: emailRedirectTo() },
+      });
+      if (error) { setAuthError(error.message); await ensureAnonSession(); return; }
+      // "Confirm email" açıkken Supabase oturum DÖNDÜRMEZ; kullanıcı doğrulamadan giriş yapamaz.
+      const dogrulamaGerekli = !data.session;
+      if (dogrulamaGerekli) {
+        // Pencereyi kapatma: ne yapacağını burada açıkça göster.
+        setUnconfirmedEmail(email);
+        setAuthMode('checkmail');
+        addLog('Kayit alindi. E-postanizdaki dogrulama baglantisina bir kez tiklayin, sonra giris yapin.', 'warn');
+        await ensureAnonSession();
+      } else {
+        setShowAuth(false);
+        addLog('Kayit basarili.', 'sys');
+      }
+    } finally {
+      unlockAuth();
+    }
+  };
+  /** Doğrulama e-postasını yeniden gönderir (tükenmiş/kaybolmuş bağlantı için). */
+  const handleResendConfirmation = async () => {
+    const target = (unconfirmedEmail || email).trim();
+    if (!target) { setAuthError('E-posta adresinizi girin.'); return; }
+    if (!lockAuth()) return;
+    setAuthError('');
+    try {
+      const { error } = await supabase.auth.resend({ type: 'signup', email: target, options: { emailRedirectTo: emailRedirectTo() } });
+      if (error) { setAuthError(error.message); return; }
+      setAuthNotice(`Yeni dogrulama e-postasi ${target} adresine gonderildi.`);
+    } finally {
+      unlockAuth();
+    }
   };
   const handleLogin = async () => {
-    setAuthError('');
-    const { error } = await supabase.auth.signInWithPassword({ email, password });
+    if (!lockAuth()) return;
+    setAuthError(''); setAuthNotice('');
+    let error: { message: string } | null = null;
+    try {
+      ({ error } = await supabase.auth.signInWithPassword({ email, password }));
+    } finally {
+      unlockAuth();
+    }
     if (error) {
       // Supabase bu durumu İngilizce döndürür; kullanıcıya ne yapacağını söyleyelim.
       const dogrulanmamis = /confirm/i.test(error.message);
+      setUnconfirmedEmail(dogrulanmamis ? email : '');
       setAuthError(dogrulanmamis
-        ? 'E-posta adresiniz henuz dogrulanmamis. Gelen kutunuzdaki dogrulama baglantisina tiklayin.'
-        : error.message);
+        ? 'E-posta adresiniz henuz dogrulanmamis. Gelen kutunuzdaki baglantiya tiklayin ya da asagidan yeniden gonderin.'
+        : /invalid login/i.test(error.message) ? 'E-posta veya sifre hatali.' : error.message);
       await ensureAnonSession();
       return;
     }
@@ -934,9 +1273,42 @@ export default function App() {
   const handlePasswordReset = async () => {
     setAuthError('');
     if (!resetEmail) { setAuthError('E-posta adresinizi girin.'); return; }
-    const { error } = await supabase.auth.resetPasswordForEmail(resetEmail);
-    if (error) { setAuthError(error.message); return; }
-    setResetSent(true);
+    if (!lockAuth()) return;
+    try {
+      const { error } = await supabase.auth.resetPasswordForEmail(resetEmail, { redirectTo: emailRedirectTo() });
+      if (error) {
+        setAuthError(error.status === 429 || /rate limit|seconds/i.test(error.message)
+          ? 'Kisa surede cok fazla istek gonderildi. Bir dakika bekleyip tekrar deneyin.'
+          : error.message);
+        return;
+      }
+      setResetSent(true);
+    } finally {
+      unlockAuth();
+    }
+  };
+  /** Şifre sıfırlama bağlantısından dönen kullanıcı yeni şifresini belirler. */
+  const handleSetNewPassword = async () => {
+    if (authBusyRef.current) return;
+    setAuthError('');
+    if (newPassValue.length < 10) { setAuthError('Yeni sifre en az 10 karakter olmali.'); return; }
+    if (newPassValue !== newPassConfirm) { setAuthError('Sifreler eslesmiyor.'); return; }
+    if (!lockAuth()) return;
+    try {
+      // Bağlantı geçersizse uygulama anonim oturum açmış olabilir; o oturumla
+      // "şifre güncellendi" demek yanlış olur (bağımsız denetim bulgusu R3).
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session?.user || session.user.is_anonymous) {
+        setAuthError('Sifirlama baglantisi gecersiz ya da suresi dolmus. Lutfen yeni bir sifirlama baglantisi isteyin.');
+        return;
+      }
+      const { error } = await supabase.auth.updateUser({ password: newPassValue });
+      if (error) { setAuthError(error.message); return; }
+      setNewPassValue(''); setNewPassConfirm('');
+      setShowAuth(false); addLog('Sifreniz guncellendi.', 'sys');
+    } finally {
+      unlockAuth();
+    }
   };
   const handleUpdateProfile = async () => {
     if (!currentUser) return; setProfileUpdateDone(false);
@@ -944,10 +1316,77 @@ export default function App() {
     if (error) { addLog(`Profil guncellenemedi: ${error.message}`, 'error'); return; }
     setProfileUpdateDone(true); addLog('Profil guncellendi.', 'sys'); setTimeout(() => setProfileUpdateDone(false), 3000);
   };
+  /** Kayitli TOTP faktorlerini getirir (yalnizca dogrulanmis olanlar). */
+  const loadMfaFactors = async () => {
+    const { data, error } = await supabase.auth.mfa.listFactors();
+    if (error) { setMfaFactors([]); return; }
+    setMfaFactors((data?.totp ?? []).filter(f => f.status === 'verified')
+      .map(f => ({ id: f.id, friendly_name: f.friendly_name ?? undefined })));
+  };
+
+  /** Yeni faktor kaydi baslatir: QR kodu ve gizli anahtar uretir. */
+  const startMfaEnroll = async () => {
+    setMfaError(''); setMfaNotice(''); setMfaBusy(true);
+    try {
+      const { data, error } = await supabase.auth.mfa.enroll({
+        factorType: 'totp',
+        // Benzersiz olmali: Supabase ayni friendlyName ile ikinci bir faktor
+        // kaydini reddediyor. Kullanici kaydi yarida birakip ayni gun tekrar
+        // denediginde eski (dogrulanmamis) faktor hala durabiliyor.
+        friendlyName: `Arku ${new Date().toISOString().slice(0, 16).replace('T', ' ')}`,
+      });
+      if (error || !data) { setMfaError(error?.message ?? 'Faktor olusturulamadi.'); return; }
+      setMfaEnroll({ factorId: data.id, qr: data.totp.qr_code, secret: data.totp.secret });
+      setMfaEnrollCode('');
+    } finally { setMfaBusy(false); }
+  };
+
+  /** Uygulamadaki kodu dogrulayarak faktoru etkinlestirir. */
+  const confirmMfaEnroll = async () => {
+    if (!mfaEnroll) return;
+    setMfaError(''); setMfaBusy(true);
+    try {
+      const { data: ch, error: chErr } = await supabase.auth.mfa.challenge({ factorId: mfaEnroll.factorId });
+      if (chErr || !ch) { setMfaError(chErr?.message ?? 'Dogrulama baslatilamadi.'); return; }
+      const { error: vErr } = await supabase.auth.mfa.verify({
+        factorId: mfaEnroll.factorId, challengeId: ch.id, code: mfaEnrollCode.replace(/\D/g, ''),
+      });
+      if (vErr) { setMfaError('Kod dogrulanamadi. Uygulamadaki guncel kodu girin.'); return; }
+      setMfaEnroll(null); setMfaEnrollCode('');
+      setMfaNotice('Iki adimli dogrulama acildi. Bundan sonra her giriste kod istenecek.');
+      await loadMfaFactors();
+      addLog('Iki adimli dogrulama etkinlestirildi.', 'sys');
+    } finally { setMfaBusy(false); }
+  };
+
+  /** Kaydi iptal eder (henuz dogrulanmamis faktoru de temizler). */
+  const cancelMfaEnroll = async () => {
+    const f = mfaEnroll;
+    setMfaEnroll(null); setMfaEnrollCode(''); setMfaError('');
+    if (f) { try { await supabase.auth.mfa.unenroll({ factorId: f.factorId }); } catch { /* yok say */ } }
+  };
+
+  const removeMfaFactor = async (factorId: string) => {
+    setMfaError(''); setMfaBusy(true);
+    try {
+      const { error } = await supabase.auth.mfa.unenroll({ factorId });
+      if (error) { setMfaError(error.message); return; }
+      setMfaNotice('Iki adimli dogrulama kapatildi.');
+      await loadMfaFactors();
+      addLog('Iki adimli dogrulama kapatildi.', 'warn');
+    } finally { setMfaBusy(false); }
+  };
+
+  // Ayarlar sekmesi acildiginda faktorleri yukle.
+  React.useEffect(() => {
+    if (activeTab === 'settings' && isRegistered) loadMfaFactors();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, currentUser?.id]);
+
   const handleChangePassword = async () => {
     setPasswordChangeError('');
     if (!currentPassword) { setPasswordChangeError('Mevcut sifrenizi girin.'); return; }
-    if (newPassword.length < 6) { setPasswordChangeError('Yeni sifre en az 6 karakter olmali.'); return; }
+    if (newPassword.length < 10) { setPasswordChangeError('Yeni sifre en az 10 karakter olmali.'); return; }
     if (newPassword !== newPasswordConfirm) { setPasswordChangeError('Sifreler eslesmiyor.'); return; }
     const { error: e1 } = await supabase.auth.signInWithPassword({ email: currentUser?.email || '', password: currentPassword });
     if (e1) { setPasswordChangeError('Mevcut sifreniz hatali.'); return; }
@@ -973,9 +1412,23 @@ export default function App() {
   const handleLogout = async () => {
     if (connTimeoutRef.current) clearTimeout(connTimeoutRef.current);
     if (webrtc) { try { await webrtc.disconnect(); } catch { /* yok say */ } setWebrtc(null); }
-    // signOut'un sunucu çağrısı (global scope) başarısız olsa bile yerel oturumu
-    // kesin temizle; aksi halde state güncellenmez ve "çıkış yapılmıyor" görünür.
-    try { await supabase.auth.signOut({ scope: 'local' }); } catch { /* yok say */ }
+    // ÖNCE GLOBAL çıkış: yenileme jetonu sunucuda da iptal edilsin.
+    //
+    // Eskiden yalnızca `scope: 'local'` çağrılıyordu; gerekçe ağ hatasında
+    // arayüzün kilitlenmemesiydi. Ama uzaktan erişim ürününde çıkış, bir
+    // oturumu GERÇEKTEN kapatma beklentisi taşır: ortak kullanılan ya da
+    // kaybolan bir makinede jeton kopyalanmışsa yerel silme hiçbir şeyi
+    // değiştirmiyordu. Global çağrı başarısız olursa yerele düşüp kullanıcıya
+    // durumu söylüyoruz — arayüz yine kilitlenmiyor.
+    let globalOk = false;
+    try {
+      const { error } = await supabase.auth.signOut();
+      globalOk = !error;
+    } catch { globalOk = false; }
+    if (!globalOk) {
+      try { await supabase.auth.signOut({ scope: 'local' }); } catch { /* yok say */ }
+      addLocalLog('Bu cihazdan cikildi, ancak sunucudaki oturum iptal edilemedi (ag hatasi). Diger oturumlar acik kalmis olabilir.', 'warn');
+    }
     // QRtım yeniden-giriş döngüsünü kır: kalan callback/token izlerini temizle.
     try { sessionStorage.removeItem('partner_callback'); } catch { /* yok say */ }
     // TURN kimlik bilgisi çağıranın kimliğine bağlıdır — sonraki kullanıcı
@@ -1003,6 +1456,54 @@ export default function App() {
     try { setEntitlements(await fetchEntitlements()); }
     catch { setEntitlements(FREE_ENTITLEMENTS); }
   };
+
+  // QRtim planini periyodik tazele.
+  //
+  // NEDEN: QRtim kaynakli Arku planinin 72 saatlik bir gecerlilik ufku var
+  // (20260922_qrtim_plan_expiry). Tazelenmezse yetki kendiliginden duser —
+  // bilincli bir guvenli varsayilan: QRtim aboneligi biten kullanici Arku'da
+  // ucretli kalmasin. Musteri magdur olmasin diye uygulama acikken duzenli
+  // tazeliyoruz.
+  //
+  // Sir ISTEMCIDE DEGIL: edge fonksiyonu onu sunucuda okuyor, buradan yalnizca
+  // "benim planimi tazele" deniyor. Yanit 'no_link' / 'unreachable' /
+  // 'unauthorized' olabilir; hicbiri kullaniciyi dusurmez.
+  React.useEffect(() => {
+    if (!QRTIM_ENABLED) return;
+    if (!currentUser || currentUser.is_anonymous) return;
+    let iptal = false;
+
+    const tazele = async () => {
+      try {
+        const { data: { session } } = await supabase.auth.getSession();
+        if (!session || iptal) return;
+        const res = await fetch(QRTIM_PLAN_REFRESH_URL, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            apikey: ARKU_ANON_KEY,
+            Authorization: `Bearer ${session.access_token}`,
+          },
+          body: '{}',
+        });
+        if (iptal) return;
+        const data = await res.json().catch(() => null);
+        // Yalnizca plan gercekten degismis olabilecek durumlarda yeniden oku.
+        if (data?.status === 'ok' || data?.status === 'revoked') {
+          await refreshEntitlements();
+        }
+        if (data?.status === 'revoked') {
+          setQrtimUser(null);
+          addLocalLog('QRtım bağlantısı QRtım tarafında kaldırıldı; plan ücretsiz kademeye alındı.', 'warn');
+        }
+      } catch { /* ag hatasi: ufuk zaten kendiliginden geciyor */ }
+    };
+
+    tazele();
+    const zamanlayici = setInterval(tazele, 6 * 60 * 60 * 1000); // 6 saat
+    return () => { iptal = true; clearInterval(zamanlayici); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentUser?.id]);
 
   const refreshContacts = async () => {
     const [sc, cat] = await Promise.all([listSavedContacts(), listCategories()]);
@@ -1147,10 +1648,13 @@ export default function App() {
   const handleCreateOrg = async () => {
     setEntError('');
     const { org, error } = await createOrganization(newOrgName.trim(), newOrgSlug.trim().toLowerCase());
-    if (error) { setEntError(error); return; }
+    // Firma açılmış ama kurucu üyeliği oluşmamış olabilir (eski şema): o durumda
+    // HEM uyarıyı göster HEM listeyi yenile — firma gerçekten var.
+    if (error) setEntError(error);
+    if (!org) return;
     setNewOrgName(''); setNewOrgSlug('');
     await refreshOrganizations();
-    if (org) setActiveOrgId(org.id);
+    setActiveOrgId(org.id);
   };
   const handleSaveOrg = async () => {
     if (!activeOrgId) return;
@@ -1201,7 +1705,11 @@ export default function App() {
       });
       const data = await res.json();
       if (!res.ok || !data.valid) {
-        addLocalLog(`QRtım bağlantısı başarısız: ${data.error || 'Bilinmeyen hata'}`, 'error');
+        if (data.code === 'token_already_used') {
+          addLocalLog('QRtım bağlantısı zaten tamamlandı.', 'warn');
+        } else {
+          addLocalLog(`QRtım bağlantısı başarısız: ${qrtimErrorText(data.code, data.error)}`, 'error');
+        }
         return;
       }
       if (data.user.name && !displayName) setDisplayName(data.user.name);
@@ -1222,6 +1730,23 @@ export default function App() {
   // yönlendirme tarayıcıca engellenir). Bu yüzden Electron'da callback olarak
   // güvenilen web adresi kullanılır; dönüş electron/main.cjs tarafından
   // yakalanıp token yerel uygulamaya aktarılır.
+  // QRtim hata KODUNU kullanici diline cevirir.
+  // Kod uzerinden dalllaniyoruz, metin uzerinden degil: QRtim tarafindaki
+  // insan okunur `error` metinleri degisebilir, `code` sabittir.
+  const qrtimErrorText = (code?: string, fallback?: string): string => {
+    switch (code) {
+      case 'token_expired':
+        return 'QRtim baglantisinin suresi doldu. Lutfen tekrar deneyin.';
+      case 'email_not_verified':
+        return 'QRtim hesabinizin e-postasi dogrulanmamis. QRtim\'de dogrulayip tekrar deneyin.';
+      case 'token_invalid':
+      case 'token_missing':
+        return 'QRtim baglantisi gecersiz. Lutfen tekrar deneyin.';
+      default:
+        return fallback || 'Bilinmeyen hata';
+    }
+  };
+
   const qrtimCallbackUrl = () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     if ((window as any).electronAPI?.isElectron) return 'https://arku-remote.vercel.app';
@@ -1255,7 +1780,14 @@ export default function App() {
       });
       const data = await res.json();
       if (!res.ok || !data.token_hash) {
-        addLocalLog(`QRtım ile giriş başarısız: ${data.error || 'Bilinmeyen hata'}`, 'error');
+        // Belirtec tek kullanimlik: ikinci kez gonderilirse QRtim
+        // `token_already_used` doner. Bu bir HATA DEGIL — ilk istek basarili
+        // olmustur; kullaniciya basarisizlik gostermek yanlis olur.
+        if (data.code === 'token_already_used') {
+          addLocalLog('QRtım bağlantısı zaten tamamlandı.', 'warn');
+        } else {
+          addLocalLog(`QRtım ile giriş başarısız: ${qrtimErrorText(data.code, data.error)}`, 'error');
+        }
         return;
       }
       const { error } = await supabase.auth.verifyOtp({ token_hash: data.token_hash, type: 'magiclink' });
@@ -1275,10 +1807,18 @@ export default function App() {
 
   const handleQrtimDisconnect = async () => {
     if (!currentUser) return;
-    await supabase.from('users').update({
-      qrtim_id: null, qrtim_username: null, qrtim_name: null,
-      qrtim_email: null, qrtim_connected_at: null,
-    }).eq('id', currentUser.id);
+    // qrtim_* kolonlarina istemci yetkisi KALDIRILDI (kolon duzeyinde grant);
+    // temizlik, yalnizca kendi satirinda bu alanlari bosaltan dar bir RPC ile
+    // yapiliyor. Gerekce: 20260912_authz_hardening.sql
+    const { error } = await supabase.rpc('arku_qrtim_unlink');
+    if (error) {
+      // Migration henuz uygulanmadiysa eski yola dus (kolon yetkisi hala var).
+      const { error: legacy } = await supabase.from('users').update({
+        qrtim_id: null, qrtim_username: null, qrtim_name: null,
+        qrtim_email: null, qrtim_connected_at: null,
+      }).eq('id', currentUser.id);
+      if (legacy) { addLocalLog(`QRtım bağlantısı kesilemedi: ${legacy.message}`, 'error'); return; }
+    }
     setQrtimUser(null);
     addLocalLog('QRtım hesabı bağlantısı kesildi.', 'warn');
   };
@@ -1311,9 +1851,26 @@ export default function App() {
     addLocalLog(`Pano karsi tarafa gonderildi (${text.length} karakter).`, 'sys');
   };
 
+  /**
+   * Bekleyen uzak pano isteği. Karşı taraftan gelen `clip-set` YALNIZCA bunun
+   * karşılığıysa panoya yazılır.
+   *
+   * NEDEN: eskiden operatör tarafında hiçbir kapı yoktu — gelen her `clip-set`
+   * "benim istediğim yanıt" sayılıyor ve doğrudan panoya yazılıyordu. Kötü
+   * niyetli bir eş, oturum boyunca istediği an operatörün panosundaki IBAN'ı,
+   * parolayı veya komutu kendi metniyle değiştirebiliyordu. Ana süreçteki
+   * kontrol izni de devreye girmiyordu, çünkü bu yol `fromRemote: false`
+   * ile çağrılıyor (operatörün kendi isteği varsayımı).
+   */
+  const clipReqRef = React.useRef<{ id: string; at: number } | null>(null);
+  /** İsteğin yanıtı için tanınan süre. Uzak pano okuma saniyeler sürer. */
+  const CLIP_REPLY_WINDOW_MS = 20000;
+
   const requestRemoteClipboard = () => {
     if (!webrtc || rtcState !== 'connected') return;
-    webrtc.sendControl({ k: 'clip-req' });
+    const id = 'c' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    clipReqRef.current = { id, at: Date.now() };
+    webrtc.sendControl({ k: 'clip-req', id });
     addLocalLog('Uzak pano istendi...', 'info');
   };
 
@@ -1323,7 +1880,14 @@ export default function App() {
     : n >= 1024 ? Math.round(n / 1024) + ' KB'
     : n + ' B';
 
-  /** Alinan dosyayi diske yazar. Masaustunde kaydetme penceresi, webde indirme. */
+  /**
+   * Alinan dosyayi diske yazar — YALNIZCA WEB surumu icin.
+   *
+   * Masaustunde dosya artik akis halinde yaziliyor (acceptIncomingFile ->
+   * streamBegin/streamWrite/streamEnd), bu yuzden buraya hic dusulmez.
+   * Eskiden 200 MB'lik ust sinirda ayni anda 4 kopya olusuyordu:
+   * parca dizisi -> Blob -> ArrayBuffer -> IPC kopyasi.
+   */
   const saveReceivedFile = async (name: string, blob: Blob) => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const api = (window as any).electronAPI;
@@ -1346,6 +1910,22 @@ export default function App() {
     addLocalLog(`Dosya indirildi: ${name}`, 'sys');
   };
 
+  /**
+   * Acik gelen-dosya akisini kapatir. `discard` ile yarim dosya silinir.
+   * Manager'in sink'i de temizlenir, aksi halde sonraki transfer kapali bir
+   * akisa yazmaya calisir.
+   */
+  const closeFileStream = async (opts: { discard?: boolean } = {}) => {
+    const st = fileStreamRef.current;
+    fileStreamRef.current = null;
+    if (webrtcRef.current) webrtcRef.current.onFileSink = undefined;
+    if (!st) return null;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const api = (window as any).electronAPI;
+    if (opts.discard) return api?.streamAbort?.(st.id) ?? null;
+    return api?.streamEnd?.(st.id) ?? null;
+  };
+
   const pickAndSendFile = () => { fileInputRef.current?.click(); };
 
   const handleFileChosen = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -1358,17 +1938,44 @@ export default function App() {
     addLocalLog(`Dosya teklif edildi: ${file.name} (${formatBytes(file.size)})`, 'info');
   };
 
-  const acceptIncomingFile = () => {
+  const acceptIncomingFile = async () => {
     if (!incomingFile || !webrtc) return;
-    webrtc.acceptIncomingFile(incomingFile);
-    setFileProgress({ id: incomingFile.id, done: 0, total: incomingFile.size, dir: 'in' });
-    addLocalLog(`Dosya aliniyor: ${incomingFile.name}`, 'sys');
+    const offer = incomingFile;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const api = (window as any).electronAPI;
+
+    // Masaustunde kaydetme yerini SIMDI sor ve akisi SIMDI ac: file-accept
+    // gonderildikten sonra parcalar hemen gelmeye baslar, ilk parcalar
+    // kaybedilmemeli. (Akisi acamazsak transferi hic kabul etmiyoruz.)
+    if (api?.streamBegin) {
+      const res = await api.streamBegin({ kind: 'file', name: offer.name });
+      if (res?.cancelled) {
+        webrtc.rejectIncomingFile(offer.id);
+        addLocalLog('Kaydetme iptal edildi, dosya reddedildi.', 'warn');
+        setIncomingFile(null);
+        return;
+      }
+      if (!res?.id) {
+        webrtc.rejectIncomingFile(offer.id);
+        addLocalLog(`Dosya acilamadi: ${res?.error ?? 'bilinmeyen hata'}`, 'error');
+        setIncomingFile(null);
+        return;
+      }
+      fileStreamRef.current = { id: res.id, path: res.path };
+      // Manager artik parcalari biriktirmiyor, buraya akitiyor.
+      webrtc.onFileSink = (buf: ArrayBuffer) => api.streamWrite(res.id, new Uint8Array(buf));
+    }
+
+    webrtc.acceptIncomingFile(offer);
+    setFileProgress({ id: offer.id, done: 0, total: offer.size, dir: 'in' });
+    addLocalLog(`Dosya aliniyor: ${offer.name}`, 'sys');
     setIncomingFile(null);
   };
 
-  const rejectIncomingFile = () => {
+  const rejectIncomingFile = async () => {
     if (!incomingFile || !webrtc) return;
     webrtc.rejectIncomingFile(incomingFile.id);
+    await closeFileStream({ discard: true });
     addLocalLog('Dosya reddedildi.', 'warn');
     setIncomingFile(null);
   };
@@ -1390,17 +1997,70 @@ export default function App() {
     return '';
   };
 
-  /** Kaydi fiilen baslatir (onay ALINDIKTAN sonra cagrilir). */
-  const startRecording = (stream: MediaStream): boolean => {
+  /**
+   * Kaydi fiilen baslatir (onay ALINDIKTAN sonra cagrilir).
+   *
+   * MASAUSTUNDE parcalar bellekte BIRIKMEZ: her parca ana surece gonderilip
+   * dosyaya append edilir. Eskiden hepsi durdurulana kadar bellekte
+   * tutuluyordu; 4 Mbps tavanla bir saatlik kayit ~1,8 GB RAM demekti ve
+   * sekme cokerse KAYIT TAMAMEN KAYBOLUYORDU.
+   */
+  const startRecording = async (stream: MediaStream): Promise<boolean> => {
     if (typeof MediaRecorder === 'undefined') {
       addLocalLog('Bu tarayici kayit desteklemiyor.', 'error');
       return false;
     }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const api = (window as any).electronAPI;
+    // Akisi kayit BASLAMADAN once ac: klasor secimi gerekebilir ve ilk
+    // parcalar kaybedilmemeli.
+    if (api?.streamBegin) {
+      const res = await api.streamBegin({ kind: 'recording', peer: peerLabel || targetId });
+      if (res?.cancelled) { addLocalLog('Kayit klasoru secilmedi, kayit baslatilmadi.', 'warn'); return false; }
+      if (!res?.id) { addLocalLog(`Kayit dosyasi acilamadi: ${res?.error ?? 'bilinmeyen hata'}`, 'error'); return false; }
+      recStreamRef.current = { id: res.id, path: res.path };
+      if (res.folder) setRecFolder(res.folder);
+    }
     try {
       const mimeType = pickRecorderMime();
-      const mr = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      // BIT HIZI TAVANI — kayitlar olabildigince kompakt olsun.
+      //
+      // Daha once bit hizi hic verilmiyordu ve tarayicinin varsayilani
+      // kullaniliyordu; 1080p ekran icin bu kolayca 4-8 Mbps'e cikiyor, yani
+      // bir saatlik kayit 2-3 GB. Uzak masaustu goruntusu buyuk olcude SABIT
+      // (pencereler, metin, degismeyen arkaplan), yani VP9 bu icerikte dusuk
+      // bit hizinda bile okunakli kalir. 1,5 Mbps'te bir saatlik kayit ~675 MB
+      // eder ve 2 GB tavanina rahat sigar.
+      //
+      // Yakalama kare hizi zaten ayarlanabilir (captureFrameRate, varsayilan
+      // 15); ikisi birlikte boyutu belirler.
+      const mr = new MediaRecorder(stream, {
+        ...(mimeType ? { mimeType } : {}),
+        videoBitsPerSecond: 1_500_000,
+      });
       recChunksRef.current = [];
-      mr.ondataavailable = (e) => { if (e.data && e.data.size > 0) recChunksRef.current.push(e.data); };
+      recBytesRef.current = 0;
+      mr.ondataavailable = (e) => {
+        if (!e.data || e.data.size === 0) return;
+        recBytesRef.current += e.data.size;
+        // Dis parametre `stream` (MediaStream) ile karismasin: bu diske
+        // yazma akisi.
+        const sink = recStreamRef.current;
+        if (sink && api?.streamWrite) {
+          // Diske akit — bellekte tutma.
+          void e.data.arrayBuffer().then((buf) => {
+            api.streamWrite(sink.id, new Uint8Array(buf));
+          }).catch(() => { /* parca okunamadi, kayit devam eder */ });
+          return;
+        }
+        // Web surumu: bellekte birikir, tavan asilirsa kaydi durdur.
+        if (recBytesRef.current > REC_WEB_MAX_BYTES) {
+          addLocalLog('Kayit bellek sinirina ulasti, durduruluyor. Masaustu surumunde bu sinir yoktur.', 'warn');
+          stopRecording();
+          return;
+        }
+        recChunksRef.current.push(e.data);
+      };
       mr.onerror = () => addLocalLog('Kayit sirasinda hata olustu.', 'error');
       mr.onstop = () => { void finalizeRecording(); };
       // 1 sn'lik parcalar: kayit ortasinda cokme olursa o ana kadarki veri durur.
@@ -1409,7 +2069,9 @@ export default function App() {
       recStartedAtRef.current = Date.now();
       setRecElapsed(0);
       setRecState('recording');
-      addLocalLog('Oturum kaydi basladi.', 'warn');
+      addLocalLog(recStreamRef.current
+        ? `Oturum kaydi basladi: ${recStreamRef.current.path}`
+        : 'Oturum kaydi basladi.', 'warn');
       recordAudit('recording_start', {
         actorIdentity: connectionId,
         peerIdentity: webrtcRef.current?.getPeerId(),
@@ -1418,6 +2080,11 @@ export default function App() {
       return true;
     } catch (err) {
       addLocalLog(`Kayit baslatilamadi: ${String(err)}`, 'error');
+      // Acilan akisi geride birakmayalim.
+      const st = recStreamRef.current;
+      recStreamRef.current = null;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      if (st) void (window as any).electronAPI?.streamAbort?.(st.id);
       return false;
     }
   };
@@ -1431,44 +2098,50 @@ export default function App() {
     if (bildir) webrtcRef.current?.sendControl({ k: 'rec-stopped' });
   };
 
-  /** Toplanan parcalari birlestirip diske yazar. */
+  /** Kaydi kapatir. Akis modunda dosya zaten diskte, yalnizca akis kapanir. */
   const finalizeRecording = async () => {
     const parts = recChunksRef.current;
     recChunksRef.current = [];
+    const bayt = recBytesRef.current;
+    recBytesRef.current = 0;
     const saniye = recStartedAtRef.current
       ? Math.round((Date.now() - recStartedAtRef.current) / 1000) : 0;
     recStartedAtRef.current = 0;
     setRecElapsed(0);
-    if (!parts.length) { addLocalLog('Kayit bos, dosya yazilmadi.', 'warn'); return; }
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const api = (window as any).electronAPI;
+    const sink = recStreamRef.current;
+    recStreamRef.current = null;
 
     // Denetim: kaydin ustverisi. Dosyanin KENDISI sunucuya gitmez; buradaki
     // boyut ve sure, kaydin varligini ve kapsamini belgeler.
-    recordAudit('recording_stop', {
-      actorIdentity: connectionId,
-      peerIdentity: webrtcRef.current?.getPeerId(),
-      detail: { saniye, bayt: parts.reduce((t, b) => t + b.size, 0),
-                consentVersion: RECORDING_CONSENT_VERSION },
-    });
-
-    const blob = new Blob(parts, { type: 'video/webm' });
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const api = (window as any).electronAPI;
-    if (api?.saveRecording) {
-      const buf = await blob.arrayBuffer();
-      const res = await api.saveRecording({
-        data: new Uint8Array(buf),
-        peer: peerLabel || targetId,
+    if (bayt > 0) {
+      recordAudit('recording_stop', {
+        actorIdentity: connectionId,
+        peerIdentity: webrtcRef.current?.getPeerId(),
+        detail: { saniye, bayt, consentVersion: RECORDING_CONSENT_VERSION },
       });
-      if (res?.ok) {
-        if (res.folder) setRecFolder(res.folder);
-        addLocalLog(`Kayit kaydedildi (${saniye} sn): ${res.path}`, 'sys');
-      } else if (res?.cancelled) {
-        addLocalLog('Kayit klasoru secilmedi, dosya yazilmadi.', 'warn');
-      } else {
-        addLocalLog(`Kayit yazilamadi: ${res?.error ?? 'bilinmeyen hata'}`, 'error');
+    }
+
+    // ── Masaustu: akis modunda dosya parca parca yazildi. ──
+    if (sink && api?.streamEnd) {
+      if (bayt === 0) {
+        // Hic veri gelmediyse bos dosyayi diskte birakmayalim.
+        await api.streamAbort?.(sink.id);
+        addLocalLog('Kayit bos, dosya yazilmadi.', 'warn');
+        return;
       }
+      const res = await api.streamEnd(sink.id);
+      addLocalLog(res?.ok
+        ? `Kayit kaydedildi (${saniye} sn): ${res.path}`
+        : `Kayit yazilamadi: ${res?.error ?? 'bilinmeyen hata'}`,
+        res?.ok ? 'sys' : 'error');
       return;
     }
+
+    if (!parts.length) { addLocalLog('Kayit bos, dosya yazilmadi.', 'warn'); return; }
+    const blob = new Blob(parts, { type: 'video/webm' });
     // Web surumu: tarayici indirmesi.
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -1620,6 +2293,9 @@ export default function App() {
       if (ev.t === 'cancelled') {
         setFileProgress(null);
         setIncomingFile(null);
+        // Yarim kalan dosyayi diskte birakmayalim: akis iptal edilir ve
+        // dosya silinir (bozuk bir dosya kullaniciyi yaniltir).
+        await closeFileStream({ discard: true });
         addLocalLog(
           ev.reason === 'size' ? 'Dosya beyan edilenden buyuk, transfer kesildi.'
           : ev.reason === 'incomplete' ? 'Dosya eksik geldi, kaydedilmedi.'
@@ -1629,7 +2305,12 @@ export default function App() {
       }
       if (ev.t === 'complete') {
         setFileProgress(null);
-        await saveReceivedFile(ev.name, ev.blob);
+        if (ev.blob) { await saveReceivedFile(ev.name, ev.blob); return; }
+        // Akis modu: dosya zaten diske yazildi, yalnizca kapatiyoruz.
+        const res = await closeFileStream();
+        addLocalLog(res?.ok ? `Dosya kaydedildi: ${res.path}`
+          : `Dosya kaydedilemedi: ${res?.error ?? 'bilinmeyen hata'}`,
+          res?.ok ? 'sys' : 'error');
       }
     };
 
@@ -1642,7 +2323,9 @@ export default function App() {
         if (role !== 'receiver' || !remoteControlAllowedRef.current) return;
         const text = await readLocalClipboard(true);
         if (!text) return;
-        m.sendControl({ k: 'clip-set', text });
+        // İstek kimliğini geri taşı: operatör yanıtın kendi isteğine ait
+        // olduğunu böyle doğruluyor.
+        m.sendControl({ k: 'clip-set', text, id: msg.id });
         addLocalLog('Panonuz karsi tarafa gonderildi.', 'warn');
         return;
       }
@@ -1655,7 +2338,18 @@ export default function App() {
           const ok = await writeLocalClipboard(text, true);
           if (ok) addLocalLog('Karsi taraf panonuza metin yazdi.', 'warn');
         } else {
-          // Operator: kendi istedigi uzak panonun yaniti.
+          // Operator tarafi: YALNIZCA bekleyen bir istegin yaniti kabul edilir.
+          // Istenmemis pano yazimi reddedilir ve gunluge dusurulur.
+          const pending = clipReqRef.current;
+          const expired = !pending || Date.now() - pending.at > CLIP_REPLY_WINDOW_MS;
+          // `id` tasiyan yanit (v1.5.0+ es) isteğin kimliğiyle eşleşmeli.
+          // Tasimayan yanit (eski es) yalnizca bekleyen istek varsa kabul edilir.
+          const idMismatch = typeof msg.id === 'string' && msg.id !== pending?.id;
+          if (expired || idMismatch) {
+            addLocalLog('Istenmemis pano yazimi reddedildi (karsi taraf panonuza yazmaya calisti).', 'warn');
+            return;
+          }
+          clipReqRef.current = null; // tek kullanimlik
           const ok = await writeLocalClipboard(text, false);
           addLocalLog(ok ? `Uzak pano alindi (${text.length} karakter).` : 'Pano yazilamadi.', ok ? 'sys' : 'warn');
         }
@@ -1677,7 +2371,7 @@ export default function App() {
         // Izleyen taraf: onay geldi, kaydi baslat.
         const stream = remoteVideoRef.current?.srcObject as MediaStream | null;
         if (!stream) { addLocalLog('Kayit baslatilamadi: goruntu akisi yok.', 'error'); setRecState('off'); return; }
-        if (startRecording(stream)) m.sendControl({ k: 'rec-started' });
+        if (await startRecording(stream)) m.sendControl({ k: 'rec-started' });
         else { setRecState('off'); m.sendControl({ k: 'rec-stopped' }); }
         return;
       }
@@ -1793,6 +2487,11 @@ export default function App() {
         setPeerLabel('');
         setRemoteScreens([]);
         setInputEnabled(false);
+        clipReqRef.current = null; // bekleyen pano istegi oturumla birlikte duser
+        // Yarim kalan dosya transferinin akisini kapat ve dosyayi sil:
+        // baglanti dustugunde manager sessizce vazgeciyor, akis ise ana
+        // surecte acik kaliyordu.
+        void closeFileStream({ discard: true });
         disableRemoteControl();
         postSessionEvent('ended', targetId, EMBED.mode);
         if (localVideoRef.current?.srcObject) {
@@ -1803,15 +2502,46 @@ export default function App() {
       }
       if (state === 'idle') { if (mediaRecorderRef.current) stopRecording(false); setIsConnecting(false); setRemoteStream(null); setQuality(null); setInputEnabled(false); disableRemoteControl(); }
     };
+    // Karşı taraf kapattığında oturumu TAMAMEN kapat (saha testi 2026-10-08).
+    // Eskiden: yönetici hangup'ı işleyip eş kimliklerini siliyor, App
+    // seviyesindeki hangup dinleyicisi isPeer() ile kimliği tanıyamadığı için
+    // hiçbir şey yapmıyordu; 'disconnected' durumu da webrtc'yi temizlemediği
+    // için oturum paneli açık kalıyor, paylaşan taraf kendisi "Kes"e basana
+    // kadar bağlantı sürüyor görünüyordu.
+    m.onPeerHangup = () => {
+      if (webrtcRef.current !== m) return; // eski bir oturumun gecikmeli sinyali
+      if (connTimeoutRef.current) { clearTimeout(connTimeoutRef.current); connTimeoutRef.current = null; }
+      if (localVideoRef.current?.srcObject) {
+        (localVideoRef.current.srcObject as MediaStream)?.getTracks().forEach(t => { t.onended = null; t.stop(); });
+        localVideoRef.current.srcObject = null;
+      }
+      setWebrtc(null); setRemoteStream(null); setQuality(null); setVerifyCode(null);
+      setPeerLabel(''); setRtcState('idle'); setIsConnecting(false); setInputEnabled(false);
+      disableRemoteControl();
+      addLocalLog('Karsi taraf baglantiyi kesti.', 'warn');
+    };
     m.onRemoteStream = (stream) => {
       setRemoteStream(stream);
       if (remoteVideoRef.current) remoteVideoRef.current.srcObject = stream;
       addLog('Uzak ekran aliniyor.', 'sys');
     };
-    m.onLog = (msg, type) => addLog(msg, (type as LogType) || 'info');
+    // WebRTC ic gunlukleri YERELDE kalir; yalnizca hatalar sunucuya yazilir.
+    //
+    // Eskiden her satir (ICE durumu, baglanti durumu, toplama durumu...)
+    // `logs` tablosuna AYRI bir insert olarak gidiyordu: tek oturum kolayca
+    // 20-30 satir uretiyor, arayuz ise yalnizca son 50'yi okuyor. Tabloda
+    // saklama suresi de yoktu ve icinde karsi taraf kimlikleri var — teknik
+    // gunluk degil kisisel veri kaydi. Saklama suresi icin bkz.
+    // supabase/migrations/20260912_retention_cleanup.sql
+    m.onLog = (msg, type) => {
+      const t = (type as LogType) || 'info';
+      if (t === 'error') addLog(msg, t); else addLocalLog(msg, t);
+    };
     m.onInputEvent = (event: InputEventMsg) => {
       // Ekranı paylaşan kullanıcı izin vermeden uzaktan kontrol işletilmez
       if (!remoteControlAllowedRef.current) return;
+      // Yerel kullanıcıya onay soruluyorsa karşı taraf yanıtlayamasın.
+      if (consentPromptOpenRef.current && event.type !== 'release-all') return;
       // Forward to Electron main process if running as desktop app
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       (window as any).electronAPI?.sendInput?.(event);
@@ -1825,8 +2555,57 @@ export default function App() {
     return m;
   };
 
+  // ── Zorunlu guncelleme kapisi ─────────────────────────────────────────────
+  // Masaustu uygulamasi, sunucudaki en dusuk surumun (app_config) altindaysa
+  // baglanti kurmaz, cagri kabul etmez ve guncelleme ekrani gosterir.
+  // Okuma hatasinda (ag, tablo yok) kapi ACILMAZ: kimse yanlislikla kilitlenmez.
+  // Not: onAuthStateChange icinde DEGIL (kilit kilitlenmesi, bkz. applySession).
+  React.useEffect(() => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    if (!(window as any).electronAPI?.isElectron || !currentUser?.id) return;
+    let stopped = false;
+    const check = async () => {
+      try {
+        const { data, error } = await supabase
+          .from('app_config').select('value').eq('key', 'min_desktop_version').maybeSingle();
+        if (stopped || error || !data) return;
+        const min = String((data as { value?: unknown }).value ?? '').trim();
+        const need = isVersionBelow(__APP_VERSION__, min);
+        updateRequiredRef.current = need;
+        setRequiredVersion(need ? min.replace(/^v/i, '') : null);
+      } catch { /* ag hatasi: kapiyi degistirme */ }
+    };
+    void check();
+    const t = setInterval(check, 60 * 60 * 1000);
+    return () => { stopped = true; clearInterval(t); };
+  }, [currentUser?.id]);
+
+  React.useEffect(() => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const api = (window as any).electronAPI;
+    if (!api?.onUpdateProgress) return;
+    return api.onUpdateProgress((p: { state: string; percent?: number; message?: string }) => {
+      setUpdateProgress(prev => ({ ...(prev ?? {}), ...p }));
+    });
+  }, []);
+
+  const startForcedUpdate = async () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const api = (window as any).electronAPI;
+    if (!api?.installUpdateNow) return;
+    setUpdateProgress({ state: 'checking' });
+    try {
+      const r = await api.installUpdateNow();
+      if (r?.mode === 'auto') setUpdateProgress(prev => (prev && prev.state !== 'checking') ? prev : { state: 'downloading', percent: 0 });
+      else setUpdateProgress({ state: r?.mode || 'error', mode: r?.mode });
+    } catch (e) {
+      setUpdateProgress({ state: 'error', message: e instanceof Error ? e.message : String(e) });
+    }
+  };
+
   const handleConnect = async () => {
     if (!isRegistered && !isGuest) { setShowAuth(true); setAuthMode('login'); return; }
+    if (updateRequiredRef.current) { addLog('Baglanmak icin once uygulamayi guncellemeniz gerekiyor.', 'error'); return; }
     // Kimlik sunucuda yoksa baglanti kurulamaz: karsi taraf cevap verse bile
     // yanit bize ulasmaz (RLS okumaya izin vermez). Zaman asimini beklemek
     // yerine sebebi simdi soyleyelim.
@@ -1907,10 +2686,26 @@ export default function App() {
 
   const handleAcceptCall = async () => {
     if (!incomingCall) return;
+    // Kapi, cagri penceresi acildiktan sonra kapanmis olabilir.
+    if (updateRequiredRef.current) {
+      const { fromId, toId } = incomingCall;
+      setIncomingCall(null);
+      addLog('Cagriyi kabul etmek icin once uygulamayi guncellemeniz gerekiyor.', 'error');
+      await sendBusySignal(fromId, toId, 'outdated');
+      return;
+    }
     const { fromId, toId, offerPayload, sessionId, signalId } = incomingCall;
     // getDisplayMedia must be called while still in the user gesture context
     // (button click). Closing the modal first breaks the gesture chain in Chrome.
     let screen: MediaStream | null = null;
+    if (!CAN_SHARE_SCREEN) {
+      // Ekran seçici bu tarayıcıda yok; çağrıyı açıklamayla kapat ki arayan
+      // 30 sn beklemesin ve sebebi görsün.
+      setIncomingCall(null);
+      addLog('Bu cihaz ekranini paylasamiyor (tarayici desteklemiyor). Istek, sebebiyle birlikte geri cevrildi.', 'error');
+      await sendBusySignal(fromId, toId, 'unsupported');
+      return;
+    }
     try {
       screen = await navigator.mediaDevices.getDisplayMedia({
         // cursor:'always' — operatör imleci görebilmeli. Standart dışı ama
@@ -1943,12 +2738,11 @@ export default function App() {
       };
     });
 
-    // DIKKAT: turetmede ARAYANIN gonderdigi parola kullanilir, bizimki degil.
-    // Parola zorunlu degilken arayan bos ya da baska bir sey gondermis
-    // olabilir; kendi parolamizi kullanirsak kodlar tutmaz ve kullaniciya
-    // sahte bir 'araya girme' uyarisi gostermis oluruz.
-    const offeredPw = String((offerPayload as { pw?: unknown })?.pw ?? '');
-    try { await m.accept(fromId, offerPayload, screen, { sessionId, addressedAs: toId, offerSignalId: signalId, password: offeredPw }); }
+    // Dogrulama kodu (SAS) artik YALNIZCA DTLS parmak izlerinden turetiliyor;
+    // parola turetmeye karismiyor. Gerekce: lib/verify.ts. Ozetle parola aynı
+    // kanaldan gittigi icin ek koruma saglamiyordu, ustune iki taraf parola
+    // konusunda anlasmadiginda sahte 'araya girme' uyarisi ureti(yordu).
+    try { await m.accept(fromId, offerPayload, screen, { sessionId, addressedAs: toId, offerSignalId: signalId }); }
     catch (err) {
       screen?.getTracks().forEach(t => { t.onended = null; t.stop(); });
       addLog(`Baglaniti kabul edilemedi: ${String(err)}`, 'error');
@@ -2009,6 +2803,37 @@ export default function App() {
     return `Kontrol edilemedi: ${r.message ?? 'bilinmeyen hata'}`;
   };
 
+  React.useEffect(() => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const api = (window as any).electronAPI;
+    if (!api?.getAutoStart) return;
+    api.getAutoStart().then((st: AutoStartState) => setAutoStart(st)).catch(() => { /* yok say */ });
+  }, []);
+
+  const changeAutoStart = async (next: { enabled: boolean; minimized: boolean }) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const api = (window as any).electronAPI;
+    if (!api?.setAutoStart || autoStartBusy) return;
+    setAutoStartBusy(true);
+    try {
+      const st: AutoStartState = await api.setAutoStart(next);
+      setAutoStart(st);
+      if (st.error) addLocalLog(`Otomatik baslatma ayarlanamadi: ${st.error}`, 'error');
+      // İşletim sistemi isteği uygulamadıysa (macOS onay bekliyor, ilke engeli)
+      // "kapatıldı" demek yanlış olur: istenenle olanı karşılaştır.
+      else if (st.enabled !== next.enabled) addLocalLog(next.enabled
+        ? 'Otomatik baslatma sistem tarafindan uygulanmadi (izin veya onay gerekebilir).'
+        : 'Otomatik baslatma kapatilamadi.', 'error');
+      else addLocalLog(st.enabled
+        ? `Bilgisayar acilinca Arku Remote otomatik baslayacak${st.minimized ? ' (kucultulmus)' : ''}.`
+        : 'Otomatik baslatma kapatildi.', 'sys');
+    } catch (err) {
+      addLocalLog(`Otomatik baslatma ayarlanamadi: ${String(err)}`, 'error');
+    } finally {
+      setAutoStartBusy(false);
+    }
+  };
+
   const isLight = theme === 'umay';
 
   // ── Bağlantı kalitesi göstergesi ───────────────────────────────────────────
@@ -2058,15 +2883,78 @@ export default function App() {
 
   return (
     <div className="min-h-screen flex flex-col selection:bg-steppe-gold selection:text-steppe-stone">
+      {/* Suren bir oturum (kapi acilmadan baslamis; yeniden baglanma sirasinda
+          'connecting'e duser) kesilmez; oturum bitince ekran gelir. */}
+      {requiredVersion && rtcState !== 'connected' && rtcState !== 'connecting' && (
+        <div role="alertdialog" aria-modal="true" aria-labelledby="arku-update-title"
+          data-testid="forced-update"
+          className="fixed inset-0 z-[300] flex items-center justify-center p-6"
+          style={{ background: isLight ? 'rgba(240,244,248,0.97)' : 'rgba(10,10,10,0.96)' }}>
+          <div className="max-w-md w-full surface-card border border-steppe-border p-8 text-center">
+            <img src="./brand/arku-mark-96.webp" srcSet="./brand/arku-mark-96.webp 1x, ./brand/arku-mark-192.webp 2x"
+              alt="" width={64} height={64} className="w-16 h-16 mx-auto mb-4 object-contain" />
+            <h2 id="arku-update-title" className="text-lg font-display text-steppe-gold mb-2">Guncelleme gerekli</h2>
+            <p className="text-[12px] text-steppe-paper leading-relaxed mb-1">
+              {`Kurulu surum v${__APP_VERSION__} artik desteklenmiyor. Baglanti kurabilmek ve cagri alabilmek icin v${requiredVersion} veya ustune guncelleyin.`}
+            </p>
+            <p className="text-[10px] text-steppe-muted leading-relaxed mb-6">
+              Ayarlariniz, kimliginiz ve kayitli kisileriniz korunur.
+            </p>
+            {(() => {
+              const st = updateProgress?.state;
+              const link = (
+                <a href="https://www.arku.com.tr/#indir" target="_blank" rel="noreferrer"
+                  className="block mt-3 text-[10px] text-steppe-muted underline">Indirme sayfasini ac</a>
+              );
+              if (st === 'downloading') {
+                const pct = Math.max(0, Math.min(100, updateProgress?.percent ?? 0));
+                return (
+                  <div className="text-left" data-testid="forced-update-progress">
+                    <div className="h-2 w-full border border-steppe-border overflow-hidden mb-2">
+                      <div className="h-full" style={{ width: `${pct}%`, background: 'var(--accent-primary)' }} />
+                    </div>
+                    <p className="text-[10px] text-steppe-muted uppercase tracking-widest text-center">{`Indiriliyor %${pct}`}</p>
+                    <div className="text-center">{link}</div>
+                  </div>
+                );
+              }
+              if (st === 'installing') return <><p className="text-[11px] text-steppe-gold">Kuruluyor, uygulama yeniden baslayacak...</p>{link}</>;
+              if (st === 'checking') return <><p className="text-[11px] text-steppe-muted">Yeni surum araniyor...</p>{link}</>;
+              const note = st === 'manual' ? 'Indirme sayfasi tarayicida acildi. Yeni surumu kurup uygulamayi yeniden acin.'
+                : st === 'none' ? 'Yeni surum henuz yayinlanmamis gorunuyor. Biraz sonra tekrar deneyin ya da indirme sayfasini kullanin.'
+                : st === 'error' ? 'Otomatik guncelleme basarisiz oldu. Indirme sayfasindan yeni surumu kurabilirsiniz.'
+                : st === 'dev' ? 'Gelistirme ortami: otomatik guncelleme yok.' : '';
+              return (
+                <>
+                  {note && <p className="text-[11px] text-steppe-muted mb-4" data-testid="forced-update-note">{note}</p>}
+                  <button type="button" onClick={() => { void startForcedUpdate(); }}
+                    className="w-full py-3 text-[11px] uppercase tracking-widest font-bold border border-steppe-gold text-steppe-gold hover:bg-steppe-gold hover:text-steppe-stone transition-colors">
+                    {st ? 'Tekrar dene' : 'Guncellemeyi indir ve kur'}
+                  </button>
+                  {link}
+                </>
+              );
+            })()}
+          </div>
+        </div>
+      )}
       {!EMBED.embed && (
       <header className="border-b border-steppe-border sticky top-0 z-50 backdrop-blur-md" style={{ background: isLight ? 'rgba(240,244,248,0.92)' : 'rgba(17,16,16,0.85)' }}>
         <div className="max-w-7xl mx-auto px-6 py-4 flex justify-between items-center">
           <div className="flex items-center gap-4">
-            <div className="w-11 h-11 gokturk-border flex items-center justify-center overflow-hidden" style={{ background: 'var(--bg-primary)' }}>
-              <img src="./icons/64x64.png" alt="Arku" className="w-9 h-9 object-contain" />
-            </div>
+            {/* Logo: eskiden 44px koyu kutu içinde 36px'lik koyu zeminli rozet vardı;
+                koyu başlıkta kayboluyordu. Artık zeminsiz ok işareti, ışıltısıyla. */}
+            <img
+              src="./brand/arku-mark-96.webp"
+              srcSet="./brand/arku-mark-96.webp 1x, ./brand/arku-mark-192.webp 2x"
+              alt="Arku"
+              width={52}
+              height={52}
+              className="w-[52px] h-[52px] object-contain shrink-0"
+              style={{ filter: isLight ? 'drop-shadow(0 1px 2px rgba(10,30,50,0.55))' : 'drop-shadow(0 0 10px rgba(111,184,216,0.45))' }}
+            />
             <div>
-              <h1 className="text-lg text-steppe-gold leading-none">Arku Remote</h1>
+              <h1 className="text-xl text-steppe-gold leading-none">Arku Remote</h1>
               <span className="text-[7px] px-1 border border-steppe-border text-steppe-gold opacity-60 uppercase tracking-widest">{`v${__APP_VERSION__}`}</span>
             </div>
           </div>
@@ -2250,9 +3138,21 @@ export default function App() {
 
             <div className="lg:col-span-8 space-y-6">
               <div className="grid grid-cols-3 gap-4">
-                <StatCard icon={<Shield size={18} />} title="Guvenlik" value="AES-256" sub="Uctan Uca" />
-                <StatCard icon={<Zap size={18} />} title="Gecikme" value={rtcState === 'connected' ? '4ms' : '12ms'} sub="Dusuk Gecikme" />
-                <StatCard icon={<Globe size={18} />} title="Sunucu" value="Frankfurt" sub="Aktif" />
+                {/* GERCEK OLCUMLER. Eskiden ucu de sabit metindi: gecikme
+                    olculmuyor, baglanti durumuna gore iki sabitten biri
+                    yaziliyordu; "Frankfurt" diye bir sunucu yok (mimari
+                    eslerarasi); AES-256 de yanlis — WebRTC'nin SRTP anahtar
+                    takimi Chromium'da AES-128-GCM olarak pazarlasir.
+                    Olculmus veri zaten elimizdeydi (QualityChips). */}
+                <StatCard icon={<Shield size={18} />} title="Sifreleme" value="DTLS-SRTP" sub="Uctan Uca" />
+                <StatCard icon={<Zap size={18} />} title="Gecikme"
+                  value={quality?.rttMs != null ? `${quality.rttMs} ms` : '—'}
+                  sub={quality?.rttMs != null ? 'Olculen gidis-donus' : 'Baglanti yok'} />
+                <StatCard icon={<Globe size={18} />} title="Baglanti Yolu"
+                  value={quality ? PATH_LABEL[quality.path] : '—'}
+                  sub={quality
+                    ? (quality.path === 'relay' ? 'TURN uzerinden' : 'Dogrudan P2P')
+                    : 'Baglanti yok'} />
               </div>
 
               {rtcState !== 'idle' && (
@@ -2738,6 +3638,42 @@ export default function App() {
                 </p>
               </div>
             </section>
+            {autoStart?.supported && (
+              <section className="gokturk-border surface-card p-8">
+                <h3 className="text-[10px] uppercase tracking-widest text-steppe-muted mb-6 flex items-center gap-2"><Monitor size={12} className="text-steppe-gold" /> Baslangic</h3>
+                <div className="space-y-4">
+                  <label className="flex items-start justify-between gap-4 cursor-pointer">
+                    <div>
+                      <p className="text-[11px] text-steppe-paper">Bilgisayar acilinca otomatik baslat</p>
+                      <p className="text-[9px] text-steppe-muted">Bu cihaza uzaktan erisilecekse yeniden baslatmadan sonra da ulasilabilir kalir.</p>
+                    </div>
+                    <input
+                      type="checkbox"
+                      aria-label="Bilgisayar acilinca otomatik baslat"
+                      className="mt-1 h-4 w-4 accent-[var(--steppe-gold,#c5a059)]"
+                      checked={autoStart.enabled}
+                      disabled={autoStartBusy}
+                      onChange={e => changeAutoStart({ enabled: e.target.checked, minimized: autoStart.minimized })}
+                    />
+                  </label>
+                  <label className={`flex items-start justify-between gap-4 ${autoStart.enabled ? 'cursor-pointer' : 'opacity-40'}`}>
+                    <div>
+                      <p className="text-[11px] text-steppe-paper">Kucultulmus baslat</p>
+                      <p className="text-[9px] text-steppe-muted">Pencere acilmaz, gorev cubugunda bekler.</p>
+                    </div>
+                    <input
+                      type="checkbox"
+                      aria-label="Kucultulmus baslat"
+                      className="mt-1 h-4 w-4 accent-[var(--steppe-gold,#c5a059)]"
+                      checked={autoStart.minimized}
+                      disabled={autoStartBusy || !autoStart.enabled}
+                      onChange={e => changeAutoStart({ enabled: autoStart.enabled, minimized: e.target.checked })}
+                    />
+                  </label>
+                  {autoStart.error && <p className="text-[10px] text-red-400">Ayarlanamadi: {autoStart.error}</p>}
+                </div>
+              </section>
+            )}
             <section className="gokturk-border surface-card p-8">
               <h3 className="text-[10px] uppercase tracking-widest text-steppe-muted mb-6 flex items-center gap-2"><User size={12} className="text-steppe-gold" /> Profil Bilgileri</h3>
               {isRegistered ? (
@@ -2762,6 +3698,78 @@ export default function App() {
                     {passwordChangeError && <p className="text-[10px] text-red-400">{passwordChangeError}</p>}
                     {passwordChangeDone && <div className="p-3 border border-green-500/30 text-center" style={{ background: 'rgba(34,197,94,0.05)' }}><CheckCircle size={16} className="text-green-400 mx-auto mb-1" /><p className="text-[10px] text-green-400">Sifreniz guncellendi!</p></div>}
                     {!passwordChangeDone && <button onClick={handleChangePassword} className="btn-primary">Sifreyi Guncelle</button>}
+                  </div>
+                )}
+
+                {/* ── Iki adimli dogrulama (TOTP) ──
+                    Uzaktan erisim yetkisi tasiyan bir hesapta parolanin tek
+                    basina yetmemesi gerekir. Dogrulama ekrani zaten vardi;
+                    eksik olan kayit akisiydi. */}
+                {isRegistered && (
+                  <div className="pt-4 border-t space-y-3" style={{ borderColor: 'var(--border-primary)' }}>
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
+                        <p className="text-[10px] text-steppe-paper flex items-center gap-2">
+                          <Lock size={11} className="text-steppe-gold" /> Iki Adimli Dogrulama
+                        </p>
+                        <p className="text-[9px] text-steppe-muted mt-0.5">
+                          {mfaFactors.length > 0
+                            ? 'Acik — her giriste uygulamanizdaki kod istenir.'
+                            : 'Kapali. Parolaniz ele gecse bile hesabiniza girilemesin.'}
+                        </p>
+                      </div>
+                      {mfaFactors.length > 0 ? (
+                        <button onClick={() => removeMfaFactor(mfaFactors[0].id)} disabled={mfaBusy}
+                          className="text-[9px] uppercase tracking-widest text-red-400 border border-red-500/40 hover:bg-red-500/10 px-3 py-2 transition-colors disabled:opacity-40 whitespace-nowrap">
+                          Kapat
+                        </button>
+                      ) : !mfaEnroll ? (
+                        <button onClick={startMfaEnroll} disabled={mfaBusy}
+                          className="text-[9px] uppercase tracking-widest text-steppe-gold border border-steppe-border hover:border-steppe-gold px-3 py-2 transition-colors disabled:opacity-40 whitespace-nowrap">
+                          {mfaBusy ? 'Hazirlaniyor...' : 'Ac'}
+                        </button>
+                      ) : null}
+                    </div>
+
+                    {mfaEnroll && (
+                      <div className="p-4 border border-steppe-border space-y-3" style={{ background: 'var(--log-bg)' }}>
+                        <p className="text-[10px] text-steppe-muted leading-relaxed">
+                          1. Google Authenticator, Microsoft Authenticator veya benzeri bir
+                          uygulamayla asagidaki kodu okutun.<br />
+                          2. Uygulamada gorunen 6 haneli kodu girin.
+                        </p>
+                        {/* Supabase QR'i SVG olarak dondurur; harici istek yok. */}
+                        <div className="flex flex-col sm:flex-row items-start gap-4">
+                          <img src={mfaEnroll.qr} alt="TOTP QR kodu"
+                            className="w-40 h-40 bg-white p-2 shrink-0" />
+                          <div className="space-y-2 min-w-0">
+                            <p className="text-[9px] uppercase tracking-widest text-steppe-muted">
+                              QR okutamiyorsaniz anahtari elle girin
+                            </p>
+                            <p className="font-mono text-[11px] text-steppe-gold break-all select-all">
+                              {mfaEnroll.secret}
+                            </p>
+                          </div>
+                        </div>
+                        <input
+                          className="input-field tracking-[0.3em] text-center" inputMode="numeric"
+                          placeholder="000000" maxLength={6} autoComplete="one-time-code"
+                          value={mfaEnrollCode}
+                          onChange={e => setMfaEnrollCode(e.target.value.replace(/\D/g, ''))}
+                          onKeyDown={e => { if (e.key === 'Enter' && mfaEnrollCode.length === 6) confirmMfaEnroll(); }}
+                        />
+                        <div className="grid grid-cols-2 gap-3">
+                          <button onClick={cancelMfaEnroll} className="btn-ghost">Vazgec</button>
+                          <button onClick={confirmMfaEnroll} disabled={mfaBusy || mfaEnrollCode.length !== 6}
+                            className="btn-primary disabled:opacity-40">
+                            {mfaBusy ? 'Dogrulaniyor...' : 'Dogrula ve Ac'}
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                    {mfaError && <p className="text-[10px] text-red-400">{mfaError}</p>}
+                    {mfaNotice && <p className="text-[10px] text-green-400">{mfaNotice}</p>}
                   </div>
                 )}
               </div>
@@ -2824,7 +3832,9 @@ export default function App() {
                 Oturum, izin ve kayit olaylari degistirilemez bir zincire yazilir.
                 Her kayit bir oncekinin ozetini tasir; bir kayit silinse veya
                 degistirilse zincir kirilir ve dogrulama bunu gosterir.
-                Kayitlar guncellenemez ve silinemez.
+                Kayitlar guncellenemez ve silinemez. Asagida yalnizca
+                <strong> kendi kayitlariniz</strong> listelenir; dogrulama ise
+                zincirin tamamini kontrol eder.
               </p>
 
               <div className="flex items-center gap-2 mb-4">
@@ -2848,15 +3858,48 @@ export default function App() {
                 <p className="text-[10px] text-red-300 mb-4">{auditVerify.mesaj}</p>
               )}
 
+              {/* Cihaz oznitelikleri — KVKK tercihi.
+                  MAC ve kullanici adi varsayilan olarak yazilmaz; toplanmalari
+                  ayri bir isleme faaliyetidir ve aydinlatma metninde yer
+                  almalidir. Kaydin curutulemezligi zincirden gelir. */}
+              <div className="flex items-start justify-between gap-3 p-3 mb-4 border border-steppe-border"
+                style={{ background: 'var(--surface-primary)' }}>
+                <div>
+                  <p className="text-[10px] text-steppe-paper">MAC adresi ve kullanici adini da kaydet</p>
+                  <p className="text-[9px] text-steppe-muted mt-0.5 leading-relaxed">
+                    Varsayilan kapali. Bunlar kisisel veridir; acarsaniz aydinlatma
+                    metninizde yer almalidir. Kayit her zaman makine adi ve isletim
+                    sistemi bilgisini icerir.
+                  </p>
+                </div>
+                <label className="flex items-center gap-1.5 cursor-pointer shrink-0 pt-0.5">
+                  <input type="checkbox" id="collect-device-ids" checked={collectDeviceIds}
+                    onChange={e => toggleCollectDeviceIds(e.target.checked)}
+                    className="w-3 h-3" style={{ accentColor: 'var(--accent-primary)' }} />
+                  <span className="text-[9px] uppercase tracking-widest text-steppe-muted">
+                    {collectDeviceIds ? 'Acik' : 'Kapali'}
+                  </span>
+                </label>
+              </div>
+
               {auditRows && (
                 auditRows.length === 0 ? (
                   <p className="text-[10px] text-steppe-muted">Henuz denetim kaydi yok.</p>
                 ) : (
                   <div className="max-h-64 overflow-y-auto border border-steppe-border" style={{ background: 'var(--log-bg)' }}>
-                    {auditRows.map(r => (
+                    {/* NUMARALANDIRMA: listedeki sira gosteriliyor, zincirdeki
+                        global `seq` degil. Zincir SISTEM GENELINDE tek oldugu
+                        icin kullanicinin kendi kayitlarinda seq atlamali
+                        gorunuyor ve arayuzde "kayit silinmis" gibi okunuyordu.
+                        Global numara teknik ayrinti olarak baslikta (title)
+                        duruyor; zincirin sagligini `Dogrula` dugmesi soyluyor. */}
+                    {auditRows.map((r, i) => (
                       <div key={r.seq} className="flex items-baseline gap-3 px-3 py-2 border-b last:border-b-0 text-[10px]"
                         style={{ borderColor: 'var(--border-primary)' }}>
-                        <span className="font-mono text-steppe-muted opacity-50 shrink-0">#{r.seq}</span>
+                        <span className="font-mono text-steppe-muted opacity-50 shrink-0"
+                          title={`Zincir sira no (sistem genelinde): ${r.seq}`}>
+                          #{auditRows.length - i}
+                        </span>
                         <span className="text-steppe-paper shrink-0">{AUDIT_LABEL[r.event] ?? r.event}</span>
                         <span className="text-steppe-muted truncate">{r.peer_identity ?? ''}</span>
                         <span className="ml-auto text-steppe-muted opacity-60 shrink-0">
@@ -2978,10 +4021,14 @@ export default function App() {
               <div className="px-4 py-3 border border-steppe-border mb-4 font-mono" style={{ background: 'var(--log-bg)' }}>
                 <span className="text-steppe-gold text-base">{incomingCall.fromId.slice(0,8)}...</span>
               </div>
-              <p className="text-[10px] text-steppe-muted mb-6 leading-relaxed">Kabul edersen ekraninizi secmeniz istenecek ve karsi tarafa paylasilacak.</p>
+              {CAN_SHARE_SCREEN ? (
+                <p className="text-[10px] text-steppe-muted mb-6 leading-relaxed">Kabul edersen ekraninizi secmeniz istenecek ve karsi tarafa paylasilacak.</p>
+              ) : (
+                <p className="text-[10px] text-red-400 mb-6 leading-relaxed">Bu cihazin tarayicisi ekran paylasimini desteklemiyor (Android/iOS). Bu cihazdan baska bir bilgisayara baglanabilirsiniz, ama bu cihazin ekrani paylasilamaz.</p>
+              )}
               <div className="grid grid-cols-2 gap-3">
                 <button onClick={handleRejectCall} className="py-3 border border-red-500/30 text-red-400 text-[10px] uppercase tracking-widest hover:bg-red-500/10 transition-all">Reddet</button>
-                <button onClick={handleAcceptCall} className="btn-primary">Kabul Et</button>
+                <button onClick={handleAcceptCall} className="btn-primary">{CAN_SHARE_SCREEN ? 'Kabul Et' : 'Tamam, bildir'}</button>
               </div>
             </motion.div>
           </div>
@@ -2999,8 +4046,12 @@ export default function App() {
                 <div className="space-y-4">
                   <input type="email" placeholder="E-POSTA" className="input-field" value={email} onChange={e => setEmail(e.target.value)} />
                   <input type="password" placeholder="SIFRE" className="input-field" value={password} onChange={e => setPassword(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') handleLogin(); }} />
+                  {authNotice && <p className="text-[10px] text-green-400 leading-relaxed">{authNotice}</p>}
                   {authError && <p className="text-[10px] text-red-400">{authError}</p>}
-                  <button onClick={handleLogin} className="btn-primary">Devam Et</button>
+                  <button onClick={handleLogin} disabled={authBusy} className="btn-primary disabled:opacity-50">{authBusy ? 'Bekleyin...' : 'Devam Et'}</button>
+                  {(unconfirmedEmail || /otp_expired|dogrulama/i.test(authNotice)) && (
+                    <button onClick={handleResendConfirmation} disabled={authBusy} className="w-full text-[10px] text-steppe-gold underline underline-offset-2 disabled:opacity-50">Dogrulama e-postasini yeniden gonder</button>
+                  )}
                   <button onClick={() => { setAuthMode('reset'); setAuthError(''); setResetSent(false); setResetEmail(''); }} className="w-full text-[10px] text-steppe-muted hover:text-steppe-gold transition-colors text-center">Sifremi Unuttum</button>
                   {QRTIM_ENABLED && (<>
                   <div className="flex items-center gap-3 py-1"><div className="flex-1 h-px bg-steppe-border" /><span className="text-[9px] uppercase tracking-widest text-steppe-muted">veya</span><div className="flex-1 h-px bg-steppe-border" /></div>
@@ -3020,9 +4071,9 @@ export default function App() {
                   <input type="text" placeholder="AD SOYAD" className="input-field" value={displayName} onChange={e => setDisplayName(e.target.value)} />
                   <input type="email" placeholder="E-POSTA" className="input-field" value={email} onChange={e => setEmail(e.target.value)} />
                   <input type="tel" placeholder="TELEFON (Istege bagli)" className="input-field" value={phone} onChange={e => setPhone(e.target.value)} />
-                  <input type="password" placeholder="SIFRE (min. 6 karakter)" className="input-field" value={password} onChange={e => setPassword(e.target.value)} />
+                  <input type="password" placeholder="SIFRE (min. 10 karakter)" className="input-field" value={password} onChange={e => setPassword(e.target.value)} />
                   {authError && <p className="text-[10px] text-red-400">{authError}</p>}
-                  <button onClick={handleRegister} className="btn-primary">Kayit Ol</button>
+                  <button onClick={handleRegister} disabled={authBusy} className="btn-primary disabled:opacity-50">{authBusy ? 'Kaydediliyor...' : 'Kayit Ol'}</button>
                   <p className="text-[10px] text-center text-steppe-muted">Zaten hesabiniz var mi?{' '}<button onClick={() => { setAuthMode('login'); setAuthError(''); }} className="text-steppe-gold underline underline-offset-2">Giris Yap</button></p>
                 </div></>
               )}
@@ -3040,13 +4091,39 @@ export default function App() {
                   <button onClick={validateMfa} disabled={isMfaValidating} className="btn-primary disabled:opacity-50">{isMfaValidating ? 'Dogrulanıyor...' : 'Dogrula'}</button>
                 </div></>
               )}
+              {authMode === 'checkmail' && (
+                <><h2 className="text-lg text-steppe-gold mb-4">E-postanizi Dogrulayin</h2>
+                <div className="space-y-4">
+                  <p className="text-[11px] text-steppe-muted leading-relaxed">
+                    <span className="text-steppe-gold">{unconfirmedEmail}</span> adresine bir dogrulama baglantisi gonderdik.
+                  </p>
+                  <ol className="text-[11px] text-steppe-muted leading-relaxed list-decimal pl-4 space-y-1">
+                    <li>E-postadaki baglantiya <strong>bir kez</strong> tiklayin. Baglanti tek kullanimliktir.</li>
+                    <li>Acilan sayfada "dogrulandi" mesajini gorun.</li>
+                    <li>Buraya donup e-posta ve sifrenizle giris yapin.</li>
+                  </ol>
+                  {authNotice && <p className="text-[10px] text-green-400">{authNotice}</p>}
+                  {authError && <p className="text-[10px] text-red-400">{authError}</p>}
+                  <button onClick={() => { setAuthMode('login'); setAuthError(''); setAuthNotice(''); }} className="btn-primary">Dogruladim, giris yap</button>
+                  <button onClick={handleResendConfirmation} disabled={authBusy} className="w-full text-[10px] text-steppe-gold underline underline-offset-2 disabled:opacity-50">E-posta gelmedi, yeniden gonder</button>
+                </div></>
+              )}
+              {authMode === 'newpass' && (
+                <><h2 className="text-lg text-steppe-gold mb-4">Yeni Sifre Belirleyin</h2>
+                <div className="space-y-4">
+                  <input type="password" placeholder="YENI SIFRE (min. 10 karakter)" className="input-field" value={newPassValue} onChange={e => setNewPassValue(e.target.value)} />
+                  <input type="password" placeholder="YENI SIFRE (tekrar)" className="input-field" value={newPassConfirm} onChange={e => setNewPassConfirm(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') handleSetNewPassword(); }} />
+                  {authError && <p className="text-[10px] text-red-400">{authError}</p>}
+                  <button onClick={handleSetNewPassword} disabled={authBusy} className="btn-primary disabled:opacity-50">{authBusy ? 'Kaydediliyor...' : 'Sifreyi Kaydet'}</button>
+                </div></>
+              )}
               {authMode === 'reset' && (
                 <><h2 className="text-lg text-steppe-gold mb-2">Sifre Sifirla</h2>
                 <div className="space-y-4">
                   {!resetSent ? (
                     <><input type="email" placeholder="E-POSTA ADRESINIZ" className="input-field" value={resetEmail} onChange={e => setResetEmail(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') handlePasswordReset(); }} />
                     {authError && <p className="text-[10px] text-red-400">{authError}</p>}
-                    <button onClick={handlePasswordReset} className="btn-primary">Sifirlama Baglantisi Gonder</button></>
+                    <button onClick={handlePasswordReset} disabled={authBusy} className="btn-primary disabled:opacity-50">{authBusy ? 'Gonderiliyor...' : 'Sifirlama Baglantisi Gonder'}</button></>
                   ) : (
                     <div className="text-center py-6">
                       <CheckCircle size={28} className="text-green-400 mx-auto mb-3" />

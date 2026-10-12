@@ -16,6 +16,10 @@
 
 services:
   coturn:
+    # Denetim 2026-10-07 (O8): 'latest' her yeniden başlatmada habersiz sürüm
+    # değiştirebilir. Canlıda çalışan sürümü sabitleyin, örn.:
+    #   docker inspect arku-turn --format '{{.Config.Image}}'  ve imaj özeti
+    #   image: coturn/coturn:<sürüm>@sha256:<özet>
     image: coturn/coturn:latest
     container_name: arku-turn
     network_mode: host

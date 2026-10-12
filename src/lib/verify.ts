@@ -1,4 +1,5 @@
-// Arku Remote — Bağlantı doğrulama (kısa doğrulama kodu / SAS).
+// Arku Remote — Bağlantı doğrulama (kısa doğrulama kodu / SAS) ve oturum
+// parolasının kanıtı.
 //
 // ── NEDEN KENDİ ŞİFRELEMEMİZİ YAZMIYORUZ ────────────────────────────────────
 // WebRTC trafiği ZATEN uçtan uca şifrelidir: medya SRTP (AES-GCM), veri
@@ -25,8 +26,26 @@
 // TUTMAZ. ZRTP (PGP'nin yaratıcısı Zimmermann) ve Signal'in "güvenlik
 // numarası" tam olarak bu yöntemi kullanır.
 //
-// Oturum parolası da türetmeye karıştırılır: sinyalleşmeyi tümüyle kontrol
-// eden ama parolayı bilmeyen bir saldırgan eşleşen bir kod üretemez.
+// ── PAROLA NEDEN ARTIK TÜRETMEYE KARIŞMIYOR (2026-09-12) ───────────────────
+// Önceki sürümde oturum parolası SAS türetmesine karıştırılıyordu; gerekçe
+// "sinyalleşmeyi kontrol eden ama parolayı bilmeyen saldırgan eşleşen kod
+// üretemez" idi. İki sorunu vardı:
+//
+//   1) Parola, tam olarak o saldırganın kontrol ettiği varsayılan kanaldan
+//      (signals.payload.pw) DÜZ METİN geçiyordu. Yani varsayım zaten
+//      geçersizdi: saldırgan parolayı okuyup eşleşen kodu üretebilirdi.
+//   2) İki taraf parola konusunda anlaşamadığında (alıcı parolayı zorunlu
+//      tutmuyor, arayan rastgele bir şey yazmış) kodlar TUTMUYOR ve
+//      kullanıcıya sahte bir "araya girme" uyarısı gösteriliyordu.
+//
+// Parolanın SAS'a kattığı gerçek bir güvenlik yoktu: araya giren biri iki
+// ayrı DTLS oturumu kurmak zorunda olduğu için parmak izleri her durumda
+// farklıdır. Bu yüzden roller ayrıldı:
+//
+//   * SAS  = yalnızca parmak izlerinden türetilir (araya girme tespiti).
+//   * PAROLA = yalnızca erişim denetimi; artık düz metin gitmez, oturum
+//     kimliğine bağlı bir HMAC kanıtı olarak gider (derivePasswordProof).
+//     Böylece veritabanına erişen biri parolayı öğrenemez.
 
 /** SDP'den DTLS sertifika parmak izini çıkarır. */
 export function fingerprintFromSdp(sdp: string | undefined | null): string | null {
@@ -44,6 +63,21 @@ export function fingerprintFromSdp(sdp: string | undefined | null): string | nul
  */
 const SAS_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
 
+/** Türetmeye bağlam ayrımı: aynı girdi başka bir amaçla aynı çıktıyı vermesin. */
+const SAS_DOMAIN = 'arku-sas-v2';
+const PW_DOMAIN = 'arku-pw-v1';
+
+async function hmacSha256(keyText: string, message: string): Promise<Uint8Array> {
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(keyText),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  );
+  return new Uint8Array(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(message)));
+}
+
 /**
  * İki parmak izinden ortak bir doğrulama kodu türetir.
  *
@@ -52,28 +86,17 @@ const SAS_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
  *
  * @param localFp  bizim DTLS parmak izimiz
  * @param remoteFp karşı tarafın DTLS parmak izi
- * @param password oturum parolası (varsa) — türetmeye karıştırılır
  */
 export async function deriveVerificationCode(
   localFp: string,
   remoteFp: string,
-  password: string,
 ): Promise<string | null> {
   // file:// dahil Chromium'da subtle mevcuttur; yine de yokluğunda
   // doğrulama kodunu göstermemek, yanlış kod göstermekten iyidir.
   if (!globalThis.crypto?.subtle) return null;
   try {
     const material = [localFp, remoteFp].sort().join('|');
-    const key = await crypto.subtle.importKey(
-      'raw',
-      new TextEncoder().encode(password || 'arku-no-password'),
-      { name: 'HMAC', hash: 'SHA-256' },
-      false,
-      ['sign'],
-    );
-    const sig = new Uint8Array(
-      await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(material)),
-    );
+    const sig = await hmacSha256(SAS_DOMAIN, material);
     // 6 karakter = 32^6 ≈ 1,07 milyar. Araya girenin doğru kodu tutturma
     // şansı milyarda bir; kullanıcı yanlışı görür.
     let out = '';
@@ -82,4 +105,72 @@ export async function deriveVerificationCode(
   } catch {
     return null;
   }
+}
+
+/** Parolayı normalize eder — iki taraf aynı biçimi kullanmalı. */
+const normalizePassword = (pw: string): string => pw.trim().toUpperCase();
+
+/**
+ * Oturum parolasının kanıtını üretir: HMAC(parola, oturum_kimliği).
+ *
+ * NEDEN OTURUM KİMLİĞİNE BAĞLI: sabit bir özet, bir kez yakalandığında
+ * sonsuza kadar tekrar oynatılabilirdi (replay). Oturum kimliği her çağrı
+ * için yeniden üretildiği ve arayan tarafından belirlendiği için kanıt da
+ * tek kullanımlık olur.
+ *
+ * crypto.subtle yoksa null döner; çağıran taraf o durumda eski düz metin
+ * yoluna düşmez — parola göndermemek, parolayı sızdırmaktan iyidir.
+ */
+export async function derivePasswordProof(
+  password: string,
+  sessionId: string,
+): Promise<string | null> {
+  if (!globalThis.crypto?.subtle) return null;
+  const pw = normalizePassword(password);
+  if (!pw) return null;
+  try {
+    const sig = await hmacSha256(`${PW_DOMAIN}|${pw}`, sessionId);
+    return Array.from(sig.slice(0, 16), (b) => b.toString(16).padStart(2, '0')).join('');
+  } catch {
+    return null;
+  }
+}
+
+/** Sabit süreli karşılaştırma — parola kanıtı için zamanlama sızıntısını kapatır. */
+function constantTimeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+/**
+ * Gelen offer'ın taşıdığı parola kanıtını doğrular.
+ *
+ * İki biçim desteklenir:
+ *   `pwh` — HMAC kanıtı (v1.5.0+ arayan). Tercih edilen yol.
+ *   `pw`  — düz metin parola (v1.4.0 arayan). GERİYE DÖNÜK UYUMLULUK için
+ *           kabul edilir; o istemciler güncellenince bu dal kaldırılmalı.
+ *
+ * @returns doğrulandıysa true; parola hiç gelmediyse ya da tutmadıysa false
+ */
+export async function verifyOfferPassword(
+  payload: Record<string, unknown> | null | undefined,
+  sessionId: string | null | undefined,
+  expectedPassword: string,
+): Promise<boolean> {
+  const expected = normalizePassword(expectedPassword);
+  if (!expected) return false;
+
+  const proof = payload?.pwh;
+  if (typeof proof === 'string' && proof && sessionId) {
+    const mine = await derivePasswordProof(expected, sessionId);
+    return !!mine && constantTimeEqual(proof, mine);
+  }
+
+  // Eski istemci: düz metin.
+  const plain = payload?.pw;
+  if (typeof plain === 'string') return constantTimeEqual(normalizePassword(plain), expected);
+
+  return false;
 }

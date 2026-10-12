@@ -5,13 +5,23 @@
 //  2) QRtım'de giriş yapar, tek kullanımlık token ile Arku'ya geri döner.
 //  3) Arku bu fonksiyona { qrtim_token } gönderir.
 //  4) Token, QRtım'in arku-link fonksiyonu ile doğrulanır (server-to-server).
-//  5) E-postaya karşılık gelen Arku kullanıcısı bulunur ya da oluşturulur,
-//     QRtım kimliği users tablosuna yazılır.
+//  5) Arku hesabı QRtım'in KALICI kimliğiyle (qrtim_uid) bulunur; hiç bağlanmamış
+//     eski hesaplar bir kereye mahsus doğrulanmış e-postayla taşınır. Karar ve
+//     yazma işi arku_qrtim_resolve_account içinde, tek işlemde yapılır.
 //  6) Şifre istemeden oturum açmak için magic-link token üretilir ve client'a
 //     döndürülür. Client supabase.auth.verifyOtp ile oturumu başlatır.
 //
 // verify_jwt = false: kullanıcı henüz Arku'da giriş yapmamıştır; güvenlik
 // QRtım'in tek kullanımlık token'ı ile sağlanır.
+//
+// ÜÇ KURAL (QRtım deposundaki docs/qrtim-kimlik-entegrasyonu.md ile ortak):
+//   * Eşleştirme e-postayla YAPILMAZ. E-posta değişir, devredilir ve aynı
+//     adres bir süre sonra başka birine ait olabilir.
+//   * Oturum, eşleşen Arku hesabının KENDİ auth e-postasıyla açılır. QRtım'den
+//     gelen e-postayla açmak, kullanıcı QRtım'de adresini değiştirdiğinde
+//     doğru hesapla eşleşip yanlış hesaba giriş yapmak demektir.
+//   * Hesap yazma hatası YUTULMAZ. Aynı QRtım kimliği başka bir Arku hesabına
+//     bağlıysa oturum açılmaz.
 
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "jsr:@supabase/supabase-js@2";
@@ -39,66 +49,31 @@ function json(body: unknown, status = 200): Response {
 }
 
 // QRtım planı -> Arku planı. Tüm ücretli planlar ücretsiz Arku verir.
-function mapQrtimPlan(p: string | null): "free" | "pro" | "business" {
-  const v = (p ?? "").toLowerCase();
-  if (["business", "kurumsal", "stk", "enterprise"].includes(v)) return "business";
-  if (v === "" || v === "free") return "free";
-  return "pro"; // student, professional ve diğer tüm ücretli planlar
-}
-
-// QRtım kaynaklı Arku aboneliği ver/güncelle.
-// Kurallar: ücretsiz plan için abonelik oluşturma; satın alınmış (source=direct,
-// active) aboneliği ezme; yalnızca qrtim kaynaklı satırı güncelle.
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-async function grantQrtimSubscription(admin: any, userId: string, qrtimPlan: string | null) {
-  const arkuPlan = mapQrtimPlan(qrtimPlan);
-
-  const { data: existing } = await admin
-    .from("subscriptions")
-    .select("id, source, status, plan")
-    .eq("owner_id", userId)
-    .maybeSingle();
-
-  // Satın alınmış aktif aboneliğe dokunma
-  if (existing && existing.source === "direct" && existing.status === "active") return;
-
-  if (arkuPlan === "free") {
-    // QRtım artık ücretsiz: yalnızca qrtim kaynaklı satırı free'ye çek
-    if (existing && existing.source === "qrtim") {
-      await admin.from("subscriptions")
-        .update({ plan: "free", qrtim_plan: qrtimPlan, status: "active" })
-        .eq("owner_id", userId);
-    }
-    return;
-  }
-
-  await admin.from("subscriptions").upsert({
-    owner_id: userId,
-    plan: arkuPlan,
-    status: "active",
-    source: "qrtim",
-    qrtim_plan: qrtimPlan,
-    seats: arkuPlan === "business" ? 5 : 1,
-  }, { onConflict: "owner_id" });
-}
+// NOT: QRtım planını Arku aboneliğine çevirme mantığı buradan TAŞINDI.
+// Aynı mantık qrtim-sync içinde de vardı ve artık plana 72 saatlik bir
+// geçerlilik ufku ekleniyor; üç çağıranın (bu fonksiyon, qrtim-sync,
+// qrtim-plan-refresh) aynı kurala uyması şart olduğu için kopya çoğaltmak yerine
+// tek yere indirildi: public.arku_qrtim_apply_plan
+// (20260922_qrtim_plan_expiry.sql). Süre de orada, tek sabitte duruyor.
 
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
   if (req.method !== "POST") return json({ error: "Yalnızca POST desteklenir" }, 405);
 
-  // ── ASKIYA ALINDI (2026-09-08) ─────────────────────────────────────────────
+  // ── KAPALI (2026-09-08'den beri) ───────────────────────────────────────────
   // Arayüzdeki düğmeyi gizlemek yeterli DEĞİLDİR: bu uç nokta anon key ile
   // doğrudan çağrılabilir. Kapı sunucuda.
   //
-  // S1: QRtım'in döndürdüğü e-posta doğrulanmadan kabul ediliyor, o e-posta
-  // için hesap açılıp oturum üretiliyordu. QRtım'de e-posta doğrulaması
-  // zorunlu değilse saldırgan kurban@firma.com ile QRtım hesabı açıp AYNI
-  // e-postaya ait Arku hesabını devralabilirdi.
+  // S1 (KAPANDI, 2026-09-21): QRtım'in döndürdüğü e-posta doğrulanmadan kabul
+  // ediliyordu; saldırgan kurban@firma.com ile QRtım hesabı açıp aynı
+  // e-postaya ait Arku hesabını devralabilirdi. QRtım 10.09.2026'dan beri
+  // doğrulanmamış hesaba belirteç vermiyor ve `email_verified` döndürüyor;
+  // aşağıda bu alan ayrıca ŞART KOŞULUYOR (savunma katmanı) ve eşleştirme
+  // artık e-postayla değil kalıcı kimlikle yapılıyor.
   //
-  // YENİDEN AÇMAK İÇİN İKİSİ BİRDEN gerekli:
-  //   1) QRtım'in arku-link yanıtı `email_verified` döndürmeli ve burada
-  //      şart koşulmalı,
-  //   2) Supabase secret: QRTIM_SSO_ENABLED=true
+  // KALAN TEK ENGEL ÜRÜN KARARI: bayrağı açmak Burak'ın kararı. Açılınca ikisi
+  // birden açılmalı — burada QRTIM_SSO_ENABLED=true, istemcide
+  // src/App.tsx > QRTIM_ENABLED = true. Biri tek başına yetmez.
   if (Deno.env.get("QRTIM_SSO_ENABLED") !== "true") {
     return json({ error: "QRtım entegrasyonu geçici olarak devre dışı." }, 503);
   }
@@ -122,14 +97,36 @@ Deno.serve(async (req: Request) => {
     });
     const vd = await vr.json().catch(() => ({ valid: false }));
     if (!vr.ok || !vd.valid || !vd.user) {
-      return json({ error: vd.error || "Geçersiz QRtım token" }, 401);
+      // `code` makine tarafından okunabilir (token_already_used, token_expired,
+      // email_not_verified …); istemci mesajı ona göre seçiyor. `error` metni
+      // insan içindir ve değişebilir — ona göre dallanılmaz.
+      return json({
+        error: vd.error || "Geçersiz QRtım token",
+        code: typeof vd.code === "string" ? vd.code : "token_invalid",
+      }, 401);
     }
 
     const q = vd.user as {
-      qrtim_id: string; email: string; name: string; username: string; phone: string | null;
-      plan?: string | null;
+      qrtim_uid?: string | null;
+      qrtim_id: string; email: string; email_verified?: boolean;
+      name: string; username: string; phone: string | null;
+      // `paid` QRtım'in `partner-plan` cevabında var; arku-link de göndermeye
+      // başlarsa buradan otomatik kullanılır. Yoksa null geçiyoruz ve SQL
+      // tarafındaki köprü bilinen ad listesine düşüyor (bilinmeyen = ücretsiz).
+      plan?: string | null; paid?: boolean;
     };
+
+    // 2) Savunma katmanı. QRtım doğrulanmamış hesaba belirteç vermiyor, ama
+    //    tek koruma olarak karşı tarafa güvenmiyoruz: alan yoksa ya da true
+    //    değilse hesap bağlanmaz.
+    if (q.email_verified !== true) {
+      return json({ error: "QRtım hesabının e-postası doğrulanmamış." }, 403);
+    }
     if (!q.email) return json({ error: "QRtım hesabında e-posta yok" }, 400);
+    if (!q.qrtim_uid) {
+      // Kalıcı kimlik gelmezse eşleştirme e-postaya düşerdi; o yol kapalı.
+      return json({ error: "QRtım kalıcı kimliği (qrtim_uid) gelmedi." }, 502);
+    }
 
     const admin = createClient(
       Deno.env.get("SUPABASE_URL")!,
@@ -137,34 +134,65 @@ Deno.serve(async (req: Request) => {
       { auth: { persistSession: false } },
     );
 
-    // 2) Kullanıcı yoksa oluştur (zaten varsa hata yok sayılır)
-    await admin.auth.admin.createUser({
-      email: q.email,
-      email_confirm: true,
-      user_metadata: { name: q.name, qrtim_id: q.qrtim_id, qrtim_username: q.username },
-    });
+    // 3) Hesabı bul: kalıcı kimlikle eşleştir, hiç bağlanmamış eski hesabı bir
+    //    kereye mahsus doğrulanmış e-postayla taşı. Karar ve yazma tek işlemde
+    //    veritabanında yapılır (20260921_qrtim_uid_identity.sql).
+    const { data: resolved, error: resolveErr } = await admin.rpc(
+      "arku_qrtim_resolve_account",
+      { p_qrtim_uid: q.qrtim_uid, p_email: q.email },
+    );
+    if (resolveErr) return json({ error: "Hesap eşleştirilemedi" }, 500);
 
-    // 3) Şifresiz oturum için magic-link token üret (e-posta gönderilmez)
-    const { data: linkData, error: linkErr } = await admin.auth.admin.generateLink({
-      type: "magiclink",
-      email: q.email,
-    });
-    if (linkErr || !linkData?.properties?.hashed_token || !linkData?.user?.id) {
-      return json({ error: "Oturum oluşturulamadı" }, 500);
+    const match = (Array.isArray(resolved) ? resolved[0] : resolved) as
+      { user_id: string; auth_email: string | null; matched: string } | undefined;
+
+    if (match?.matched === "conflict") {
+      return json({
+        error: "Bu Arku hesabı başka bir QRtım hesabına bağlı. Ayarlar > QRtım " +
+          "bağlantısını kesip tekrar deneyin.",
+      }, 409);
     }
 
-    // 4) QRtım kimliğini Arku users tablosuna yaz. Ad/telefon gibi profil
-    //    alanlarını yalnızca Arku tarafında boşsa QRtım'den doldur — kullanıcının
-    //    daha önce Arku'da yaptığı özelleştirmeyi ezme.
+    let userId = match?.user_id ?? null;
+    // Oturum, hesabın KENDİ auth e-postasıyla açılır — QRtım'inkiyle değil.
+    let loginEmail = match?.auth_email ?? null;
+
+    // 4) Eşleşen hesap yoksa yeni hesap. email_confirm burada meşru: QRtım
+    //    e-postayı doğruladığını bildirdi ve yukarıda şart koştuk.
+    if (!userId) {
+      const { data: created, error: createErr } = await admin.auth.admin.createUser({
+        email: q.email,
+        email_confirm: true,
+        user_metadata: { name: q.name, qrtim_id: q.qrtim_id, qrtim_username: q.username },
+      });
+      if (createErr || !created?.user?.id) {
+        // En olası sebep: bu e-postayla DOĞRULANMAMIŞ bir Arku kaydı var
+        // (eşleşseydi 3. adım bulurdu). Böyle bir kaydı bağlamak, kaydı
+        // önceden açmış birinin hesabına kullanıcıyı sokmak olurdu.
+        return json({
+          error: "Bu e-postayla tamamlanmamış bir Arku kaydı var. Önce Arku'daki " +
+            "e-posta doğrulamasını bitirin, sonra Ayarlar'dan QRtım hesabınızı bağlayın.",
+        }, 409);
+      }
+      userId = created.user.id;
+      loginEmail = q.email;
+    }
+
+    if (!loginEmail) return json({ error: "Oturum oluşturulamadı" }, 500);
+
+    // 5) QRtım kimliğini yaz. Ad/telefon yalnızca Arku tarafında BOŞSA doldurulur
+    //    — kullanıcının Arku'da yaptığı özelleştirme ezilmez. users.email
+    //    hesabın kendi adresidir; QRtım'inki qrtim_email'de durur.
     const { data: existing } = await admin
       .from("users")
       .select("display_name, phone")
-      .eq("id", linkData.user.id)
+      .eq("id", userId)
       .maybeSingle();
 
     const row: Record<string, unknown> = {
-      id: linkData.user.id,
-      email: q.email,
+      id: userId,
+      email: loginEmail,
+      qrtim_uid: q.qrtim_uid,
       qrtim_id: q.qrtim_id,
       qrtim_username: q.username,
       qrtim_name: q.name,
@@ -174,17 +202,63 @@ Deno.serve(async (req: Request) => {
     if (!existing?.display_name && q.name) row.display_name = q.name;
     if (!existing?.phone && q.phone) row.phone = q.phone;
 
-    await admin.from("users").upsert(row, { onConflict: "id" });
+    // HATA YUTULMAZ: aynı QRtım kimliği başka bir hesapta ise benzersizlik
+    // hatası döner ve oturum AÇILMAZ.
+    const { error: upsertErr } = await admin.from("users").upsert(row, { onConflict: "id" });
+    if (upsertErr) {
+      return json({ error: "QRtım kimliği bu hesaba bağlanamadı." }, 409);
+    }
 
-    // 5) QRtım aboneliğini Arku'ya senkronla — ücretli QRtım planları ücretsiz
+    // 6) Plan tazeleme sırrını sakla (QRtım `partner-plan` ucu için).
+    //
+    // Sır YALNIZCA bağlama anında dönüyor; şimdi yakalanmazsa sonradan almanın
+    // yolu yok. İstemciye hiç gönderilmiyor, politikası olmayan ayrı bir
+    // tabloda duruyor (20260922_qrtim_link_secrets).
+    //
+    // Hata girişi DÜŞÜRMEZ: oturum geçerli, yalnızca planı sonradan doğrulama
+    // yeteneğini kaybederiz. Plan tazeleme yolu "sır yok" durumunu
+    // "doğrulanamadı" olarak ele alır.
+    if (typeof vd.link_secret === "string" && vd.link_secret) {
+      await admin.from("qrtim_link_secrets").upsert({
+        user_id: userId,
+        qrtim_uid: q.qrtim_uid,
+        link_secret: vd.link_secret,
+      }, { onConflict: "user_id" });
+    }
+
+    // 7) Şifresiz oturum için magic-link token üret (e-posta gönderilmez)
+    const { data: linkData, error: linkErr } = await admin.auth.admin.generateLink({
+      type: "magiclink",
+      email: loginEmail,
+    });
+    if (linkErr || !linkData?.properties?.hashed_token) {
+      return json({ error: "Oturum oluşturulamadı" }, 500);
+    }
+    // generateLink kullanıcıyı e-postadan bulur. Eşleştiğimiz hesapla aynı
+    // olduğunu doğrula: aradaki bir e-posta değişikliği başka bir hesaba
+    // oturum açmamızı sağlayabilirdi.
+    if (linkData.user?.id && linkData.user.id !== userId) {
+      return json({ error: "Oturum oluşturulamadı" }, 500);
+    }
+
+    // 8) QRtım aboneliğini Arku'ya senkronla — ücretli QRtım planları ücretsiz
     //    Arku aboneliği verir. Mevcut satın alınmış (direct) abonelik ezilmez.
-    await grantQrtimSubscription(admin, linkData.user.id, q.plan ?? null);
+    //
+    //    Buradaki plan BAĞLAMA ANININ fotoğrafıdır ve eskir; bu yüzden yazılan
+    //    satır 72 saatlik bir ufukla yazılıyor ve qrtim-plan-refresh onu
+    //    periyodik tazeliyor. Tazelenmezse yetki kendiliğinden düşer.
+    await admin.rpc("arku_qrtim_apply_plan", {
+      p_user_id: userId,
+      p_qrtim_plan: q.plan ?? null,
+      p_paid: typeof q.paid === "boolean" ? q.paid : null,
+    });
 
     return json({
-      email: q.email,
+      email: loginEmail,
       token_hash: linkData.properties.hashed_token,
     });
-  } catch (e) {
-    return json({ error: String(e) }, 500);
+  } catch {
+    // İç hata ayrıntısı dışarı sızmasın (QRtım tarafı da aynı kuralı uyguluyor).
+    return json({ error: "İşlem tamamlanamadı" }, 500);
   }
 });

@@ -88,7 +88,22 @@ function ipHash(ip) {
 function geoOf(req) {
   const h = req.headers;
   const dec = (s) => { try { return decodeURIComponent(String(s || '')); } catch { return String(s || ''); } };
-  const ipRaw = String(h['x-forwarded-for'] || h['x-real-ip'] || h['x-vercel-forwarded-for'] || '')
+  // BAŞLIK SIRASI: aşağıdaki hız sınırı ve tekil ziyaretçi sayımı bu değere
+  // dayanıyor, yani istemcinin belirleyebildiği bir başlık kullanılırsa ikisi de
+  // etkisiz kalır (her istekte başka bir "IP" uydurup yeni kova açmak).
+  //
+  // Vercel'de bu sömürülebilir DEĞİL: platform `x-forwarded-for`'u kendisi
+  // yazar ve dışarıdan gelen değeri taklidi önlemek için iletmez (yalnızca
+  // Enterprise "trusted proxy" ayarında davranış değişir).
+  // Bkz. https://vercel.com/docs/headers/request-headers
+  //
+  // Yine de platformun kendi ürettiği başlıklar önce okunuyor: sıralamanın
+  // maliyeti yok ve site bir gün Vercel dışında, gelen başlığı KORUYAN bir
+  // vekilin arkasına konursa (tipik ters vekil davranışı) `x-forwarded-for`'un
+  // ilk elemanı istemcinin yazdığı değer olur. QRtım tarafında tam olarak bu
+  // kalıp üretimde sömürüldü; orada vekil Cloudflare ve doğru başlık
+  // `cf-connecting-ip`.
+  const ipRaw = String(h['x-vercel-forwarded-for'] || h['x-real-ip'] || h['x-forwarded-for'] || '')
     .split(',')[0].trim();
   return {
     country: String(h['x-vercel-ip-country'] || '').slice(0, 4),
