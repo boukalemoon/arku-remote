@@ -53,6 +53,13 @@ function json(body: unknown, status = 200): Response {
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
   if (req.method !== "POST") return json({ error: "Yalnızca POST desteklenir" }, 405);
+  // QRtım askıdayken bu uç da kapalı (güvenlik denetimi 2026-11-10).
+  // qrtim-auth ve qrtim-sync bu anahtara bağlıydı, plan tazeleme değildi:
+  // daha önce bağlanmış bir hesap 72 saatlik plan ufkunu süresiz uzatabiliyor
+  // ve her çağrı QRtım'e sunucudan sunucuya bir istek üretiyordu.
+  if (Deno.env.get("QRTIM_SSO_ENABLED") !== "true") {
+    return json({ error: "QRtım entegrasyonu geçici olarak devre dışı." }, 503);
+  }
 
   try {
     const authHeader = req.headers.get("Authorization") ?? "";

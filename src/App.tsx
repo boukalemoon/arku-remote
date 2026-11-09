@@ -21,7 +21,8 @@ import { verifyOfferPassword } from './lib/verify';
 import { isVersionBelow } from './lib/version';
 import { describeHangup, HANGUP_PROTO } from './lib/hangup';
 import type { AuditRow, AuditVerifyResult } from './lib/audit';
-import { authRedirectUrl, parseAuthReturn, describeAuthError } from './lib/authRedirect';
+import { authRedirectUrl, parseAuthReturn, describeAuthError, isDesktopReturn, desktopAppLink, describeDesktopAuthEvent } from './lib/authRedirect';
+import type { DesktopAuthEvent } from './lib/authRedirect';
 
 type Theme = 'otuken' | 'umay' | 'gok' | 'gece';
 type Tab = 'dashboard' | 'connections' | 'contacts' | 'organization' | 'settings';
@@ -33,6 +34,13 @@ type AuthMode = 'login' | 'register' | 'mfa' | 'reset' | 'checkmail' | 'newpass'
 const INITIAL_AUTH_RETURN = typeof window !== 'undefined'
   ? parseAuthReturn(window.location.hash, window.location.search)
   : null;
+// Bağlantı masaüstü uygulamasından başlatılan bir kayıt/sıfırlamaya mı ait
+// (?kaynak=masaustu)? Öyleyse web sayfası işi bitirince arku:// ile masaüstü
+// uygulamasını açar. Adres temizlenmeden önce, modül yüklenirken okunur.
+const INITIAL_FROM_DESKTOP = typeof window !== 'undefined'
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  && !(window as any).electronAPI?.isElectron
+  && isDesktopReturn(window.location.search);
 
 /** E-posta bağlantılarının döneceği adres (bkz. lib/authRedirect.ts). */
 const emailRedirectTo = (): string => authRedirectUrl(
@@ -248,6 +256,12 @@ export default function App() {
   const [authError, setAuthError] = React.useState('');
   // Hata olmayan bilgilendirme (ör. "e-postaniz dogrulandi").
   const [authNotice, setAuthNotice] = React.useState('');
+  // Web sayfasında: masaüstü uygulamasını açacak arku:// olayı (null = düğme yok).
+  const [desktopEvent, setDesktopEvent] = React.useState<DesktopAuthEvent | null>(null);
+  /** Masaüstü uygulamasını arku:// ile açar. Uygulama yüklü değilse tarayıcı bir şey yapmaz. */
+  const openDesktopApp = (event: DesktopAuthEvent) => {
+    try { window.location.href = desktopAppLink(event); } catch { /* yok say */ }
+  };
   // Kayit/giris istegi surerken dugmeler kilitli: cift tiklama ayni kaydi iki
   // kez gonderiyor, biri "duplicate key" ile sunucu hatasina dusuyordu (2026-10-11).
   const [authBusy, setAuthBusy] = React.useState(false);
@@ -859,9 +873,18 @@ export default function App() {
     if (r.kind === 'error') {
       setShowAuth(true); setAuthMode('login'); setAuthError('');
       setAuthNotice(describeAuthError(r.code));
+      // Bağlantı tükenmiş olsa da hesap büyük olasılıkla doğrulandı; masaüstü
+      // kullanıcısına uygulamaya dönüş yolunu göster (otomatik açmadan).
+      if (INITIAL_FROM_DESKTOP) setDesktopEvent('ac');
     } else if (r.kind === 'signup') {
       setShowAuth(true); setAuthMode('login'); setAuthError('');
-      setAuthNotice('E-posta adresiniz dogrulandi. Bu tarayicida oturumunuz acildi; masaustu uygulamasini kullaniyorsaniz oraya donup e-posta ve sifrenizle giris yapin.');
+      if (INITIAL_FROM_DESKTOP) {
+        setAuthNotice('E-posta adresiniz dogrulandi. Arku uygulamasi aciliyor; acilmazsa asagidaki dugmeye basin ya da uygulamaya donup e-posta ve sifrenizle giris yapin.');
+        setDesktopEvent('dogrulandi');
+        openDesktopApp('dogrulandi');
+      } else {
+        setAuthNotice('E-posta adresiniz dogrulandi. Bu tarayicida oturumunuz acildi; masaustu uygulamasini kullaniyorsaniz oraya donup e-posta ve sifrenizle giris yapin.');
+      }
     } else if (r.kind === 'recovery') {
       setShowAuth(true); setAuthMode('newpass'); setAuthError('');
     }
@@ -872,6 +895,33 @@ export default function App() {
       if (event === 'PASSWORD_RECOVERY') { setShowAuth(true); setAuthMode('newpass'); setAuthError(''); }
     });
     return () => subscription.unsubscribe();
+  }, []);
+
+  // Masaüstü: web sayfası doğrulama/şifre sıfırlamadan sonra uygulamayı
+  // arku://auth/<olay> ile açtı (bkz. electron/deeplink.cjs). Olay yalnızca
+  // bilgi mesajı gösterir; oturum açmaz, belirteç taşımaz.
+  React.useEffect(() => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const api = (window as any).electronAPI;
+    if (!api?.takeDeepLink || !api?.onDeepLinkAvailable) return;
+    let alive = true;
+    const handle = async () => {
+      const ev: string | null = await api.takeDeepLink().catch(() => null);
+      if (!alive || !ev) return;
+      const notice = describeDesktopAuthEvent(ev);
+      if (!notice) return; // 'ac': pencere zaten öne getirildi
+      // Bu pencerede zaten kayıtlı bir hesapla oturum açıksa giriş ekranını açma.
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!alive) return;
+      if (session?.user && !session.user.is_anonymous) return;
+      setShowAuth(true); setAuthMode('login'); setAuthError('');
+      setUnconfirmedEmail('');
+      setAuthNotice(notice);
+    };
+    const off = api.onDeepLinkAvailable(() => { void handle(); });
+    // İlk açılışta (uygulama bağlantıyla başlatıldı) bekleyen olay olabilir.
+    void handle();
+    return () => { alive = false; off(); };
   }, []);
 
   // Son işlenen oturumun kullanıcısı ve sırası: eski bir olayın geç biten işi
@@ -1305,7 +1355,16 @@ export default function App() {
       const { error } = await supabase.auth.updateUser({ password: newPassValue });
       if (error) { setAuthError(error.message); return; }
       setNewPassValue(''); setNewPassConfirm('');
-      setShowAuth(false); addLog('Sifreniz guncellendi.', 'sys');
+      if (INITIAL_FROM_DESKTOP) {
+        // Sıfırlamayı masaüstünden istedi: pencereyi kapatma, uygulamaya döndür.
+        setAuthMode('login');
+        setAuthNotice('Sifreniz guncellendi. Arku uygulamasi aciliyor; acilmazsa asagidaki dugmeye basin ve yeni sifrenizle giris yapin.');
+        setDesktopEvent('sifre-guncellendi');
+        openDesktopApp('sifre-guncellendi');
+      } else {
+        setShowAuth(false);
+      }
+      addLog('Sifreniz guncellendi.', 'sys');
     } finally {
       unlockAuth();
     }
@@ -4047,6 +4106,9 @@ export default function App() {
                   <input type="email" placeholder="E-POSTA" className="input-field" value={email} onChange={e => setEmail(e.target.value)} />
                   <input type="password" placeholder="SIFRE" className="input-field" value={password} onChange={e => setPassword(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') handleLogin(); }} />
                   {authNotice && <p className="text-[10px] text-green-400 leading-relaxed">{authNotice}</p>}
+                  {desktopEvent && (
+                    <button onClick={() => openDesktopApp(desktopEvent)} className="btn-ghost w-full">Arku uygulamasini ac</button>
+                  )}
                   {authError && <p className="text-[10px] text-red-400">{authError}</p>}
                   <button onClick={handleLogin} disabled={authBusy} className="btn-primary disabled:opacity-50">{authBusy ? 'Bekleyin...' : 'Devam Et'}</button>
                   {(unconfirmedEmail || /otp_expired|dogrulama/i.test(authNotice)) && (

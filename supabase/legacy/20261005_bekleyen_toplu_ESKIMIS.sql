@@ -1,3 +1,11 @@
+-- !!! ESKIMIS DOSYA — CALISTIRMAYIN (guvenlik denetimi 2026-11-10) !!!
+-- Bu toplu dosya 20261007000200 (Y1/O1) ve sonraki duzeltmelerden ONCE
+-- hazirlandi. Yeniden calistirilirsa eski uye politikalarini ve yalnizca
+-- INSERT'te calisan koltuk tetikleyicisini geri kurar: admin herhangi bir
+-- kullaniciyi 'owner' olarak ekleyebilir, koltuk siniri asilir.
+-- Tarihsel kayit icin saklaniyor. Ilk satirdaki hata calistirmayi durdurur.
+do $$ begin raise exception 'ESKIMIS DOSYA: supabase/legacy/20261005_bekleyen_toplu_ESKIMIS.sql calistirilmamali'; end $$;
+
 -- =========================================================
 -- Arku Remote — BEKLEYEN MIGRATION'LARIN TAMAMI (tek dosya)
 -- Olusturuldu: 2026-10-05

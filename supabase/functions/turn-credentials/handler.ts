@@ -50,6 +50,8 @@ function json(body: unknown, status = 200): Response {
 
 const DEFAULT_STUN = ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"];
 export const DEFAULT_TTL = 43_200; // 12 saat
+/** Aynı hesabın aynı kullanıcı adını aldığı süre (bkz. A modu). */
+export const CREDENTIAL_BUCKET_SECONDS = 3600;
 
 interface RTCIceServerLike { urls?: string | string[]; username?: string; credential?: string }
 
@@ -197,7 +199,15 @@ export async function handle(req: Request, deps: Deps): Promise<Response> {
   // A modu: coturn paylaşılan sırrı
   const ttlRaw = Number(env.get("TURN_TTL_SECONDS"));
   const ttl = Number.isFinite(ttlRaw) && ttlRaw > 0 ? Math.floor(ttlRaw) : DEFAULT_TTL;
-  const expiry = Math.floor(now() / 1000) + ttl;
+  // Bitiş zamanı saat başına YUVARLANIR (güvenlik incelemesi 2026-11-10).
+  // NEDEN: coturn kullanıcı başına kotayı (user-quota) kullanıcı ADINA göre
+  // sayar. Bitiş her istekte değişince aynı hesap her istekte YENİ bir
+  // kullanıcı oluyordu: tek bir misafir oturumu 10 dakikada 30 kimlik alıp
+  // 30 x user-quota ayırmayla sunucunun tüm relay kapasitesini tutabiliyordu.
+  // Artık aynı hesap bir saat boyunca aynı kullanıcı adını alır, kota gerçekten
+  // kişi başına işler. Geçerlilik ttl ile ttl+1 saat arasındadır.
+  const nowSec = Math.floor(now() / 1000);
+  const expiry = Math.ceil((nowSec + ttl) / CREDENTIAL_BUCKET_SECONDS) * CREDENTIAL_BUCKET_SECONDS;
   const username = `${expiry}:${auth.sub}`;
   let credential: string;
   try {

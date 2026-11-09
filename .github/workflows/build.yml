@@ -139,6 +139,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # Belirteç .git/config'e yazılmasın: npm ci'daki bağımlılık kurulum
+          # betikleri onu okuyup etiket/sürüm yayımlayabilirdi (denetim 2026-11-10).
+          persist-credentials: false
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -204,7 +208,9 @@ jobs:
         # degistiriyordu (once etiket, sonra PR birlestirme sirasinda).
         run: npm run desktop:build:${{ matrix.platform }} -- ${{ startsWith(github.ref, 'refs/tags/v') && '--publish onTag' || '--publish never' }}
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Yazma yetkili belirteç YALNIZCA sürüm etiketinde verilir; PR ve main
+          # derlemeleri yayımlamaz, belirtece de ihtiyaçları yoktur.
+          GH_TOKEN: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.GITHUB_TOKEN || '' }}
           VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
           VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
           VITE_QRTIM_URL: ${{ secrets.VITE_QRTIM_URL }}

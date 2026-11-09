@@ -1,17 +1,39 @@
 // Çalıştırma: npm test  (node --experimental-strip-types --test ...)
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { authRedirectUrl, parseAuthReturn, describeAuthError, PUBLIC_APP_URL } from './authRedirect.ts';
+import {
+  authRedirectUrl, parseAuthReturn, describeAuthError, PUBLIC_APP_URL,
+  isDesktopReturn, desktopAppLink, describeDesktopAuthEvent,
+} from './authRedirect.ts';
 
 const web = (origin: string) => {
   const u = new URL(origin);
   return { protocol: u.protocol, hostname: u.hostname, origin: u.origin };
 };
 
-test('masaüstü uygulaması asla localhost ya da file:// adresine yönlendirmez', () => {
-  assert.equal(authRedirectUrl(web('http://localhost:3000'), true), PUBLIC_APP_URL);
-  assert.equal(authRedirectUrl({ protocol: 'file:', hostname: '', origin: 'null' }, true), PUBLIC_APP_URL);
-  assert.equal(authRedirectUrl({ protocol: 'file:', hostname: '', origin: 'null' }, false), PUBLIC_APP_URL);
+const DESKTOP_URL = `${PUBLIC_APP_URL}?kaynak=masaustu`;
+
+test('masaüstü uygulaması asla localhost ya da file:// adresine yönlendirmez; masaüstü işareti eklenir', () => {
+  assert.equal(authRedirectUrl(web('http://localhost:3000'), true), DESKTOP_URL);
+  assert.equal(authRedirectUrl({ protocol: 'file:', hostname: '', origin: 'null' }, true), DESKTOP_URL);
+  assert.equal(authRedirectUrl({ protocol: 'file:', hostname: '', origin: 'null' }, false), DESKTOP_URL);
+});
+
+test('masaüstü dönüşü tanınır, web dönüşü tanınmaz', () => {
+  assert.equal(isDesktopReturn('?kaynak=masaustu'), true);
+  assert.equal(isDesktopReturn('kaynak=masaustu&code=x'), true);
+  assert.equal(isDesktopReturn(''), false);
+  assert.equal(isDesktopReturn('?kaynak=web'), false);
+  // Web kullanıcısının dönüş adresinde işaret YOK.
+  assert.equal(isDesktopReturn(new URL(authRedirectUrl(web('https://arku-remote.vercel.app'), false)).search), false);
+});
+
+test('masaüstü bağlantıları ve mesajları', () => {
+  assert.equal(desktopAppLink('dogrulandi'), 'arku://auth/dogrulandi');
+  assert.match(describeDesktopAuthEvent('dogrulandi') ?? '', /dogrulandi/);
+  assert.match(describeDesktopAuthEvent('sifre-guncellendi') ?? '', /guncellendi/);
+  assert.equal(describeDesktopAuthEvent('ac'), null);
+  assert.equal(describeDesktopAuthEvent('baska'), null);
 });
 
 test('web: sayfanın kendi kökü (canlı, önizleme, yerel geliştirme)', () => {
@@ -21,7 +43,8 @@ test('web: sayfanın kendi kökü (canlı, önizleme, yerel geliştirme)', () =>
 });
 
 test('ortam değişkeni önceliklidir; geçersizse yok sayılır', () => {
-  assert.equal(authRedirectUrl(web('http://localhost:3000'), true, 'https://app.arku.com.tr/'), 'https://app.arku.com.tr/');
+  assert.equal(authRedirectUrl(web('http://localhost:3000'), true, 'https://app.arku.com.tr/'), 'https://app.arku.com.tr/?kaynak=masaustu');
+  assert.equal(authRedirectUrl(web('https://a.example'), false, 'https://app.arku.com.tr/'), 'https://app.arku.com.tr/');
   assert.equal(authRedirectUrl(web('https://a.example'), false, 'javascript:alert(1)'), 'https://a.example/');
 });
 

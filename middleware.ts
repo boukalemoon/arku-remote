@@ -30,6 +30,12 @@ export const config = {
 //
 // connect-src: Supabase REST + Realtime (wss). WebRTC bağlantıları CSP
 // kapsamında değildir; STUN/TURN adreslerini burada saymaya gerek yok.
+//
+// Yalnızca BİZİM projemiz (güvenlik denetimi 2026-11-10). Eskiden
+// *.supabase.co idi: bir XSS olursa saldırgan veriyi KENDİ Supabase
+// projesine gönderebilirdi, CSP bunu durdurmazdı. Proje değişirse
+// src/lib/supabase.ts ile birlikte burası da güncellenir.
+const SUPABASE_HOST = 'jpmbttlxyxrqmpghymbq.supabase.co';
 const CSP_DIRECTIVES = [
   "default-src 'self'",
   "script-src 'self'",
@@ -43,7 +49,7 @@ const CSP_DIRECTIVES = [
   // logoyu belirleyen firma yöneticisinin üyelerin IP adresini görebilmesi.
   "img-src 'self' data: blob: https:",
   "media-src 'self' blob:",
-  "connect-src 'self' https://*.supabase.co wss://*.supabase.co",
+  `connect-src 'self' https://${SUPABASE_HOST} wss://${SUPABASE_HOST}`,
   "font-src 'self' data:",
   "object-src 'none'",
   "base-uri 'none'",
@@ -60,6 +66,12 @@ export default function middleware(): Response {
       // dış sitelere referrer sızdırma.
       'X-Content-Type-Options': 'nosniff',
       'Referrer-Policy': 'strict-origin-when-cross-origin',
+      // HTTPS zorunlu (1 yıl). preload bilinçli olarak yok: tarayıcı listesine
+      // girmek geri alınması aylar süren bir karardır.
+      'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',
+      // Arku kamera, mikrofon, konum kullanmaz. Ekran paylaşımı yalnızca
+      // kendi sayfamızda (gömüldüğü Nexus çerçevesine verilmez).
+      'Permissions-Policy': 'camera=(), microphone=(), geolocation=(), payment=(), usb=(), display-capture=(self)',
     },
   });
 }

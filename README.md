@@ -6,7 +6,7 @@
 
 **Güvenli P2P Uzak Masaüstü Uygulaması** — Görüntü ve veri doğrudan iki cihaz arasında, uçtan uca şifreli. Açık kaynak.
 
-[arku-remote-website.vercel.app](https://arku-remote-website.vercel.app) · [Web'de Dene](https://arku-remote.vercel.app) · [Releases](https://github.com/boukalemoon/arku-remote/releases)
+[www.arku.com.tr](https://www.arku.com.tr) · [Web'de Dene](https://app.arku.com.tr) · [Releases](https://github.com/boukalemoon/arku-remote/releases)
 
 ---
 

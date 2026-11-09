@@ -12,7 +12,7 @@
  */
 
 /** Masaüstü uygulamasının kendi web adresi yok; dönüş buraya yapılır. */
-export const PUBLIC_APP_URL = 'https://arku-remote.vercel.app/';
+export const PUBLIC_APP_URL = 'https://app.arku.com.tr/';
 
 export interface LocationLike {
   protocol: string;
@@ -21,18 +21,57 @@ export interface LocationLike {
 }
 
 /**
+ * Masaüstünden başlatılan e-posta akışının işareti. Web sayfası bunu görünce
+ * doğrulamadan sonra masaüstü uygulamasını arku:// ile öne getirir.
+ * Supabase panelinde Redirect URLs listesinde bu adresin de izinli olması
+ * gerekir (ör. https://app.arku.com.tr/**).
+ */
+export const DESKTOP_MARKER_PARAM = 'kaynak';
+export const DESKTOP_MARKER_VALUE = 'masaustu';
+
+function withDesktopMarker(base: string): string {
+  const u = new URL(base);
+  u.searchParams.set(DESKTOP_MARKER_PARAM, DESKTOP_MARKER_VALUE);
+  return u.toString();
+}
+
+/**
  * E-posta bağlantısının döneceği adres.
  *   - Ortam değişkeniyle verilmişse o (VITE_AUTH_REDIRECT_URL).
- *   - Masaüstü uygulaması (Electron, file://) → herkese açık web uygulaması.
- *     Bağlantı kullanıcının varsayılan tarayıcısında açılır; file:// ya da
- *     localhost oraya hiçbir zaman ulaşamaz.
+ *   - Masaüstü uygulaması (Electron, file://) → herkese açık web uygulaması,
+ *     sonuna ?kaynak=masaustu eklenir. Bağlantı kullanıcının varsayılan
+ *     tarayıcısında açılır; file:// ya da localhost oraya hiçbir zaman
+ *     ulaşamaz. Web sayfası doğrulamayı tamamlar, sonra arku:// ile
+ *     masaüstü uygulamasını açar.
  *   - Web → sayfanın kendi kökü (önizleme ve yerel geliştirme dahil).
  */
 export function authRedirectUrl(loc: LocationLike, isElectron: boolean, override?: string): string {
-  if (override && /^https?:\/\//.test(override)) return override;
-  if (isElectron) return PUBLIC_APP_URL;
-  if (loc.protocol !== 'http:' && loc.protocol !== 'https:') return PUBLIC_APP_URL;
+  const validOverride = override && /^https?:\/\//.test(override) ? override : undefined;
+  const desktop = isElectron || (loc.protocol !== 'http:' && loc.protocol !== 'https:');
+  if (desktop) return withDesktopMarker(validOverride ?? PUBLIC_APP_URL);
+  if (validOverride) return validOverride;
   return `${loc.origin}/`;
+}
+
+/** Dönüş adresi masaüstünden başlatılmış bir akışa mı ait? */
+export function isDesktopReturn(search: string): boolean {
+  return new URLSearchParams(search.replace(/^\?/, '')).get(DESKTOP_MARKER_PARAM) === DESKTOP_MARKER_VALUE;
+}
+
+/** Web sayfasının masaüstü uygulamasını açmak için kullandığı bağlantılar. */
+export type DesktopAuthEvent = 'dogrulandi' | 'sifre-guncellendi' | 'ac';
+export const desktopAppLink = (event: DesktopAuthEvent): string => `arku://auth/${event}`;
+
+/** Masaüstü uygulamasının arku:// olayı aldığında göstereceği bilgi. */
+export function describeDesktopAuthEvent(event: string): string | null {
+  switch (event) {
+    case 'dogrulandi':
+      return 'E-posta adresiniz dogrulandi. Simdi e-posta ve sifrenizle giris yapin.';
+    case 'sifre-guncellendi':
+      return 'Sifreniz guncellendi. Yeni sifrenizle giris yapin.';
+    default:
+      return null;
+  }
 }
 
 export type AuthReturn =

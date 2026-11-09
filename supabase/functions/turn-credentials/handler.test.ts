@@ -56,6 +56,30 @@ test('temel durum: doğrulanmış kullanıcı coturn kimliği alır (A modu)', a
   assert.equal(turn.credential, await hmacSha1Base64('s3cr3t', body.username));
 });
 
+test('aynı hesap bir saat içinde aynı kullanıcı adını alır (coturn user-quota kişi başı işler)', async () => {
+  const at = async (ms: number) => {
+    const { d } = deps(HMAC_ENV, okAdmin(), { now: () => ms });
+    return (await (await handle(req(), d)).json()).username as string;
+  };
+  const t0 = NOW + 5 * 60_000; // saat başından 5 dk sonra
+  const a = await at(t0);
+  const b = await at(t0 + 20 * 60_000);
+  const c = await at(t0 + 60 * 60_000); // sonraki saat dilimi
+  assert.equal(a, b);
+  assert.notEqual(a, c);
+  const expiry = Number(a.split(':')[0]);
+  assert.equal(expiry % 3600, 0);
+  // Geçerlilik en az TTL kadar (12 saat), en fazla TTL + 1 saat.
+  const left = expiry - t0 / 1000;
+  assert.ok(left >= 43200 && left <= 43200 + 3600, `kalan sure ${left}`);
+  // Farklı hesap aynı dilimde farklı kullanıcı adı alır.
+  const other = '22222222-2222-4222-8222-222222222222';
+  const { d } = deps(HMAC_ENV, okAdmin({ getUser: async () => ({ id: other, status: 200 }) }), { now: () => t0 });
+  const tok = jwt({ role: 'authenticated', sub: other, exp: NOW / 1000 + 7200 });
+  const u2 = (await (await handle(req(tok), d)).json()).username as string;
+  assert.notEqual(u2, a);
+});
+
 test('anon anahtarı (role=anon) reddedilir', async () => {
   const { d } = deps(HMAC_ENV, okAdmin());
   const res = await handle(req(jwt({ role: 'anon', exp: NOW / 1000 + 60 })), d);

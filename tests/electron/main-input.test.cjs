@@ -25,9 +25,10 @@ function loadMain() {
   let dialogImpl = async () => ({ response: 0, canceled: true, filePaths: [] });
   const noop = () => {};
   const evt = { on: noop, once: noop };
+  const windows = { n: 0 };
   const electron = {
     app: { isPackaged: true, whenReady: () => new Promise(noop), on: noop, getPath: () => '/tmp', getVersion: () => '0.0.0', requestSingleInstanceLock: () => true, quit: noop },
-    BrowserWindow: Object.assign(function () {}, { fromWebContents: () => null, getAllWindows: () => [] }),
+    BrowserWindow: Object.assign(function () { windows.n++; throw new Error('test: pencere olusturulmaz'); }, { fromWebContents: () => null, getAllWindows: () => [] }),
     session: { defaultSession: evt },
     desktopCapturer: { getSources: async () => [] },
     shell: { openExternal: noop, openPath: async () => '' },
@@ -62,7 +63,7 @@ function loadMain() {
   current = { electron, nut };
   delete require.cache[require.resolve(MAIN)];
   require(MAIN);
-  return { ipc, calls, state, setDialog: (fn) => { dialogImpl = fn; } };
+  return { ipc, calls, state, windows, setDialog: (fn) => { dialogImpl = fn; } };
 }
 
 const tick = () => new Promise((r) => setTimeout(r, 20));
@@ -125,4 +126,26 @@ test('O3: pencere açılmadan önce kuyruğa girmiş tuşlar da pencere açıkke
   release({ canceled: true, filePaths: [] });
   await pending.catch(() => {});
   assert.equal(pressedWhileOpen, false, 'kuyruktaki Enter pencere açıkken basıldı');
+});
+
+test('İzin kaldırılınca kuyrukta bekleyen tuşlar da atılır (denetim 2026-11-10)', async () => {
+  const m = loadMain();
+  await grant(m);
+  m.state.delayMs = 15; // girdi zinciri yavaş: olaylar kuyrukta bekler
+  for (let i = 0; i < 5; i++) m.ipc.on.get('input-event')({ sender }, { type: 'wheel', dx: 0, dy: 100, x: 0.5, y: 0.5 });
+  m.ipc.on.get('input-event')({ sender }, { type: 'keydown', key: 'Enter', code: 'Enter' });
+  m.ipc.on.get('remote-control:revoke')({ sender });
+  await new Promise((r) => setTimeout(r, 250)); // kuyruk tamamen boşalsın
+  const pressed = m.calls.some((c) => c[0] === 'pressKey' && c[1] === 'Return');
+  assert.equal(pressed, false, 'izin kapandıktan sonra kuyruktaki Enter basıldı');
+});
+
+test('Uzaktan kontrol izni varken yeni oturum penceresi açılmaz (denetim 2026-11-10)', async () => {
+  const m = loadMain();
+  await grant(m);
+  m.ipc.on.get('new-window')({ sender });
+  assert.equal(m.windows.n, 0, 'izin varken ikinci pencere açıldı');
+  m.ipc.on.get('remote-control:revoke')({ sender });
+  assert.throws(() => m.ipc.on.get('new-window')({ sender }), /pencere olusturulmaz/);
+  assert.equal(m.windows.n, 1, 'izin kapandıktan sonra yeni pencere açılamadı');
 });

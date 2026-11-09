@@ -95,8 +95,8 @@ test('R4 Electron: redirect_to is the public web app for signup AND resend', asy
   await expect(page.getByText(/Yeni dogrulama e-postasi/)).toBeVisible();
   const su = calls.find(c => c.path === '/auth/v1/signup' && c.body?.email)!;
   const rs = calls.find(c => c.path === '/auth/v1/resend')!;
-  expect(new URL(su.url).searchParams.get('redirect_to')).toBe('https://arku-remote.vercel.app/');
-  expect(new URL(rs.url).searchParams.get('redirect_to')).toBe('https://arku-remote.vercel.app/');
+  expect(new URL(su.url).searchParams.get('redirect_to')).toBe('https://app.arku.com.tr/?kaynak=masaustu');
+  expect(new URL(rs.url).searchParams.get('redirect_to')).toBe('https://app.arku.com.tr/?kaynak=masaustu');
 });
 
 test('R5 login double click sends one token request', async ({ page }) => {

@@ -56,6 +56,16 @@ contextBridge.exposeInMainWorld('electronAPI', {
   remoteControlStatus: () => ipcRenderer.invoke('remote-control:status'),
   // Bilgisayar açılınca otomatik başlat. Dönüş: { supported, enabled, minimized, error? }
   // Kayıt yolu ve argümanı ana süreçte belirlenir; buradan yalnızca boolean gider.
+  // arku:// bağlantısı (e-posta doğrulama / şifre sıfırlama sonrası).
+  // Olay adı ana süreçte bekletilir; burada yalnızca "bekleyen var" bildirimi
+  // dinlenir ve olay takeDeepLink ile alınır. Dönüş: olay adı ya da null.
+  takeDeepLink: () => ipcRenderer.invoke('deeplink:take'),
+  onDeepLinkAvailable: (cb) => {
+    if (typeof cb !== 'function') return () => {};
+    const h = () => cb();
+    ipcRenderer.on('deeplink:available', h);
+    return () => ipcRenderer.removeListener('deeplink:available', h);
+  },
   getAutoStart: () => ipcRenderer.invoke('autostart:get'),
   setAutoStart: (opts) => ipcRenderer.invoke('autostart:set', {
     enabled: !!(opts && opts.enabled), minimized: !!(opts && opts.minimized),

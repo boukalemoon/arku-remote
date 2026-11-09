@@ -5,6 +5,7 @@ const {
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const { SCHEME: DEEPLINK_SCHEME, parseDeepLink, findDeepLinkInArgv } = require('./deeplink.cjs');
 
 // ── Onay pencereleri açıkken uzaktan girdi durdurulur (denetim O3) ──────────
 // Uzaktan kontrol izni olan karşı taraf, yerel kullanıcıya gösterilen bir
@@ -193,6 +194,7 @@ function createWindow(opts = {}) {
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
+      sandbox: true, // Electron 41 varsayilani; acikca yazildi (denetim 2026-11-10)
       preload: path.join(__dirname, 'preload.cjs'),
     },
     icon: path.join(__dirname, '../dist/icons/icon.ico'),
@@ -302,7 +304,7 @@ if (isDev) {
   win.webContents.on('before-input-event', (_event, input) => {
     const mod = process.platform === 'darwin' ? input.meta : input.control;
     if (mod && !input.shift && !input.alt && input.type === 'keyDown' && input.key.toLowerCase() === 'n') {
-      createWindow();
+      openSessionWindow();
     }
   });
 
@@ -481,6 +483,7 @@ function pickDisplaySource(parent, audioRequested) {
           webPreferences: {
             nodeIntegration: false,
             contextIsolation: true,
+            sandbox: true,
             preload: path.join(__dirname, 'picker-preload.cjs'),
           },
         });
@@ -588,7 +591,9 @@ function setupDisplayMediaHandler() {
       const parent = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0];
       ekranKaydiIzniVarMi(parent).then((izinli) => {
       if (!izinli) { callback({}); return; }
-      pickDisplaySource(parent, !!request.audioRequested).then((choice) => {
+      // Seçici açıkken uzaktan girdi işlenmez (denetim 2026-11-10): kontrol eden
+      // taraf başka bir pencereden açtırdığı seçicide "Tüm ekran"ı kendisi seçebiliyordu.
+      withModal(() => pickDisplaySource(parent, !!request.audioRequested)).then((choice) => {
         // Seçim yapılmadıysa isteği reddet: boş nesne "kaynak yok" demektir.
         if (!choice) { callback({}); return; }
         if (requester && !requester.isDestroyed()) {
@@ -1064,8 +1069,23 @@ ipcMain.on('remote-control:revoke', (e) => {
   queueRelease(e.sender.id);
 });
 
+/**
+ * Yeni oturum penceresi (Ctrl+N ya da "Yeni Oturum" düğmesi).
+ *
+ * Herhangi bir pencerede uzaktan kontrol izni varken AÇILMAZ (denetim
+ * 2026-11-10). NEDEN: kontrol eden taraf işletim sistemi düzeyinde Ctrl+N
+ * gönderip boş bir ikinci pencere açtırabiliyor, sonra o pencereye gelen
+ * yeni bir çağrıyı kendisi "Kabul" edip ekranı yerel kullanıcının onayı
+ * olmadan ikinci kez paylaştırabiliyordu. İzin kapandığında yeni pencere
+ * normal şekilde açılır.
+ */
+function openSessionWindow() {
+  if (controlGrants.size > 0) return null;
+  return createWindow();
+}
+
 // Renderer'daki "Yeni Oturum" butonu
-ipcMain.on('new-window', () => createWindow());
+ipcMain.on('new-window', () => { openSessionWindow(); });
 
 // Zorunlu güncelleme ekranındaki "Güncellemeyi indir ve kur" düğmesi.
 // Dönüş: { mode }
@@ -1154,15 +1174,87 @@ ipcMain.handle('check-for-updates', async () => {
 const gotSingleInstanceLock = typeof app.requestSingleInstanceLock === 'function'
   ? app.requestSingleInstanceLock()
   : true;
+
+// ── arku:// bağlantıları (bkz. electron/deeplink.cjs) ───────────────────────
+// E-posta doğrulama / şifre sıfırlama sonrası web sayfası uygulamayı
+// arku://auth/<olay> ile öne getirir. Bağlantı belirteç TAŞIMAZ, yalnızca
+// sabit bir olay adı taşır.
+//
+// Teslim: olay ana süreçte bekletilir, pencereye yalnızca "bekleyen var"
+// bildirimi gider, pencere olayı kendisi alır (deeplink:take). Böylece
+// pencere henüz yüklenirken gelen bağlantı (ilk açılış) kaybolmaz ve
+// aynı olay iki kez işlenmez.
+let pendingDeepLink = null;
+function bringToFront() {
+  const win = BrowserWindow.getAllWindows()[0];
+  if (!win) { if (app.isReady()) createWindow(); return null; }
+  if (win.isMinimized()) win.restore();
+  win.show();
+  win.focus();
+  return win;
+}
+function deliverDeepLink(link) {
+  if (!link) return;
+  pendingDeepLink = { event: link.event, at: Date.now() };
+  const win = bringToFront();
+  if (win && !win.isDestroyed()) win.webContents.send('deeplink:available');
+}
+ipcMain.handle('deeplink:take', () => {
+  const p = pendingDeepLink;
+  pendingDeepLink = null;
+  // Çok eski bir olay (ör. pencere hiç açılmadı) artık anlamsız.
+  if (!p || Date.now() - p.at > 10 * 60 * 1000) return null;
+  return p.event;
+});
+// İlk açılış (Windows/Linux): bağlantı komut satırı argümanıdır.
+if (gotSingleInstanceLock) {
+  const coldStart = findDeepLinkInArgv(process.argv);
+  if (coldStart) pendingDeepLink = { event: coldStart.event, at: Date.now() };
+}
+// macOS: bağlantı 'open-url' ile gelir; uygulama hazır olmadan da
+// gelebileceği için olay hemen bağlanır.
+app.on('open-url', (event, url) => {
+  if (typeof event?.preventDefault === 'function') event.preventDefault();
+  const link = parseDeepLink(url);
+  if (!link) return;
+  if (app.isReady()) deliverDeepLink(link);
+  else pendingDeepLink = { event: link.event, at: Date.now() };
+});
+
+/**
+ * arku:// protokolünü bu uygulamaya bağlar.
+ * Yalnızca paketli sürümde: geliştirme sürümü, kurulu uygulamanın
+ * protokol kaydını kendi electron.exe'sine çevirmesin.
+ * macOS ve Linux paketlerinde kayıt ayrıca package.json > build.protocols
+ * ile yapılır; bu çağrı Windows'ta (HKCU) asıl kaydı yapar.
+ */
+function registerProtocol() {
+  if (!app.isPackaged || typeof app.setAsDefaultProtocolClient !== 'function') return;
+  try {
+    // Taşınabilir (portable) exe her açılışta geçici bir klasöre açılır;
+    // kayıt o geçici yolu değil, kullanıcının çalıştırdığı exe'yi göstermeli.
+    //
+    // Windows'ta kayıt `"exe" -- "%1"` biçiminde yapılır: "--" sonrasındaki
+    // hiçbir şey Chromium/Electron bayrağı olarak çözümlenmez, yani bir
+    // bağlantının içine bayrak sıkıştırmak (CVE-2018-1000006 türü) işe yaramaz.
+    if (process.platform === 'win32') {
+      const exe = process.env.PORTABLE_EXECUTABLE_FILE || process.execPath;
+      app.setAsDefaultProtocolClient(DEEPLINK_SCHEME, exe, ['--']);
+    } else {
+      app.setAsDefaultProtocolClient(DEEPLINK_SCHEME);
+    }
+  } catch (err) {
+    console.warn('[deeplink] protokol kaydedilemedi:', err && err.message);
+  }
+}
+
 if (!gotSingleInstanceLock) {
   app.quit();
 } else {
-  app.on('second-instance', () => {
-    const win = BrowserWindow.getAllWindows()[0];
-    if (!win) { if (app.isReady()) createWindow(); return; }
-    if (win.isMinimized()) win.restore();
-    win.show();
-    win.focus();
+  app.on('second-instance', (_event, argv) => {
+    const link = findDeepLinkInArgv(argv);
+    if (link) { deliverDeepLink(link); return; }
+    bringToFront();
   });
 }
 
@@ -1182,6 +1274,7 @@ app.whenReady().then(() => {
 
   // Oturum genelinde bir kez bağlanır (pencere başına değil).
   setupDisplayMediaHandler();
+  registerProtocol();
   // Bilgisayar açılışında başlatıldıysa ve kullanıcı istediyse küçültülmüş aç.
   createWindow({ startMinimized: launchedAtLogin() && autoStartSupported() && readAutoStartPrefs().minimized });
   setupUpdates();
@@ -1420,7 +1513,10 @@ ipcMain.on('input-event', (e, event) => {
   inputChain = inputChain
     // Kuyrukta bekleyen olaylar da pencere açıldıysa atılır: kontrol eden taraf
     // önce kuyruğu doldurup sonra onay penceresini kendisi tetikleyebilir.
-    .then(() => (modalDepth > 0 ? undefined : applyInput(mod, event, wcId, target)))
+    // İzin bu arada kaldırıldıysa (kullanıcı "izni kapat" dedi, sayfa gezindi,
+    // oturum bitti) kuyruktaki olaylar da atılır (denetim 2026-11-10): aksi
+    // halde kuyruğa önceden doldurulmuş tuşlar izin kapandıktan sonra işleniyordu.
+    .then(() => ((modalDepth > 0 || !controlGrants.has(wcId)) ? undefined : applyInput(mod, event, wcId, target)))
     .catch(() => {})
     .finally(() => { pendingInputs--; });
 });

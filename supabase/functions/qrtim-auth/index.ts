@@ -101,7 +101,8 @@ Deno.serve(async (req: Request) => {
       // email_not_verified …); istemci mesajı ona göre seçiyor. `error` metni
       // insan içindir ve değişebilir — ona göre dallanılmaz.
       return json({
-        error: vd.error || "Geçersiz QRtım token",
+        // Karşı tarafın hata metni istemciye geçirilmez (iç ayrıntı sızmasın).
+        error: "Geçersiz QRtım token",
         code: typeof vd.code === "string" ? vd.code : "token_invalid",
       }, 401);
     }
